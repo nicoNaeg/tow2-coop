@@ -1,0 +1,103 @@
+{
+  "_notes": [
+    "The Outer Worlds 2 (Steam build 24225441) test copies for tools/gamepool in the coop-anything hub.",
+    "Hard links only: the drive has no room for a 90 GB copy. Nothing in the copies is ever written through a link.",
+    "Saves, settings and logs go to <instance>/sandbox through the dsound.dll proxy (TOW2_SANDBOX_DIR); the proxy stops the game when it cannot redirect.",
+    "steam_appid.txt plus SteamAppId/SteamGameId keep the platform layer from relaunching the store install through Steam.",
+    "copy_gb 7: measured 6.1-6.4 GB working set per copy in gameplay with the low settings of qa/prep_instance.py (2026-11-16).",
+    "TOW2_COOP_BIND 127.0.0.1: test copies listen on loopback only (no firewall prompt on the owner PC).",
+    "960x540 and a VRAM budget (prep_instance Engine.ini): two copies share one 8 GB GPU (run 17 out of video memory)."
+  ],
+  "name": "TOW2",
+  "game_dir": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\TheOuterWorlds2",
+  "process_name": "TheOuterWorlds2-Win64-Shipping.exe",
+  "launch": {
+    "exe": "Arkansas/Binaries/Win64/TheOuterWorlds2-Win64-Shipping.exe",
+    "args": [
+      "-windowed",
+      "-ResX=960",
+      "-ResY=540",
+      "-nomovie"
+    ],
+    "env": {
+      "SteamAppId": "1449110",
+      "SteamGameId": "1449110",
+      "TOW2_SANDBOX_DIR": "{instance_dir}\\sandbox",
+      "TOW2_BRIDGE_PIPE": "tow2-{i}",
+      "TOW2_COOP_BIND": "127.0.0.1"
+    },
+    "window": "minimized",
+    "spawns_game": false,
+    "stagger_s": 10,
+    "child_wait_s": 30,
+    "watch_s": 30
+  },
+  "link": {
+    "modes": [
+      "hardlink"
+    ],
+    "per_instance_files": [
+      "Arkansas/Binaries/Win64/steam_appid.txt",
+      "Arkansas/Binaries/Win64/dsound.dll",
+      "Arkansas/Binaries/Win64/dwmapi.dll",
+      "Arkansas/Binaries/Win64/tow2coop.dll"
+    ],
+    "empty_dirs": [
+      "sandbox"
+    ],
+    "per_instance_dirs": [
+      "Arkansas/Binaries/Win64/ue4ss"
+    ],
+    "root_skip_suffixes": [
+      ".log",
+      ".dmp",
+      ".mdmp"
+    ],
+    "pinned_files": [
+      "Arkansas/Binaries/Win64/TheOuterWorlds2-Win64-Shipping.exe",
+      "Arkansas/Content/Paks/Arkansas-Windows.pak",
+      "Arkansas/Content/Paks/Arkansas-Windows.utoc",
+      "Arkansas/Content/Paks/global.utoc"
+    ]
+  },
+  "write_files": {
+    "Arkansas/Binaries/Win64/steam_appid.txt": "1449110"
+  },
+  "protected_paths": [
+    "%USERPROFILE%\\Saved Games\\TheOuterWorlds2",
+    "%LOCALAPPDATA%\\Arkansas",
+    "C:\\Program Files (x86)\\Steam\\userdata"
+  ],
+  "ready": {
+    "type": "window",
+    "timeout_s": 900,
+    "poll_s": 2
+  },
+  "crash": {
+    "logs": [
+      "sandbox/sandbox.log",
+      "sandbox/tow2coop.log",
+      "sandbox/LocalAppData/Arkansas/Saved/Logs/Arkansas.log",
+      "Arkansas/Binaries/Win64/ue4ss/UE4SS.log"
+    ],
+    "markers": [
+      "Fatal error",
+      "Unhandled Exception",
+      "Assertion failed",
+      "REFUSED",
+      "FAILED"
+    ],
+    "wer_match": "TheOuterWorlds2"
+  },
+  "collect_logs": [
+    "sandbox/*.log",
+    "sandbox/LocalAppData/Arkansas/Saved/Logs/*.log",
+    "Arkansas/Binaries/Win64/ue4ss/UE4SS.log"
+  ],
+  "pairs": {
+    "port_base": 27960,
+    "copy_gb": 7.0,
+    "reserve_gb": 4.0,
+    "proto": "udp"
+  }
+}
