@@ -79,10 +79,11 @@ if (-not $fail) {  # a player's package in the layout install.ps1 expects; no ga
     $stage = Join-Path $root 'dist\tow2coop'
     if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
     New-Item -ItemType Directory -Force "$stage\bin\core" | Out-Null
-    Copy-Item "$root\install.ps1", "$root\README.md" $stage
+    Copy-Item "$root\install.ps1", "$root\README.md", "$root\LICENSE" $stage
     Copy-Item "$out\dsound.dll" "$stage\bin\"
     Copy-Item "$coreOut\tow2coop.dll" "$stage\bin\core\"
-    Compress-Archive -Path "$stage\*" -DestinationPath "$root\dist\tow2coop.zip" -Force
+    # forward-slash entry names: Compress-Archive and ZipFile on Windows PowerShell 5.1 write '\', which other unzip tools misread
+    python -I -c "import sys, zipfile, pathlib; s = pathlib.Path(sys.argv[1]); z = zipfile.ZipFile(sys.argv[2], 'w', zipfile.ZIP_DEFLATED); [z.write(f, f.relative_to(s).as_posix()) for f in sorted(s.rglob('*')) if f.is_file()]; z.close()" $stage "$root\dist\tow2coop.zip"
     Write-Host "package: $root\dist\tow2coop.zip"
 }
 Write-Host ("BUILD+TEST: {0} ({1} failure(s))" -f $(if ($fail) { 'FAIL' } else { 'PASS' }), $fail)
