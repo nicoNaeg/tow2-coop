@@ -9,6 +9,7 @@
 #include "ue.hpp"
 #include "coop.hpp"
 #include "join.hpp"
+#include "steamnet.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdarg>
@@ -421,11 +422,30 @@ DWORD WINAPI init_thread(LPVOID) {
     std::string coop_why;
     reg("coop.status", [](const Value&) { return coop::status(); });
     reg("coop.set", [](const Value& p) { return coop::set_options(p); });
+    reg("coop.steamProbe", [](const Value&) { return coop::steam_probe(); }, false);  // waits: off the game thread
     // Join: host saves and serves its campaign over TCP (co-op port + 1); the client downloads and loads it.
     reg("coop.offer", [](const Value& p) {
         std::string bind = p.get("bind").asString(env("TOW2_COOP_BIND"));
-        return join::host_offer(static_cast<int>(p.get("port").asInt(27961)), bind.empty() ? "127.0.0.1" : bind);
+        // steamSelf (test): push the save over Steam to your own SteamID; coop.steamPump plays the client side
+        uint64_t self = p.get("steamSelf").asBool(false) ? steamnet::me() : 0;
+        return join::host_offer(static_cast<int>(p.get("port").asInt(27961)), bind.empty() ? "127.0.0.1" : bind, "", self, 0xABCDEF01u);
     });
+    // Test (off the game thread): hand Steam channel-1 messages sent to yourself to the client side of the hand-over,
+    // which writes CoopHost_ABCDEF01 and then loads it. Use with transport=udp (in Steam mode the game thread reads them).
+    reg("coop.steamPump", [](const Value& p) {
+        std::string why;
+        if (!steamnet::start(why)) throw coopbridge::Error(-32012, why);
+        for (ULONGLONG end = GetTickCount64() + static_cast<ULONGLONG>(p.get("seconds").asNumber(60) * 1000); GetTickCount64() < end; Sleep(20)) {
+            bool done = false;
+            steamnet::receive(1, [&](uint64_t from, const char* d, int n) {
+                if (from != steamnet::me()) return;
+                join::on_steam_data(d, n);
+                done = done || (n == 1 && d[0] == 'E');
+            });
+            if (done) break;
+        }
+        return join::status();
+    }, false);
     reg("coop.join", [](const Value& p) {
         return join::client_fetch(p.get("host").asString("127.0.0.1"), static_cast<int>(p.get("port").asInt(27961)),
                                   static_cast<uint32_t>(p.get("hostId").asInt(0)));
@@ -439,6 +459,8 @@ DWORD WINAPI init_thread(LPVOID) {
     return 0;
 }
 }  // namespace
+
+void core_log(const std::string& line) { logmsg("%s", line.c_str()); }
 
 BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID) {
     if (reason != DLL_PROCESS_ATTACH) return TRUE;

@@ -9,6 +9,7 @@
 #include <knownfolders.h>
 #include <shlobj.h>
 #include "join.hpp"
+#include "steamnet.hpp"
 #include "ue.hpp"
 #include <atomic>
 #include <cstdio>
@@ -17,8 +18,11 @@
 #include <thread>
 #include <vector>
 
+void core_log(const std::string& line);  // main.cpp: a line in tow2coop.log
+
 namespace join {
 using json = coopbridge::json::Value;
+json status();
 namespace {
 std::mutex mu;
 std::string state = "idle", error, folder;  // folder: the save folder name the client will load
@@ -91,9 +95,81 @@ bool recv_all(SOCKET s, void* p, size_t n) {
     return true;
 }
 
+std::vector<char> read_file(const std::wstring& path, bool& ok) {
+    std::vector<char> data;
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    ok = f != nullptr;
+    if (!f) return data;
+    char buf[1 << 16];
+    for (size_t k; (k = fread(buf, 1, sizeof buf, f)) > 0;) data.insert(data.end(), buf, buf + k);
+    fclose(f);
+    return data;
+}
+
+// Steam: the save files go to the joined player on channel 1 (reliable, ordered): 'B' host id + file count, per file
+// 'F' size + UTF-16 name and 'D' chunks of 64 KB, then 'E'. A full send buffer (EResult 25) is waited out.
+bool steam_push(uint64_t to, const std::wstring& dir, const std::vector<std::wstring>& names, uint32_t host_id) {
+    auto put = [&](const std::string& m) {
+        for (int i = 0; i < 6000; i++) {  // up to 60 s of back-pressure
+            int r = steamnet::send(to, m.data(), static_cast<int>(m.size()), true, 1);
+            if (r == 1) return true;
+            if (r != 25) { set_state("failed", "Steam send error " + std::to_string(r)); return false; }
+            Sleep(10);
+        }
+        set_state("failed", "the Steam send buffer stayed full for 60 s");
+        return false;
+    };
+    auto u32 = [](std::string& s, uint32_t v) { s.append(reinterpret_cast<const char*>(&v), 4); };
+    std::string b(1, 'B');
+    u32(b, host_id), u32(b, static_cast<uint32_t>(names.size()));
+    if (!put(b)) return false;
+    for (auto& n : names) {
+        bool ok;
+        std::vector<char> data = read_file(dir + L"\\" + n, ok);
+        if (!ok) { set_state("failed", "cannot read the host save"); return false; }
+        uint64_t sz = data.size();
+        std::string f(1, 'F');
+        f.append(reinterpret_cast<const char*>(&sz), 8);
+        u32(f, static_cast<uint32_t>(n.size() * 2));
+        f.append(reinterpret_cast<const char*>(n.data()), n.size() * 2);
+        if (!put(f)) return false;
+        for (size_t off = 0; off < data.size(); off += 1 << 16) {
+            std::string d(1, 'D');
+            d.append(data.data() + off, std::min<size_t>(1 << 16, data.size() - off));
+            if (!put(d)) return false;
+        }
+        bytes += sz;
+    }
+    return put(std::string(1, 'E'));
+}
+
+// Client side of the Steam push (game thread).
+FILE* rx_file = nullptr;
+uint64_t rx_left = 0;
+std::wstring rx_dir;
+
+void rx_fail(const std::string& why) {
+    if (rx_file) fclose(rx_file), rx_file = nullptr;
+    rx_left = 0;
+    set_state("failed", why);
+    core_log("hand-over failed: " + why);
+}
+
+void rx_begin(uint32_t host_id) {
+    char name[48];
+    snprintf(name, sizeof name, "CoopHost_%08X", host_id);
+    if (rx_file) fclose(rx_file), rx_file = nullptr;
+    rx_left = 0;
+    rx_dir = saves_dir();
+    if (!rx_dir.empty()) rx_dir += L"\\" + std::wstring(name, name + strlen(name));
+    { std::lock_guard<std::mutex> g(mu); folder = name, error.clear(); }
+    bytes = 0, started = now_s(), ready_to_load = false;
+    set_state("receiving");
+}
+
 // Host worker: wait until the save folder stops changing, then serve it to one client. Framing per file:
 // u32 name bytes, UTF-16 name, u64 size, data; a zero name length ends the stream.
-void host_worker(std::wstring dir, int port, std::string bind_ip, std::string allow_ip) {
+void host_worker(std::wstring dir, int port, std::string bind_ip, std::string allow_ip, uint64_t steam_to, uint32_t host_id) {
     DWORD64 last_total = ~0ull;
     for (int stable = 0, i = 0; stable < 3 && i < 120; i++) {  // 3 quiet half-seconds, at most 60 s
         Sleep(500);
@@ -107,6 +183,15 @@ void host_worker(std::wstring dir, int port, std::string bind_ip, std::string al
     }
     auto names = files_of(dir);
     if (names.empty()) { set_state("failed", "the host save was not written"); busy = false; return; }
+    if (steam_to) {  // pushed to the joined player's SteamID: no listening socket
+        set_state("serving");
+        core_log("hand-over: sending the campaign over Steam (" + std::to_string(names.size()) + " files)");
+        bool ok = steam_push(steam_to, dir, names, host_id);
+        if (ok) set_state("sent");
+        core_log(ok ? "hand-over: sent " + std::to_string(bytes) + " bytes" : "hand-over failed: " + status().get("error").asString());
+        busy = false;
+        return;
+    }
     SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     sockaddr_in a{};
     a.sin_family = AF_INET, a.sin_port = htons(static_cast<u_short>(port));
@@ -205,7 +290,7 @@ void client_worker(std::string host, int port, std::wstring dir) {
 }
 }  // namespace
 
-json host_offer(int port, const std::string& bind_ip, const std::string& allow_ip) {
+json host_offer(int port, const std::string& bind_ip, const std::string& allow_ip, uint64_t steam_to, uint32_t host_id) {
     if (busy.exchange(true)) throw std::runtime_error("a transfer is already running");
     std::wstring dir = saves_dir();
     if (dir.empty()) { busy = false; throw std::runtime_error("cannot resolve the save folder"); }
@@ -217,7 +302,7 @@ json host_offer(int port, const std::string& bind_ip, const std::string& allow_i
     json r = ue::call(sgm, ue::find_func(ue::class_of(sgm), "SaveGame"), a);
     bytes = 0, started = now_s(), error.clear();
     set_state("saving");
-    std::thread(host_worker, dir + L"\\CoopHost", port, bind_ip, allow_ip).detach();
+    std::thread(host_worker, dir + L"\\CoopHost", port, bind_ip, allow_ip, steam_to, host_id).detach();
     json out = json::object();
     out.set("save", r.get("ReturnValue")).set("port", port);
     return out;
@@ -237,6 +322,57 @@ json client_fetch(const std::string& host, int port, uint32_t host_id) {
     json out = json::object();
     out.set("folder", name);
     return out;
+}
+
+void client_expect(uint32_t host_id) {
+    std::string f;
+    { std::lock_guard<std::mutex> g(mu); f = state == "receiving" ? folder : std::string(); }
+    char name[48];
+    snprintf(name, sizeof name, "CoopHost_%08X", host_id);
+    if (f != name) rx_begin(host_id);  // the 'B' message may already have started this hand-over
+}
+
+void on_steam_data(const char* d, int n) {
+    if (n < 1) return;
+    uint32_t a = 0, b = 0;
+    switch (d[0]) {
+    case 'B':
+        if (n != 9) return rx_fail("bad hand-over start");
+        memcpy(&a, d + 1, 4);
+        rx_begin(a);
+        if (rx_dir.empty()) return rx_fail("cannot resolve the save folder");
+        CreateDirectoryW(rx_dir.c_str(), nullptr);
+        return;
+    case 'F': {
+        uint64_t sz = 0;
+        if (rx_dir.empty() || rx_file || rx_left || n < 13) return rx_fail("bad file header");
+        memcpy(&sz, d + 1, 8);
+        memcpy(&b, d + 9, 4);
+        if (b == 0 || b > 512 || b % 2 || n != 13 + static_cast<int>(b) || sz > (256ull << 20)) return rx_fail("bad file header");
+        std::wstring name(b / 2, L'\0');
+        memcpy(&name[0], d + 13, b);
+        if (name.find_first_of(L"\\/:") != std::wstring::npos || name == L"." || name == L"..") return rx_fail("bad file name");
+        rx_file = _wfopen((rx_dir + L"\\" + name).c_str(), L"wb");
+        if (!rx_file) return rx_fail("cannot write the received save");
+        rx_left = sz;
+        if (!rx_left) fclose(rx_file), rx_file = nullptr;
+        return;
+    }
+    case 'D': {
+        size_t k = static_cast<size_t>(n - 1);
+        if (!rx_file || k > rx_left) return rx_fail("unexpected data");
+        if (fwrite(d + 1, 1, k, rx_file) != k) return rx_fail("cannot write the received save");
+        rx_left -= k, bytes += k;
+        if (!rx_left) fclose(rx_file), rx_file = nullptr;
+        return;
+    }
+    case 'E':
+        if (rx_dir.empty() || rx_file || rx_left) return rx_fail("transfer broken");
+        set_state("received");
+        ready_to_load = true;
+        core_log("hand-over: received " + std::to_string(bytes) + " bytes, loading the host's campaign");
+        return;
+    }
 }
 
 // Game thread: load the received save once (the front end must have run for a while, see session.py).

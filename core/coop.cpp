@@ -11,6 +11,7 @@
 #include "ue.hpp"
 #include "story.hpp"
 #include "join.hpp"
+#include "steamnet.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <cmath>
@@ -19,6 +20,8 @@
 #include <string>
 #include <unordered_map>
 #include <mutex>
+
+void core_log(const std::string& line);  // main.cpp: a line in tow2coop.log (what a player sends when something fails)
 
 namespace coop {
 using json = coopbridge::json::Value;
@@ -109,6 +112,10 @@ struct Ctx {
     SOCKET s = INVALID_SOCKET;
     sockaddr_in peer{};
     bool have_peer = false;
+    bool steam = false;            // transport=steam: the peer is a SteamID (peer_id), found through rich presence
+    uint64_t peer_id = 0;
+    double next_discovery = 0;
+    int session = 0;               // last Steam session state with the peer (logged when it changes)
     uint32_t me = 0, seq = 0, remote_id = 0, remote_last_seq = 0;
     uint32_t magic = kMagic;  // kMagic mixed with the hash of the optional shared key: other keys never become the peer
     uint64_t sent = 0, recv = 0, stale = 0, bad = 0;
@@ -242,6 +249,10 @@ bool read_transform(ue::UObject* pawn, double pos[3], float& yaw, float& pitch, 
 
 void send_raw(const void* p, int n) {
     if (!g.have_peer) return;
+    if (g.steam) {
+        if (steamnet::send(g.peer_id, p, n, false, 0) == 1) g.sent++;
+        return;
+    }
     if (sendto(g.s, static_cast<const char*>(p), n, 0, reinterpret_cast<const sockaddr*>(&g.peer), sizeof g.peer) == n) g.sent++;
 }
 
@@ -427,7 +438,8 @@ void request_resync(const char* reason) {
     try {
         char peer_ip[64] = "";
         inet_ntop(AF_INET, &g.peer.sin_addr, peer_ip, sizeof peer_ip);
-        join::host_offer(g.port + 1, bind_ip(), peer_ip);  // the campaign goes to the joined player's address only
+        // the campaign goes to the joined player only: its address (TCP), or its SteamID (pushed over Steam)
+        join::host_offer(g.port + 1, bind_ip(), peer_ip, g.steam ? g.peer_id : 0, g.me);
     } catch (const std::exception& e) {
         g.last_error = std::string("resync offer: ") + e.what();
         return;
@@ -447,7 +459,8 @@ void client_fetch_resync(const char* body, int len) {
     inet_ntop(AF_INET, &g.peer.sin_addr, ip, sizeof ip);
     if (g.now < g.fetch_quiet_until) return;  // the host repeats its notice; one hand-over per resync
     try {
-        join::client_fetch(ip, static_cast<int>(port), host_id);
+        if (g.steam) join::client_expect(host_id);  // the host pushes the files on Steam channel 1
+        else join::client_fetch(ip, static_cast<int>(port), host_id);
         g.resync_fetches++;
         g.fetch_quiet_until = g.now + 30.0;
     } catch (const std::exception&) {}  // already fetching
@@ -677,97 +690,116 @@ void apply_interact(const InteractMsg& m) {
     applying_remote = false;
 }
 
+// One datagram from the other player: UDP gives its address (from), Steam its SteamID (from_id).
+void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t from_id) {
+    if (n < static_cast<int>(sizeof(Header))) { g.bad++; return; }
+    Header h;
+    memcpy(&h, buf, sizeof h);
+    if (h.magic != g.magic || h.size != n || h.sender == g.me) { g.bad++; return; }
+    if (g.host && !g.have_peer) {  // first client becomes the peer
+        if (from) g.peer = *from;
+        g.peer_id = from_id;
+        g.have_peer = true;
+    }
+    if (g.remote_id && h.sender != g.remote_id) { g.bad++; return; }  // shortcut: one remote player only
+    if (h.type == kHello) { g.remote_id = h.sender; return; }
+    if (h.type == kBye) { g.remote_id = 0; g.snaps.clear(); return; }
+    // shortcut: one sequence for every packet type, newest wins; damage events can be lost on a lossy link
+    // (loopback and LAN rarely drop); make them acked when testing over the internet.
+    if (g.remote_id == h.sender && h.seq <= g.remote_last_seq) { g.stale++; return; }  // reordered or duplicate
+    if (g.remote_id != h.sender && g.host) story::reset_peer();  // a (re)joined client gets the story log replayed
+    g.remote_id = h.sender;
+    g.remote_last_seq = h.seq;
+    if (h.type == kResync && !g.host) { g.last_recv_t = g.now; client_fetch_resync(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }
+    if (!g.in_gameplay || g.now < g.settle_until) { g.last_recv_t = g.now; g.stale++; return; }  // not in a settled world: data ignored
+    if (h.type == kResync && !g.host) {  // handled even while not settled: the client may be anywhere
+        client_fetch_resync(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)));
+        return;
+    }
+    if (h.type == kInteract) {
+        int body = n - static_cast<int>(sizeof(Header));
+        InteractMsg m{};
+        if (body < static_cast<int>(offsetof(InteractMsg, path)) || body > static_cast<int>(sizeof m)) { g.bad++; return; }
+        memcpy(&m, buf + sizeof(Header), body);
+        if (m.len > sizeof m.path || body != static_cast<int>(offsetof(InteractMsg, path)) + m.len) { g.bad++; return; }
+        g.recv++;
+        apply_interact(m);
+        return;
+    }
+    if (h.type == kResyncRequest && g.host) {
+        uint32_t reason = 1;
+        if (n == static_cast<int>(sizeof(Header)) + 4) memcpy(&reason, buf + sizeof(Header), 4);
+        g.resync_requests++;
+        request_resync(reason == 2 ? "client joins from the main menu" : "client could not apply a quest outcome");
+        return;
+    }
+    if (h.type == story::kStory && !g.host) {
+        g.recv++;
+        story::on_story(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)), send_typed);
+        return;
+    }
+    if (h.type == story::kStoryAck && g.host) {
+        story::on_ack(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)));
+        return;
+    }
+    if (h.type == kEnemies && !g.host) {
+        Enemies e;
+        int head = static_cast<int>(offsetof(Enemies, rec));
+        memcpy(&e, buf, std::min(n, static_cast<int>(sizeof e)));
+        if (n < head || e.count > kMaxEnemyRecs || n != head + e.count * static_cast<int>(sizeof(EnemyRec))) { g.bad++; return; }
+        g.recv++;
+        apply_npcs(e);
+        return;
+    }
+    if (h.type == kDamage && g.host) {
+        if (n != static_cast<int>(sizeof(Damage))) { g.bad++; return; }
+        Damage d;
+        memcpy(&d, buf, sizeof d);
+        g.recv++;
+        if (std::find(g.dmg_seen.begin(), g.dmg_seen.end(), d.eid) == g.dmg_seen.end()) {
+            apply_damage(d);
+            g.dmg_seen.push_back(d.eid);
+            if (g.dmg_seen.size() > 1024) g.dmg_seen.erase(g.dmg_seen.begin(), g.dmg_seen.begin() + 512);
+        }
+        send_typed(kDamageAck, &d.eid, 4);
+        return;
+    }
+    if (h.type == kDamageAck && !g.host) {
+        uint32_t eid;
+        if (n != static_cast<int>(sizeof(Header)) + 4) { g.bad++; return; }
+        memcpy(&eid, buf + sizeof(Header), 4);
+        for (size_t i = 0; i < g.dmg_pending.size(); i++)
+            if (g.dmg_pending[i].d.eid == eid) { g.dmg_pending.erase(g.dmg_pending.begin() + i); break; }
+        return;
+    }
+    if (h.type != kState || n != static_cast<int>(sizeof(State))) { g.bad++; return; }
+    State st;
+    memcpy(&st, buf, sizeof st);
+    g.recv++;
+    g.last_recv_t = g.now;
+    g.snaps.push_back({g.now, st.px, st.py, st.pz, st.vx, st.vy, st.vz, st.yaw});
+    g.puppet_map = st.map_hash;
+    while (g.snaps.size() > 64) g.snaps.pop_front();
+}
+
 void receive() {
+    if (g.steam) {
+        steamnet::receive(0, [](uint64_t from_id, const char* data, int n) {
+            if (n > 1500 || (g.have_peer && from_id != g.peer_id)) { g.bad++; return; }  // only the player found by presence
+            handle_packet(data, n, nullptr, from_id);
+        });
+        steamnet::receive(1, [](uint64_t from_id, const char* data, int n) {  // the campaign hand-over (reliable, ordered)
+            if (!g.host && g.have_peer && from_id == g.peer_id) join::on_steam_data(data, n);
+        });
+        return;
+    }
     char buf[1500];
     for (;;) {
         sockaddr_in from{};
         int fl = sizeof from;
         int n = recvfrom(g.s, buf, sizeof buf, 0, reinterpret_cast<sockaddr*>(&from), &fl);
         if (n <= 0) break;
-        if (n < static_cast<int>(sizeof(Header))) { g.bad++; continue; }
-        Header h;
-        memcpy(&h, buf, sizeof h);
-        if (h.magic != g.magic || h.size != n || h.sender == g.me) { g.bad++; continue; }
-        if (g.host && !g.have_peer) { g.peer = from; g.have_peer = true; }  // first client becomes the peer
-        if (g.remote_id && h.sender != g.remote_id) { g.bad++; continue; }  // shortcut: one remote player only
-        if (h.type == kHello) { g.remote_id = h.sender; continue; }
-        if (h.type == kBye) { g.remote_id = 0; g.snaps.clear(); continue; }
-        // shortcut: one sequence for every packet type, newest wins; damage events can be lost on a lossy link
-        // (loopback and LAN rarely drop); make them acked when testing over the internet.
-        if (g.remote_id == h.sender && h.seq <= g.remote_last_seq) { g.stale++; continue; }  // reordered or duplicate
-        if (g.remote_id != h.sender && g.host) story::reset_peer();  // a (re)joined client gets the story log replayed
-        g.remote_id = h.sender;
-        g.remote_last_seq = h.seq;
-        if (h.type == kResync && !g.host) { g.last_recv_t = g.now; client_fetch_resync(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); continue; }
-        if (!g.in_gameplay || g.now < g.settle_until) { g.last_recv_t = g.now; g.stale++; continue; }  // not in a settled world: data ignored
-        if (h.type == kResync && !g.host) {  // handled even while not settled: the client may be anywhere
-            client_fetch_resync(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)));
-            continue;
-        }
-        if (h.type == kInteract) {
-            int body = n - static_cast<int>(sizeof(Header));
-            InteractMsg m{};
-            if (body < static_cast<int>(offsetof(InteractMsg, path)) || body > static_cast<int>(sizeof m)) { g.bad++; continue; }
-            memcpy(&m, buf + sizeof(Header), body);
-            if (m.len > sizeof m.path || body != static_cast<int>(offsetof(InteractMsg, path)) + m.len) { g.bad++; continue; }
-            g.recv++;
-            apply_interact(m);
-            continue;
-        }
-        if (h.type == kResyncRequest && g.host) {
-            uint32_t reason = 1;
-            if (n == static_cast<int>(sizeof(Header)) + 4) memcpy(&reason, buf + sizeof(Header), 4);
-            g.resync_requests++;
-            request_resync(reason == 2 ? "client joins from the main menu" : "client could not apply a quest outcome");
-            continue;
-        }
-        if (h.type == story::kStory && !g.host) {
-            g.recv++;
-            story::on_story(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)), send_typed);
-            continue;
-        }
-        if (h.type == story::kStoryAck && g.host) {
-            story::on_ack(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)));
-            continue;
-        }
-        if (h.type == kEnemies && !g.host) {
-            Enemies e;
-            int head = static_cast<int>(offsetof(Enemies, rec));
-            memcpy(&e, buf, std::min(n, static_cast<int>(sizeof e)));
-            if (n < head || e.count > kMaxEnemyRecs || n != head + e.count * static_cast<int>(sizeof(EnemyRec))) { g.bad++; continue; }
-            g.recv++;
-            apply_npcs(e);
-            continue;
-        }
-        if (h.type == kDamage && g.host) {
-            if (n != static_cast<int>(sizeof(Damage))) { g.bad++; continue; }
-            Damage d;
-            memcpy(&d, buf, sizeof d);
-            g.recv++;
-            if (std::find(g.dmg_seen.begin(), g.dmg_seen.end(), d.eid) == g.dmg_seen.end()) {
-                apply_damage(d);
-                g.dmg_seen.push_back(d.eid);
-                if (g.dmg_seen.size() > 1024) g.dmg_seen.erase(g.dmg_seen.begin(), g.dmg_seen.begin() + 512);
-            }
-            send_typed(kDamageAck, &d.eid, 4);
-            continue;
-        }
-        if (h.type == kDamageAck && !g.host) {
-            uint32_t eid;
-            if (n != static_cast<int>(sizeof(Header)) + 4) { g.bad++; continue; }
-            memcpy(&eid, buf + sizeof(Header), 4);
-            for (size_t i = 0; i < g.dmg_pending.size(); i++)
-                if (g.dmg_pending[i].d.eid == eid) { g.dmg_pending.erase(g.dmg_pending.begin() + i); break; }
-            continue;
-        }
-        if (h.type != kState || n != static_cast<int>(sizeof(State))) { g.bad++; continue; }
-        State st;
-        memcpy(&st, buf, sizeof st);
-        g.recv++;
-        g.last_recv_t = g.now;
-        g.snaps.push_back({g.now, st.px, st.py, st.pz, st.vx, st.vy, st.vz, st.yaw});
-        g.puppet_map = st.map_hash;
-        while (g.snaps.size() > 64) g.snaps.pop_front();
+        handle_packet(buf, n, &from, 0);
     }
 }
 
@@ -938,18 +970,76 @@ void drive_puppet() {
 }
 }  // namespace
 
-bool start(std::string& why) {
-    // TOW2_COOP_* wins; else the hub's gamepool pair variables (up --pairs N) give role and port.
-    std::string role = env("TOW2_COOP_ROLE");
-    if (role.empty()) role = env("GAMEPOOL_ROLE");
-    if (role != "host" && role != "client") { why = "no role (TOW2_COOP_ROLE or GAMEPOOL_ROLE): co-op off"; return false; }
-    g.host = role == "host";
-    std::string key = env("TOW2_COOP_KEY");  // optional shared secret; both players set the same
-    g.magic = key.empty() ? kMagic : kMagic ^ fnv(key) ^ 0x9E3779B9u;
-    int port = atoi(env("TOW2_COOP_PORT").c_str());
-    if (!port) port = atoi(env("GAMEPOOL_PORT").c_str());
-    if (!port) port = 27960;
-    g.port = port;
+// Steam: find the other player through rich presence (every 2 s). A host shows "host" and takes the first friend that
+// shows "join:<host's SteamID>"; a client takes a friend that shows "host" (TOW2_COOP_HOST / ini host= narrows it to a
+// Steam name or SteamID) and shows "join:<that friend>". Each side sends a hello first: that accepts the other's
+// session, so no Steam callback is needed. The keys are re-set every pass (the game may clear rich presence).
+void steam_discovery() {
+    if (g.now < g.next_discovery) return;
+    g.next_discovery = g.now + 2.0;
+    const uint8_t none = 0;
+    if (g.have_peer) {
+        int st = steamnet::session_state(g.peer_id);
+        if (st != g.session) {
+            core_log("steam: session with " + steamnet::name(g.peer_id) + " state " + std::to_string(st) + " (3 = connected), relay " +
+                     std::to_string(steamnet::relay_status()) + " (100 = ready)");
+            g.session = st;
+        }
+        static double next_log = 0;  // a status line every 30 s: what a player sends when something looks wrong
+        if (g.now >= next_log) {
+            next_log = g.now + 30.0;
+            core_log("steam: " + steamnet::name(g.peer_id) + " state " + std::to_string(st) + ", sent " + std::to_string(g.sent) + ", received " +
+                     std::to_string(g.recv) + ", rejected " + std::to_string(g.bad) + (g.puppet ? ", stand-in shown" : ", no stand-in"));
+        }
+        steamnet::set_presence("tow2coop", g.host ? "host" : ("join:" + std::to_string(g.peer_id)).c_str());
+        if (st != 3) send_typed(kHello, &none, 0);  // keeps asking until the session is up
+        return;
+    }
+    steamnet::set_presence("tow2coop", g.host ? "host" : "");
+    std::string want = g.host ? "join:" + std::to_string(steamnet::me()) : std::string("host");
+    std::string pick = g.host ? std::string() : env("TOW2_COOP_HOST");
+    // A named host is contacted directly, presence or not (its game details may be private); the host accepts friends.
+    uint64_t named = pick.empty() ? 0 : steamnet::find_friend(pick);
+    std::vector<uint64_t> candidates = named ? std::vector<uint64_t>{named} : steamnet::friends_in_game();
+    for (uint64_t f : candidates) {
+        steamnet::request_presence(f);
+        if (!named && steamnet::presence(f, "tow2coop") != want) continue;
+        if (!named && !pick.empty()) continue;  // a name was given but no such friend: wait for it to show up
+        g.peer_id = f, g.have_peer = true, g.session = -1;
+        if (!g.host) steamnet::set_presence("tow2coop", ("join:" + std::to_string(f)).c_str());
+        send_typed(kHello, &none, 0);
+        core_log(std::string(g.host ? "steam: a friend joins: " : "steam: joining the host ") + steamnet::name(f));
+        return;
+    }
+}
+
+// Self-test of the Steam link without another player (bridge coop.steamProbe, any thread): the functions resolve, the
+// relay network comes up, and a message addressed to yourself comes back on channel 9.
+json steam_probe() {
+    std::string why;
+    json r = json::object();
+    bool ok = steamnet::start(why);
+    r.set("available", ok).set("why", why);
+    if (!ok) return r;
+    r.set("app", static_cast<double>(steamnet::app_id())).set("friendsInGame", static_cast<double>(steamnet::friends_in_game().size()));
+    int relay = 0;
+    for (int i = 0; i < 100 && (relay = steamnet::relay_status()) != 100 && relay > -100; i++) Sleep(100);  // up to 10 s
+    r.set("relay", static_cast<double>(relay));
+    const char ping[] = "tow2coop self-test";
+    r.set("selfSend", static_cast<double>(steamnet::send(steamnet::me(), ping, sizeof ping, true, 9)));
+    bool back = false;
+    for (int i = 0; i < 50 && !back; i++) {  // up to 5 s
+        steamnet::receive(9, [&](uint64_t from, const char* d, int n) {
+            back = back || (from == steamnet::me() && n == static_cast<int>(sizeof ping) && !memcmp(d, ping, sizeof ping));
+        });
+        if (!back) Sleep(100);
+    }
+    r.set("selfReceived", back);
+    return r;
+}
+
+// UDP: the host listens on the port; a client knows the host's address (TOW2_COOP_PEER).
+bool start_udp(int port, std::string& why) {
     WSADATA w;
     WSAStartup(MAKEWORD(2, 2), &w);
     g.s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -971,12 +1061,30 @@ bool start(std::string& why) {
         if (inet_pton(AF_INET, peer.substr(0, c).c_str(), &g.peer.sin_addr) != 1) { why = "bad peer address " + peer; return false; }
         g.have_peer = true;
     }
+    return true;
+}
+
+bool start(std::string& why) {
+    // TOW2_COOP_* wins; else the hub's gamepool pair variables (up --pairs N) give role and port.
+    std::string role = env("TOW2_COOP_ROLE");
+    if (role.empty()) role = env("GAMEPOOL_ROLE");
+    if (role != "host" && role != "client") { why = "no role (TOW2_COOP_ROLE or GAMEPOOL_ROLE): co-op off"; return false; }
+    g.host = role == "host";
+    std::string key = env("TOW2_COOP_KEY");  // optional shared secret; both players set the same
+    g.magic = key.empty() ? kMagic : kMagic ^ fnv(key) ^ 0x9E3779B9u;
+    int port = atoi(env("TOW2_COOP_PORT").c_str());
+    if (!port) port = atoi(env("GAMEPOOL_PORT").c_str());
+    if (!port) port = 27960;
+    g.port = port;
+    g.steam = env("TOW2_COOP_TRANSPORT") == "steam";  // no socket, no open port: the peer is found through Steam
+    if (g.steam ? !steamnet::start(why) : !start_udp(port, why)) return false;
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
     g.me = static_cast<uint32_t>(GetCurrentProcessId() * 2654435761u ^ q.LowPart) | 1;
     g.on = true;
     g.start_time = clock_s();
-    why = std::string(g.host ? "host on port " : "client, host port ") + std::to_string(g.host ? port : ntohs(g.peer.sin_port));
+    if (g.steam) why += g.host ? "; host: Steam friends running the mod as client join" : "; client: joins a Steam friend hosting";
+    else why = std::string(g.host ? "host on port " : "client, host port ") + std::to_string(g.host ? port : ntohs(g.peer.sin_port));
     return true;
 }
 
@@ -984,6 +1092,7 @@ void frame(float) {
     if (!g.on) return;
     g.now = clock_s();
     receive();
+    if (g.steam) steam_discovery();
     ue::UObject* pawn = local_pawn();
     std::string err;
     ue::UObject* world = ue::resolve("world", &err);
@@ -1024,7 +1133,8 @@ void frame(float) {
         destroy_puppet();
         g.last_recv_t = -1;
         g.remote_id = 0, g.remote_last_seq = 0;  // a restarted peer has a new id and starts its sequence again
-        if (g.host) g.have_peer = false;         // the next client to send becomes the peer
+        if (g.host) g.have_peer = false;         // the next client to send becomes the peer (Steam: to show up again)
+        if (g.steam) core_log("steam: no data from " + steamnet::name(g.peer_id) + " for 5 s" + (g.host ? ", looking for a client again" : ""));
         g.drops++;
     }
     if (pawn && settled) {
@@ -1093,6 +1203,10 @@ json set_options(const json& p) {
 json status() {
     json s = json::object();
     s.set("on", g.on).set("host", g.host).set("me", static_cast<double>(g.me)).set("remote", static_cast<double>(g.remote_id));
+    s.set("transport", g.steam ? "steam" : "udp");
+    if (g.steam)
+        s.set("steamPeer", g.peer_id ? steamnet::name(g.peer_id) : std::string()).set("session", static_cast<double>(steamnet::session_state(g.peer_id)))
+            .set("relay", static_cast<double>(steamnet::relay_status()));
     s.set("sent", static_cast<double>(g.sent)).set("recv", static_cast<double>(g.recv)).set("stale", static_cast<double>(g.stale)).set("bad", static_cast<double>(g.bad));
     s.set("peer", g.have_peer).set("puppet", g.puppet ? ue::addr(g.puppet) : std::string("none")).set("error", g.last_error);
     s.set("sameMap", g.puppet_map == g.my_map);

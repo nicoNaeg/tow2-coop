@@ -8,17 +8,24 @@ Set-Content "$win64\TheOuterWorlds2-Win64-Shipping.exe" 'fake'
 $inst = Join-Path (Split-Path $PSScriptRoot) 'install.ps1'
 $fails = 0
 function Check($ok, $what) { if ($ok) { "PASS $what" } else { "FAIL $what"; $script:fails++ } }
-$said = & $inst -Role host -GameDir $root
+& $inst -Role host -GameDir $root | Out-Null
+$ini = Get-Content "$win64\tow2coop.ini"
+Check ((Test-Path "$win64\dsound.dll") -and (Test-Path "$win64\tow2coop.dll") -and ($ini -contains 'role=host') -and ($ini -contains 'transport=steam')) 'host install places the loader, the mod, role=host over Steam'
+$name = "Zo$([char]0xEB) $([char]0xDC)nder"  # built from code points: Windows PowerShell reads this file as ANSI
+& $inst -Role client -Friend $name -GameDir $root | Out-Null
+$raw = [IO.File]::ReadAllBytes("$win64\tow2coop.ini")
+$ini = [Text.Encoding]::UTF8.GetString($raw) -split "`r`n"
+Check (($ini -contains 'transport=steam') -and ($ini -contains "host=$name") -and $raw[0] -ne 0xEF -and -not ($ini -match '^key=')) 'Steam client install names the friend to join (UTF-8, no BOM), no key'
+$said = & $inst -Role host -Transport udp -GameDir $root
 $ini = Get-Content "$win64\tow2coop.ini"
 $key = ($ini | Where-Object { $_ -match '^key=[a-z0-9]{10}$' }) -replace '^key='
-Check ((Test-Path "$win64\dsound.dll") -and (Test-Path "$win64\tow2coop.dll") -and ($ini -contains 'role=host')) 'host install places the loader, the mod and role=host'
-Check ($key -and "$said" -match "-Key $key") 'host install makes a key and tells it for the friend'
+Check ($key -and ($ini -contains 'transport=udp') -and "$said" -match "-Key $key") 'direct-IP host install makes a key and tells it for the friend'
 $refused = $false
 try { & $inst -Role client -Peer 10.0.0.5 -GameDir $root | Out-Null } catch { $refused = $true }
-Check $refused 'client install without the key is refused'
+Check $refused 'direct-IP client install without the key is refused'
 & $inst -Role client -Peer 10.0.0.5 -Key $key -GameDir $root | Out-Null
 $ini = Get-Content "$win64\tow2coop.ini"
-Check (($ini -contains 'peer=10.0.0.5:27960') -and ($ini -contains "key=$key")) 'client install writes the host address (default port) and the key'
+Check (($ini -contains 'peer=10.0.0.5:27960') -and ($ini -contains "key=$key") -and ($ini -contains 'transport=udp')) 'direct-IP client install writes the host address (default port) and the key'
 & $inst -Uninstall -GameDir $root | Out-Null
 Check (-not (Test-Path "$win64\dsound.dll") -and -not (Test-Path "$win64\tow2coop.dll") -and -not (Test-Path "$win64\tow2coop.ini")) 'uninstall removes every file it placed'
 Check (Test-Path "$win64\TheOuterWorlds2-Win64-Shipping.exe") 'uninstall leaves the game alone'

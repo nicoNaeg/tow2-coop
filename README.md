@@ -1,6 +1,7 @@
 # tow2-coop: two-player co-op for The Outer Worlds 2 (work in progress)
 
-Status: **v0.1.0, an early test build, tested with two copies on one PC only** (never across two PCs yet). Two
+Status: **v0.2.0-beta.1, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.
+Tested with two copies on one PC only** (never across two PCs yet; the Steam link was checked on one copy). Two
 independent copies of the game share one campaign owned by the host: the client joins by receiving the host's save,
 each player controls their own character, sees the other (position, rotation, walk/idle animation, the player's look),
 and the host owns NPC health and deaths, quest progress, map travel, door states and container contents. See `TASKS.md`
@@ -58,23 +59,32 @@ Co-op settings come from the environment (else from `tow2coop.ini`, see below): 
 another PC, `TOW2_COOP_BIND` for the host (test copies: 127.0.0.1). Two copies on one 8 GB GPU need the VRAM budget
 that `qa/prep_instance.py` writes (`Engine.ini`) and 960x540.
 
-## Install for players (not released: never tested across two PCs)
+## Install for players (never tested across two PCs yet)
 
 Each player runs the installer on their own PC, with the game closed (it finds the game through Steam; `-GameDir`
-overrides, `-Find` only shows the folder):
+overrides, `-Find` only shows the folder). The two players must be **Steam friends**, each with their own copy:
 
     powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Role host
-    powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Role client -Peer <host address> -Key <host's key>
+    powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Role client [-Friend "<host's Steam name>"]
 
-The host's run prints a key; the friend passes it with `-Key` (a join password against strangers who reach the open port,
-not encryption). The installer places `dsound.dll` (loader), `tow2coop.dll` (the mod) and `tow2coop.ini` (settings,
-section `[coop]`: `role`, `peer`, `port`, `key`, `bind`) in `<game dir>\Arkansas\Binaries\Win64\`, refuses to replace
-another mod's `dsound.dll`, and changes nothing of the game. The host starts the game and loads their campaign; the
-client starts the game and waits at the main menu: about a minute later it receives the host's campaign and loads it.
-The host's PC must be reachable on UDP 27960 and TCP 27961 (Windows asks to allow the game through the firewall on the
-first start; across the internet, forward both ports or use a VPN such as Tailscale or ZeroTier). Only a player with the
-key becomes the peer, and the campaign save goes only to that player's address. `qa/test_install.ps1` checks the
-installer on a fake game folder.
+The host starts the game and loads their campaign; the friend starts the game and waits at the main menu: about a
+minute later the friend receives the host's campaign and loads it. **Over Steam** (the default) there is no address, no
+open port and no firewall prompt: the game's own Steam session carries everything through Valve's relay, encrypted.
+The players find each other through Steam rich presence (the host shows `tow2coop=host`, the friend shows
+`tow2coop=join:<host>`); `-Friend` names the host when several friends host, or when the host's game details are
+private. Only Steam friends are accepted.
+
+**Direct IP** instead (`-Transport udp`, or a client given `-Peer`): the host's run prints a key, the friend runs
+`install.ps1 -Role client -Peer <host address> -Key <key>`, and the host's PC must accept UDP 27960 and TCP 27961
+(forward both ports or use a VPN such as Tailscale or ZeroTier). Only a player with the key becomes the peer, and the
+campaign goes only to that player's address.
+
+The installer places `dsound.dll` (loader), `tow2coop.dll` (the mod) and `tow2coop.ini` (settings, section `[coop]`:
+`role`, `transport`, `host`, `peer`, `port`, `key`, `bind`) in `<game dir>\Arkansas\Binaries\Win64\`, refuses to
+replace another mod's `dsound.dll`, and changes nothing of the game. When something goes wrong, `tow2coop.log` next to
+the mod says what the link did (who was found, session state, hand-over). `qa/test_install.ps1` checks the installer
+on a fake game folder; `qa/test_steam_self.py` checks the Steam hand-over on one copy (the copy sends its campaign to
+itself over Steam, compares every byte and loads it).
 
 ## Remove
 
