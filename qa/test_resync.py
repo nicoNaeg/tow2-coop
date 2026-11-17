@@ -40,6 +40,25 @@ def wait(pred, timeout):
     return safe(pred, False)
 
 
+def in_combat(inst):
+    return call("ue.call", {"ref": "pawn", "fn": "IsInCombat"}, inst=inst)["ReturnValue"]
+
+
+def end_combat(inst=0, patience=60):
+    """A hand-over needs a save, which the game refuses in combat; the bot host stands still (and can't die), so after
+    the melee tests hostile NPCs may keep it in combat for minutes (runs 44-46, 52). Wait, then defeat the hostile ones."""
+    if wait(lambda: not in_combat(inst), patience):
+        return True
+    lib = call("ue.find", {"path": "/Script/Arkansas.Default__CharacterBlueprintFunctionLibrary"}, inst=inst)[0].split()[0]
+    pawn = call("eval", {"expr": "pawn"}, inst=inst)["value"].split()[0]
+    for c in call("ue.find", {"class": "Character", "limit": 400}, inst=inst):
+        a = c.split()[0]
+        att = safe(lambda: call("ue.call", {"ref": lib, "fn": "GetTeamAttitudeTowards", "args": {"Character": a, "Other": pawn}}, inst=inst)["ReturnValue"])
+        if str(att).split(":")[-1] in ("Hostile", "2"):
+            safe(lambda: call("ue.call", {"ref": a + ".HealthComponent", "fn": "Suicide"}, inst=inst))
+    return wait(lambda: not in_combat(inst), 30)
+
+
 def main(which):
     fails = 0
 
@@ -49,6 +68,9 @@ def main(which):
         fails += not ok
 
     if "A" in which:
+        hp = safe(lambda: call("ue.call", {"ref": "pawn.HealthComponent", "fn": "GetHealth"}, inst=0)["ReturnValue"])
+        check(hp is not None and hp > 0, "host is alive (a dead or downed player cannot save)", f"health {hp}")
+        check(end_combat(), "host out of combat (the game refuses to save in combat)", f"in combat: {safe(lambda: in_combat(0))}")
         n = len(call("eval", {"expr": Q}, inst=0)["value"])
         names = [call("eval", {"expr": f"{Q}[{i}].Name"}, inst=0)["value"] for i in range(n)]
         gid, name = None, None
@@ -70,11 +92,18 @@ def main(which):
                 time.sleep(1.0)
             end = state(0, gid)
             check(end in ("Succeeded", "Failed"), "host drove it to an end state", end)
-            r0 = call("coop.status", {}, inst=0)["resyncs"]
-            ok = wait(lambda: state(1, gid) == end, 240)
+            # The hand-over waits while the host can't save: a player would finish a fight first, so the bot does too.
+            t0, fights, ok = time.time(), 0, False
+            while time.time() - t0 < 240 and not ok:
+                ok = safe(lambda: state(1, gid)) == end
+                if not ok and safe(lambda: in_combat(0), False):
+                    fights += 1
+                    end_combat(patience=10)
+                elif not ok:
+                    time.sleep(2)
             s0, s1 = safe(lambda: call("coop.status", {}, inst=0), {}), safe(lambda: call("coop.status", {}, inst=1), {})
-            check(ok, "client reached the same end state", f"client {safe(lambda: state(1, gid))}; host resyncs {s0.get('resyncs')} "
-                  f"(reason: {s0.get('resyncReason')}), client fetches {s1.get('resyncFetches')}")
+            check(ok, "client reached the same end state", f"client {safe(lambda: state(1, gid))} after {time.time() - t0:.0f} s; host resyncs "
+                  f"{s0.get('resyncs')} (reason: {s0.get('resyncReason')}), client fetches {s1.get('resyncFetches')}; host fights ended: {fights}")
             wait(lambda: call("coop.status", {}, inst=0)["puppet"] != "none" and call("coop.status", {}, inst=1)["puppet"] != "none", 120)
             s0, s1 = call("coop.status", {}, inst=0), call("coop.status", {}, inst=1)
             check(s0["puppet"] != "none" and s1["puppet"] != "none", "both see each other after the resync", f"{s0['puppet']} / {s1['puppet']}")

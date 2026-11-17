@@ -61,14 +61,20 @@ void logmsg(const char* fmt, ...) {
 // An access violation inside this DLL while a bridge request runs becomes a C++ exception at the faulting frame, so
 // destructors run and the request fails instead of the game. Faults in game code are left alone (they stay crashes).
 thread_local int t_guard;
+thread_local uintptr_t t_fault_at, t_fault_addr;  // where in this DLL (offset) and what address it read or wrote
 uintptr_t g_self_lo, g_self_hi;
 [[noreturn]] __attribute__((noinline, force_align_arg_pointer)) void throw_av() {
-    throw std::runtime_error("access violation inside the core (bad pointer or layout); the request was aborted");
+    char b[200];  // the offset maps to a function with llvm-symbolizer --obj=tow2coop.dll --adjust-vma=<image base>
+    snprintf(b, sizeof b, "access violation inside the core at +0x%llx, address 0x%llx (bad pointer or layout); the request was aborted",
+             static_cast<unsigned long long>(t_fault_at), static_cast<unsigned long long>(t_fault_addr));
+    throw std::runtime_error(b);
 }
 LONG CALLBACK fault_guard(EXCEPTION_POINTERS* e) {
     if (!t_guard || e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
     uintptr_t rip = e->ContextRecord->Rip;
     if (rip < g_self_lo || rip >= g_self_hi) return EXCEPTION_CONTINUE_SEARCH;
+    t_fault_at = rip - g_self_lo;
+    t_fault_addr = e->ExceptionRecord->NumberParameters >= 2 ? e->ExceptionRecord->ExceptionInformation[1] : 0;
     e->ContextRecord->Rsp -= 8;
     *reinterpret_cast<DWORD64*>(e->ContextRecord->Rsp) = rip + 1;  // a return address inside the faulting function
     e->ContextRecord->Rip = reinterpret_cast<DWORD64>(&throw_av);

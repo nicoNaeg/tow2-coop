@@ -42,22 +42,35 @@ def main(host_pid, att=0, pics=Path(r"C:\coop-anything\local\the-outer-worlds-2\
         print("FAIL no live hostile NPC found\nRESULT: FAIL (1 failure(s))")
         return 1
     _, h_npc, c_npc, path = best
-    p = loc(0, h_npc)
-    # stand 1.5 m from it, facing it
-    ang = math.atan2(me["Y"] - p["Y"], me["X"] - p["X"])
-    stand = {"X": p["X"] + 150 * math.cos(ang), "Y": p["Y"] + 150 * math.sin(ang), "Z": p["Z"] + 30}
-    call("ue.call", {"ref": "pawn", "fn": "K2_SetActorLocation", "args": {"NewLocation": stand, "bSweep": False, "bTeleport": True}}, inst=att)
-    yaw = math.degrees(math.atan2(p["Y"] - stand["Y"], p["X"] - stand["X"]))
-    call("ue.call", {"ref": "pc", "fn": "SetControlRotation", "args": {"NewRotation": {"Pitch": -5, "Yaw": yaw, "Roll": 0}}}, inst=att)
+    mine = h_npc if att == 0 else c_npc  # the target in the attacker's own world
+
+    def approach():
+        """Stand 1.5 m from the target, facing it, as a player chasing it would. Its position comes from the attacker's
+        world: the client's copy of an NPC can be up to 3 m from the host's and keeps moving (run 52: the client swung
+        at the host's position, the bear had walked off and another one took the hits)."""
+        p, me = loc(att, mine), loc(att, "pawn")
+        if math.dist((p["X"], p["Y"]), (me["X"], me["Y"])) > 200:
+            ang = math.atan2(me["Y"] - p["Y"], me["X"] - p["X"])
+            me = {"X": p["X"] + 150 * math.cos(ang), "Y": p["Y"] + 150 * math.sin(ang), "Z": p["Z"] + 30}
+            call("ue.call", {"ref": "pawn", "fn": "K2_SetActorLocation", "args": {"NewLocation": me, "bSweep": False, "bTeleport": True}}, inst=att)
+        yaw = math.degrees(math.atan2(p["Y"] - me["Y"], p["X"] - me["X"]))
+        call("ue.call", {"ref": "pc", "fn": "SetControlRotation", "args": {"NewRotation": {"Pitch": -5, "Yaw": yaw, "Roll": 0}}}, inst=att)
+
+    approach()
     time.sleep(0.8)
     before_h, before_c = hp(0, h_npc), hp(1, c_npc)
     g = Game(host_pid)
     g.shot(str(pics / f"melee-{who}-before.png"))  # a menu or popup in front would eat the clicks
     for _ in range(6):
+        approach()
         g.click("left", hold_s=0.1)
         time.sleep(0.7)
     time.sleep(1.0)
-    after_h, after_c = hp(0, h_npc), hp(1, c_npc)
+    for _ in range(16):  # the last hit may still be on its way (client report -> host -> health stream back)
+        after_h, after_c = hp(0, h_npc), hp(1, c_npc)
+        if abs(after_c - after_h) < 1.0:
+            break
+        time.sleep(0.25)
     print(f"target {path.split('.')[-1]}: host {before_h:.0f} -> {after_h:.0f}, client {before_c:.0f} -> {after_c:.0f}")
     ok_hit = after_h < before_h
     ok_sync = abs(after_c - after_h) < 1.0

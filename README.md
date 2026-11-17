@@ -1,10 +1,11 @@
 # tow2-coop: two-player co-op for The Outer Worlds 2 (work in progress)
 
-Status: **v0.2.0-beta.1, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.
-Tested with two copies on one PC only** (never across two PCs yet; the Steam link was checked on one copy). Two
-independent copies of the game share one campaign owned by the host: the client joins by receiving the host's save,
-each player controls their own character, sees the other (position, rotation, walk/idle animation, the player's look),
-and the host owns NPC health and deaths, quest progress, map travel, door states and container contents. See `TASKS.md`
+Status: **v0.2.0-beta.2, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.
+Tested with two copies on one PC only** (never across two PCs yet; the Steam link was checked on one copy). Both
+players need the same version: beta.2 does not connect to beta.1 (the log says so). Two independent copies of the game
+share one campaign owned by the host: the client joins by receiving the host's save, each player controls their own
+character, sees the other (position, rotation, walk/idle animation, the player's look, armor and helmet changes), and
+the host owns NPC health and deaths, quest progress, map travel, door states and container contents. See `TASKS.md`
 for the acceptance matrix with PASS / PARTIAL / NOT TESTED and evidence.
 
 Download: the release zip (installer, loader, mod, this README). Each player needs their own copy of the game on Steam
@@ -13,6 +14,9 @@ Entertainment or Xbox; it ships no game files. MIT license.
 
 ## How it plays (rules)
 
+- **Saves:** only the host saves the campaign. A game installed as client has saving switched off while the mod runs: its
+  autosave and quicksave slots are the same files as in the friend's own campaign, so a co-op autosave would overwrite
+  them. To play your own campaign alone, uninstall (or reinstall as host).
 - **Join:** the client starts at the main menu and joins; the host saves its current campaign ("CoopHost") and hands it
   over; the client loads it into its own save folder `CoopHost_<host id>` (never over the client's own saves). The client
   plays a copy of the host's character (same look, stats and inventory at join time).
@@ -40,7 +44,7 @@ Entertainment or Xbox; it ships no game files. MIT license.
 |---|---|
 | `bin/dsound.dll` (`sandbox/dsound_proxy.c`) | Proxy loaded by the game. Forwards DirectSound; loads `tow2coop.dll` from a thread. **Test copies only** (`TOW2_SANDBOX_DIR` set): redirects Saved Games, LocalAppData, Documents to the sandbox, answers Steam stat, achievement and cloud writes locally, renames the single-instance mutex; stops the game (`0x5AFE00xx`) if it cannot. |
 | `bin/core/tow2coop.dll` (`core/*.cpp`) | Build check, UE 5.4 reflection, hooks on `UGameEngine::Tick` and `ProcessEvent`; co-op: `coop.cpp` (UDP link, stand-in, NPC authority, doors, containers, resync), `story.cpp` (quests/globals), `join.cpp` (save hand-over over TCP); in test copies the hub's bridge protocol for tests. |
-| `qa/` | Test tooling: gamepool config, deploy/prep scripts, bridge client (`tow2.py`), input (`gamewin.py`), tests (`test_npc_sync.py`, `test_melee.py`, `test_story.py`, `test_resync.py`, `test_interact.py`, `test_join.py`, `test_rejoin.py`), soak (`soak_run.ps1`). |
+| `qa/` | Test tooling: gamepool config, deploy/prep scripts, bridge client (`tow2.py`), input (`gamewin.py`), tests (`test_autojoin.py`, `test_npc_sync.py`, `test_melee.py`, `test_story.py`, `test_interact.py`, `test_look.py`, `test_resync.py`, `test_client_saves.py`, `test_resume.py`, `test_join.py`, `test_rejoin.py`, `test_key.py`, `test_steam_self.py`, `test_install.ps1`), the whole regression (`run_suite.ps1`), soak (`soak_run.ps1`), memory guard (`memguard.ps1`). |
 
 ## Build
 
@@ -52,7 +56,9 @@ Needs llvm-mingw (portable, no install) and the coop-anything hub next to this f
 
 Test copies are hard-linked, isolated installs made by the hub's `tools/gamepool` (config `qa/tow2.gamepool.json`).
 One command runs the whole regression on a pair: `powershell -NoProfile -File qa/run_suite.ps1 -Out <folder>`
-(`qa/soak_run.ps1 -Minutes 30` for the soak, `qa/run_key.ps1` for the shared key). The tests load a save copied from
+(`qa/soak_run.ps1 -Minutes 30` for the soak, `qa/run_key.ps1` for the shared key). Add `-Warm` when other games ran
+since the last session: a start with an emptied graphics-driver shader cache takes 7-17 GB instead of ~4.5 GB, and one
+copy started alone and closed normally (`qa/warmup.ps1`) refills it. The tests load a save copied from
 your own game into each copy's sandbox (`qa/prep_instance.py --saves`); nothing is written to the real save folder.
 Co-op settings come from the environment (else from `tow2coop.ini`, see below): `TOW2_COOP_ROLE=host|client` (or gamepool's `GAMEPOOL_ROLE`),
 `TOW2_COOP_PORT` (UDP, default 27960; the save hand-over uses TCP port + 1), `TOW2_COOP_PEER=ip:port` for a client on
@@ -99,12 +105,14 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
 - Keep the host's game window un-minimized while a friend joins or follows a map change: the game finishes a save only
   while its window is drawn (a minimized copy's save never completes, so the hand-over fails). Switching to another
   window without minimizing is fine.
+- A join or a resync waits while the host can't save (combat, a conversation, a menu): it happens a few seconds after.
 
 - Loading a save within the first ~15 s after start crashes the game (engine `LoadMap`); the client waits 60 s of
   frames before loading a received campaign. Players loading from the menu by hand are not affected.
-- The remote player is a stand-in NPC wearing the player's look as it was when the client joined (face, head, armor
-  set and helmet); armor changed later is not shown to the other player.
+- The remote player is a stand-in NPC with the player's face and body as at the join; their armor set and helmet follow
+  changes within a few seconds (a piece you don't wear yourself shows without its mods).
 - NPC AI still runs in each world; the host corrects positions over 3 m and owns health and death; enemies do not
   attack the remote player's stand-in.
 - Quest completions reach the client by a reload (resync), not live.
-- Damage messages are not acknowledged (fine on loopback/LAN, can be lost on a lossy link).
+- Door and container changes are sent three times without acknowledgement; on a very lossy link one can be missed.
+  (Damage the client deals is resent until the host acknowledges it; quest updates are acknowledged too.)

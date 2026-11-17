@@ -1,6 +1,8 @@
 # Full co-op regression on one PC (two test copies). Writes every test's output to <Out>\suite.log and a summary.
-# Usage: run_suite.ps1 -Out <evidence folder>
-param([Parameter(Mandatory)][string]$Out)
+# Usage: run_suite.ps1 -Out <evidence folder> [-Warm]
+# -Warm: first start copy 0 alone and close it normally, so the graphics driver refills its shader cache (an emptied
+# cache made each start reach 7-17 GB in run 49, which left no room for a map load with two copies).
+param([Parameter(Mandatory)][string]$Out, [switch]$Warm)
 $ErrorActionPreference = 'Continue'
 $hub = 'C:\coop-anything'; $qa = "$hub\local\tow2-coop\qa"; $cfg = "$qa\tow2.gamepool.json"
 New-Item -ItemType Directory -Force $Out | Out-Null
@@ -28,13 +30,19 @@ function Up([switch]$KeepSaves) {
 }
 function Down { & "$qa\close_copies.ps1" | Out-Host; Set-Location $hub; python -I tools/gamepool/gamepool.py --config $cfg down 2>&1 | Select-Object -Last 1 | Out-Host; Start-Sleep 5; Set-Location $qa }
 
+if ($Warm) { & "$qa\warmup.ps1" -Out "$Out\warmup" -Instance 0 -Seconds 150 | Tee-Object -FilePath $log -Append | Out-Host }
 Set-Location $hub
 python -I local/tow2-coop/qa/owner_guard.py snapshot "$Out\owner-before.json" | Out-Host
+# The copies' core logs grow across runs: remember where this run starts (the 'no caught faults' step reads from there).
+$coreLogs = foreach ($i in 0, 1) { "$hub\local\gamepool\instances\tow2\$i\sandbox\tow2coop.log" }
+$logStart = @{}; foreach ($f in $coreLogs) { $logStart[$f] = if (Test-Path $f) { (Get-Item $f).Length } else { 0 } }
 # Stops the copies if free RAM or commit runs low (this PC: 2.8 GB fixed page file); log in <Out>\memory.csv
 Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-File', "$qa\memguard.ps1", '-Out', $Out
 Up
 Step 'host load' { python -I session.py --instances 0 }
 Step 'auto-join' { python -I test_autojoin.py }
+Step 'client saves blocked' { python -I test_client_saves.py "$hub\local\gamepool\instances\tow2\1\sandbox" }
+Step 'players invulnerable' { python -I god.py }  # bots stand still in fights; a dead host cannot save for a hand-over
 Start-Sleep 15
 $p = Pids
 Step 'npc authority' { python -I test_npc_sync.py }
@@ -42,8 +50,10 @@ Step 'melee host' { python -I test_melee.py $p[0] 0 $Out }
 Step 'melee client' { python -I test_melee.py $p[1] 1 $Out }
 Step 'story' { python -I test_story.py }
 Step 'interact' { python -I test_interact.py }
+Step 'outfit follows' { python -I test_look.py }
 Step 'resync quest outcome' { python -I test_resync.py A }
 Step 'resync map travel' { python -I test_resync.py B }
+Step 'client saves (session)' { python -I test_client_saves.py "$hub\local\gamepool\instances\tow2\1\sandbox" session "$hub\local\the-outer-worlds-2\test-saves\TheOuterWorlds2" }
 Step 'resume save' { python -I test_resume.py save "$Out\resume-facts.json" }
 Down
 Up -KeepSaves
@@ -52,6 +62,16 @@ Step 'auto-join after restart' { python -I test_autojoin.py }
 Start-Sleep 20
 Step 'resume check' { python -I test_resume.py check "$Out\resume-facts.json" }
 foreach ($i in 0, 1) { Get-ChildItem "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes" -ErrorAction SilentlyContinue | ForEach-Object { "crash report in copy ${i}: $($_.Name)" | Tee-Object -FilePath $log -Append; Copy-Item $_.FullName $Out -Recurse } }
+Step 'no caught faults' {  # a fault the core's guard caught aborts that frame's sync (run 50: old world after a load)
+    $bad = @(foreach ($f in $coreLogs) {
+        if (-not (Test-Path $f)) { continue }
+        $fs = [IO.File]::Open($f, 'Open', 'Read', 'ReadWrite'); [void]$fs.Seek([math]::Min($logStart[$f], $fs.Length), 'Begin')
+        $text = (New-Object IO.StreamReader($fs)).ReadToEnd(); $fs.Close()
+        $text -split "`n" | Where-Object { $_ -match 'co-op frame error' } | ForEach-Object { "copy $(Split-Path -Leaf (Split-Path (Split-Path $f))): $_" }
+    })
+    $bad | Select-Object -First 8
+    "RESULT: $(if ($bad.Count) { 'FAIL' } else { 'PASS' }) ($($bad.Count) failure(s))"
+}
 Down
 New-Item -ItemType File -Force "$Out\memguard.stop" | Out-Null
 if (Test-Path "$Out\memguard.log") { Get-Content "$Out\memguard.log" | Tee-Object -FilePath $log -Append }

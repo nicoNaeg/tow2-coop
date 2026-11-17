@@ -28,7 +28,9 @@ std::mutex mu;
 std::string state = "idle", error, folder;  // folder: the save folder name the client will load
 std::atomic<bool> busy{false}, ready_to_load{false};
 uint64_t bytes = 0;
-double started = 0;
+double started = 0, load_t = -1e9;  // load_t: when this core last started a LoadGame (game thread)
+bool load_ok = false;               // the game accepted that LoadGame
+uintptr_t load_world = 0;           // the world it was started from
 
 double now_s() { return GetTickCount64() / 1000.0; }
 void set_state(const std::string& s, const std::string& e = "") {
@@ -297,9 +299,17 @@ json host_offer(int port, const std::string& bind_ip, const std::string& allow_i
     std::vector<ue::UObject*> found = ue::instances(ue::find_class("/Script/Arkansas.SaveGameManager"), false, 1);
     ue::UObject* sgm = found.empty() ? nullptr : found[0];
     if (!sgm) { busy = false; throw std::runtime_error("no SaveGameManager"); }
+    // The previous hand-over's files go first: if the game refuses to save now (combat, a conversation, a menu...), the
+    // worker finds nothing instead of sending the old campaign (run 44-45: the client got a stale save mid-combat).
+    for (auto& f : files_of(dir + L"\\CoopHost")) DeleteFileW((dir + L"\\CoopHost\\" + f).c_str());
     json a = json::object();
     a.set("Filename", "CoopHost").set("bIgnoreSuperNova", true).set("SaveGameType", "Standard");
     json r = ue::call(sgm, ue::find_func(ue::class_of(sgm), "SaveGame"), a);
+    std::string saved = r.get("ReturnValue").asString();
+    if (saved != "Success" && saved != "AsyncSaveTask_Begun") {  // the client asks again in a few seconds
+        busy = false;
+        throw std::runtime_error("the host cannot save right now (" + saved + ")");
+    }
     bytes = 0, started = now_s(), error.clear();
     set_state("saving");
     std::thread(host_worker, dir + L"\\CoopHost", port, bind_ip, allow_ip, steam_to, host_id).detach();
@@ -375,6 +385,27 @@ void on_steam_data(const char* d, int n) {
     }
 }
 
+// Game thread. The old world is torn down over several frames after LoadGame (run 50: 7 s after the call) and the
+// world pointer changes only when the new one is there; a refused load keeps the old world, so no wait then.
+bool loading() {
+    double t = now_s() - load_t;
+    if (t < 5.0) return true;
+    if (t >= 60.0 || !load_ok) return false;
+    std::string err;
+    return reinterpret_cast<uintptr_t>(ue::resolve("world", &err)) == load_world;
+}
+
+// A joined player's game must not save: its autosave and quicksave slots ("Autosave02", ...) are the same files as in
+// the player's own campaign, so a co-op autosave would overwrite them; the host keeps the campaign (test_client_saves.py).
+void block_saves(bool block) {
+    std::vector<ue::UObject*> found = ue::instances(ue::find_class("/Script/Arkansas.SaveGameManager"), false, 1);
+    ue::UFunction* f = found.empty() ? nullptr : ue::find_func(ue::class_of(found[0]), "DisableSaves");
+    if (!f) return;
+    json a = json::object();
+    a.set("bDisable", block);
+    ue::call(found[0], f, a);
+}
+
 // Game thread: load the received save once (the front end must have run for a while, see session.py).
 void frame(uint64_t frames) {
     if (frames < 3600 || !ready_to_load.load()) return;  // LoadGame in the first ~15 s after start crashed the engine
@@ -386,7 +417,13 @@ void frame(uint64_t frames) {
     json a = json::object();
     a.set("Filename", f).set("bPreValidateMetadata", true);
     set_state("loading");
+    block_saves(false);  // a joined game has saves off, which may refuse the load too; the new world blocks them again
+    std::string err;
+    load_world = reinterpret_cast<uintptr_t>(ue::resolve("world", &err));
+    load_ok = false;
+    load_t = now_s();
     json r = ue::call(found[0], ue::find_func(ue::class_of(found[0]), "LoadGame"), a);
+    load_ok = r.get("ReturnValue").asString().find("Success") != std::string::npos;
     set_state("loaded:" + r.get("ReturnValue").asString());
 }
 

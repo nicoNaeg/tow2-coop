@@ -55,8 +55,9 @@ struct Outgoing {
     double at[3];
     int sent;
 };
-constexpr uint32_t kMagic = 0x30433254;  // "T2C0"
-constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11;
+constexpr uint32_t kMagic = 0x31433254;  // "T2C1": the last character is the protocol version, bump it on any packet change
+constexpr const char* kVersion = "0.2.0-beta.2";
+constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12;
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";
 
@@ -92,6 +93,12 @@ struct Damage {
     uint32_t eid;  // client-unique; the host acknowledges it and applies each eid once
     uint64_t id;
     float amount;
+};
+// Either way, every 2 s (UDP may drop one): the armor set and helmet the player wears, class paths, empty = none,
+// and whether the helmet shows (none worn, or hidden: the stand-in body would show its own cap, probe 53).
+struct Look {
+    char item[2][256];
+    uint8_t helmet_shown;
 };
 #pragma pack(pop)
 
@@ -134,7 +141,7 @@ struct Ctx {
     uint64_t npc_sent = 0, npc_applied = 0, npc_killed = 0, npc_snapped = 0, dmg_sent = 0, dmg_applied = 0, drops = 0, map_changes = 0;
     double settle_until = 0, next_tame = 0;
     // resync: the host hands its campaign over again (save + TCP) when the client cannot follow (map, quest outcome)
-    uintptr_t world_ptr = 0;
+    uintptr_t world_ptr = 0, saves_blocked_world = 0;
     int port = 27960;
     double resync_cooldown = 0, mismatch_since = -1, next_resync_send = 0, fetch_quiet_until = 0;
     int resync_sends = 0;
@@ -159,6 +166,9 @@ struct Ctx {
     std::string resync_reason;
     bool in_gameplay = false;
     uint64_t brain_stops = 0;
+    std::string look[2], look_applied;  // the other player's armor set and helmet; what the stand-in shows
+    bool have_look = false, look_helmet_shown = true;
+    double next_look = 0;
 } g;
 
 uint64_t fnv64(const std::string& s) {
@@ -442,6 +452,8 @@ void request_resync(const char* reason) {
         join::host_offer(g.port + 1, bind_ip(), peer_ip, g.steam ? g.peer_id : 0, g.me);
     } catch (const std::exception& e) {
         g.last_error = std::string("resync offer: ") + e.what();
+        static std::string logged;  // once per reason: the client asks again every few seconds
+        if (logged != e.what()) core_log(std::string("hand-over waits: ") + (logged = e.what()));
         return;
     }
     g.resync_cooldown = g.now + 60.0;  // one hand-over at a time; the client needs ~30-60 s to reload
@@ -695,7 +707,16 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
     if (n < static_cast<int>(sizeof(Header))) { g.bad++; return; }
     Header h;
     memcpy(&h, buf, sizeof h);
-    if (h.magic != g.magic || h.size != n || h.sender == g.me) { g.bad++; return; }
+    if (h.magic != g.magic || h.size != n || h.sender == g.me) {
+        static bool warned = false;  // "T2C" + protocol digit: another digit is another version of the mod
+        if (!warned && g.magic == kMagic && h.magic != kMagic && (h.magic & 0x00FFFFFFu) == (kMagic & 0x00FFFFFFu)) {
+            warned = true;
+            core_log(std::string("the other player runs another version of the mod (protocol ") + static_cast<char>(h.magic >> 24) + ", this one " +
+                     static_cast<char>(kMagic >> 24) + "): both players need the same version");
+        }
+        g.bad++;
+        return;
+    }
     if (g.host && !g.have_peer) {  // first client becomes the peer
         if (from) g.peer = *from;
         g.peer_id = from_id;
@@ -704,8 +725,8 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
     if (g.remote_id && h.sender != g.remote_id) { g.bad++; return; }  // shortcut: one remote player only
     if (h.type == kHello) { g.remote_id = h.sender; return; }
     if (h.type == kBye) { g.remote_id = 0; g.snaps.clear(); return; }
-    // shortcut: one sequence for every packet type, newest wins; damage events can be lost on a lossy link
-    // (loopback and LAN rarely drop); make them acked when testing over the internet.
+    // One sequence for every packet type, newest wins: a reordered packet is dropped. Damage and story updates are
+    // resent until acknowledged, looks every 2 s; door and container changes go out three times.
     if (g.remote_id == h.sender && h.seq <= g.remote_last_seq) { g.stale++; return; }  // reordered or duplicate
     if (g.remote_id != h.sender && g.host) story::reset_peer();  // a (re)joined client gets the story log replayed
     g.remote_id = h.sender;
@@ -764,6 +785,16 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
         send_typed(kDamageAck, &d.eid, 4);
         return;
     }
+    if (h.type == kLook) {
+        if (n != static_cast<int>(sizeof(Header) + sizeof(Look))) { g.bad++; return; }
+        Look l;
+        memcpy(&l, buf + sizeof(Header), sizeof l);
+        for (int i = 0; i < 2; i++) g.look[i].assign(l.item[i], strnlen(l.item[i], sizeof l.item[i]));
+        g.look_helmet_shown = l.helmet_shown != 0;
+        g.have_look = true;
+        g.recv++;
+        return;
+    }
     if (h.type == kDamageAck && !g.host) {
         uint32_t eid;
         if (n != static_cast<int>(sizeof(Header)) + 4) { g.bad++; return; }
@@ -813,6 +844,75 @@ void call_quiet(const std::string& ref, const char* fn, const json& args) {
     try { ue::call(o, f, args); } catch (const std::exception& e) { g.last_error = std::string(fn) + ": " + e.what(); }
 }
 
+const char* const kArmorSlot[2] = {"ArmorSet", "Helmet"};
+
+ue::UObject* worn(ue::UObject* equipment, int slot) {  // the armor set (0) or helmet (1) worn, nullptr if none
+    ue::UFunction* f = ue::find_func(ue::class_of(equipment), slot == 0 ? "GetEquippedArmor" : "GetEquippedHelmet");
+    std::string r = f ? ue::call(equipment, f, json::object()).get("ReturnValue").asString() : std::string();
+    std::string err;
+    return r.rfind("0x", 0) == 0 ? ue::resolve(r.substr(0, r.find(' ')), &err) : nullptr;
+}
+
+ue::UClass* load_class(const std::string& path) {  // a Blueprint class by path, loaded if needed (blocking)
+    if (ue::UClass* c = ue::find_class(path)) return c;
+    ue::UClass* k = ue::find_class("/Script/Engine.KismetSystemLibrary");
+    json a = json::object();
+    a.set("AssetClass", path);
+    try { ue::call(ue::cdo(k), ue::find_func(k, "LoadClassAsset_Blocking"), a); } catch (const std::exception& e) { g.last_error = e.what(); }
+    return ue::find_class(path);
+}
+
+// The stand-in wears the other player's armor set and helmet as a visual override (nothing is equipped or given to the
+// NPC). Until their first look message arrives: the local player's (the joined client plays a copy of the host's
+// character). Same piece as ours: our item (its mods show); another one: the class defaults (unmodded).
+std::string look_key() { return g.look[0] + "|" + g.look[1] + (g.look_helmet_shown ? "|shown" : "|hidden"); }
+
+bool helmet_shown(ue::UObject* equipment) {  // a helmet worn and not hidden (the stand-in mirrors it)
+    if (!worn(equipment, 1)) return false;
+    try { return ue::eval_path("pawn.AppearanceComponent.bHelmetVisible").asBool(true); } catch (const std::exception&) { return true; }
+}
+
+void dress_outfit() {
+    g.look_applied = g.have_look ? look_key() : std::string();  // first: a failure is not retried every frame
+    std::string err;
+    ue::UObject* my_eq = ue::resolve("pawn.EquipmentComponent", &err);
+    ue::UObject* their_eq = g.puppet ? ue::resolve(ue::addr(g.puppet) + ".EquipmentComponent", &err) : nullptr;
+    if (!my_eq || !their_eq) return;
+    for (int i = 0; i < 2; i++) {
+        ue::UObject* mine = worn(my_eq, i);
+        std::string want = g.have_look ? g.look[i] : mine ? ue::path_of(ue::class_of(mine)) : std::string();
+        ue::UObject* item = mine && ue::path_of(ue::class_of(mine)) == want ? mine : nullptr;
+        // A path from the other player (trust boundary): only a /Game/ class of this slot's item type is used.
+        ue::UClass* base = ue::find_class(i == 0 ? "/Script/Arkansas.ArmorSet" : "/Script/Arkansas.Helmet");
+        if (!item && base && want.rfind("/Game/", 0) == 0)
+            if (ue::UClass* c = load_class(want))
+                if (ue::cdo(c) && ue::is_a(ue::cdo(c), base)) item = ue::cdo(c);
+        json a = json::object();
+        a.set("Slot", kArmorSlot[i]);
+        if (!item) { call_quiet(ue::addr(their_eq), "ClearArmorVisualOverride", a); continue; }
+        a.set("OverrideItem", ue::addr(item));
+        call_quiet(ue::addr(their_eq), "SetArmorVisualOverride", a);
+    }
+    // Without a helmet override the stand-in body shows its own headgear (a dock worker's cap): hide it then.
+    bool shown = g.have_look ? g.look_helmet_shown : helmet_shown(my_eq);
+    try { ue::set_path(ue::addr(g.puppet) + ".AppearanceComponent.bHelmetVisible", json(shown)); } catch (const std::exception& e) { g.last_error = std::string("helmet: ") + e.what(); }
+    call_quiet(ue::addr(g.puppet) + ".AppearanceComponent", "RefreshFullAppearance", json::object());
+}
+
+void send_look() {
+    std::string err;
+    ue::UObject* eq = ue::resolve("pawn.EquipmentComponent", &err);
+    if (!eq) return;
+    Look l{};
+    for (int i = 0; i < 2; i++) {
+        ue::UObject* item = worn(eq, i);
+        std::string p = item ? ue::path_of(ue::class_of(item)) : std::string();
+        if (p.size() < sizeof l.item[i]) memcpy(l.item[i], p.data(), p.size());  // never cut: a cut path names no class
+    }
+    l.helmet_shown = helmet_shown(eq) ? 1 : 0;
+    send_typed(kLook, &l, sizeof l);
+}
+
 // The joined client plays a copy of the host's character, so the stand-in takes the local player's look: the
 // Customization struct (floats and shared appearance-asset pointers only, safe to copy), head and body, then a refresh.
 void dress_puppet() {
@@ -829,21 +929,7 @@ void dress_puppet() {
     ue::UObject* h = ue::resolve("pawn.AppearanceComponent.DefaultHead", &err);
     if (b) { body.set("Body", ue::addr(b)); call_quiet(ue::addr(theirs), "SetDefaultBody", body); }
     if (h) { head.set("Head", ue::addr(h)); call_quiet(ue::addr(theirs), "SetDefaultHead", head); }
-    // Outfit: the body follows the armor worn, so the stand-in shows the player's armor set and helmet (a visual
-    // override: nothing is equipped or given to the NPC).
-    ue::UObject* my_eq = ue::resolve("pawn.EquipmentComponent", &err);
-    ue::UObject* their_eq = ue::resolve(ue::addr(g.puppet) + ".EquipmentComponent", &err);
-    const char* slots[][2] = {{"ArmorSet", "GetEquippedArmor"}, {"Helmet", "GetEquippedHelmet"}};
-    for (auto& s : slots) {
-        ue::UFunction* get = my_eq && their_eq ? ue::find_func(ue::class_of(my_eq), s[1]) : nullptr;
-        if (!get) continue;
-        std::string item = ue::call(my_eq, get, json::object()).get("ReturnValue").asString();
-        if (item.rfind("0x", 0) != 0) continue;  // nothing worn in that slot
-        json a = json::object();
-        a.set("Slot", s[0]).set("OverrideItem", item.substr(0, item.find(' ')));
-        call_quiet(ue::addr(their_eq), "SetArmorVisualOverride", a);
-    }
-    call_quiet(ue::addr(theirs), "RefreshFullAppearance", json::object());
+    dress_outfit();
 }
 
 void tame_puppet(bool full) {
@@ -887,16 +973,8 @@ bool spawn_puppet(const Snapshot& s) {
     json gender = json();
     try { gender = ue::eval_path("pawn.AppearanceComponent.AppearanceGender.TagName"); } catch (...) {}
     const char* klass = gender.asString().find("Female") != std::string::npos ? kPuppetClassFemale : kPuppetClass;
-    ue::UClass* cls = ue::find_class(klass);
-    if (!cls) {
-        // shortcut: the class must already be loaded in this level (it is in 0601); load it with
-        // KismetSystemLibrary.LoadClassAsset_Blocking when other levels need it.
-        json a = json::object();
-        a.set("AssetClass", klass);
-        try { ue::call(ue::cdo(ue::find_class("/Script/Engine.KismetSystemLibrary")), ue::find_func(ue::find_class("/Script/Engine.KismetSystemLibrary"), "LoadClassAsset_Blocking"), a); } catch (const std::exception& e) { g.last_error = e.what(); }
-        cls = ue::find_class(klass);
-        if (!cls) { g.last_error = "puppet class not loaded"; return false; }
-    }
+    ue::UClass* cls = load_class(klass);
+    if (!cls) { g.last_error = "puppet class not loaded"; return false; }
     std::string err;
     ue::UObject* world_ctx = ue::resolve("pc", &err);
     ue::UObject* gs = ue::cdo(ue::find_class("/Script/Engine.GameplayStatics"));
@@ -952,6 +1030,9 @@ void drive_puppet() {
     if (g.now >= g.next_tame) {
         g.next_tame = g.now + 2.0;
         tame_puppet(false);
+    }
+    if (g.have_look && look_key() != g.look_applied) {  // the other player changed armor or helmet
+        try { dress_outfit(); } catch (const std::exception& e) { g.last_error = std::string("outfit: ") + e.what(); }
     }
     static Fn set;
     if (!set.init(g.puppet, "K2_SetActorLocationAndRotation")) return;
@@ -1085,14 +1166,16 @@ bool start(std::string& why) {
     g.start_time = clock_s();
     if (g.steam) why += g.host ? "; host: Steam friends running the mod as client join" : "; client: joins a Steam friend hosting";
     else why = std::string(g.host ? "host on port " : "client, host port ") + std::to_string(g.host ? port : ntohs(g.peer.sin_port));
+    why = std::string("tow2coop ") + kVersion + ", " + why;
     return true;
 }
 
 void frame(float) {
     if (!g.on) return;
     g.now = clock_s();
-    receive();
-    if (g.steam) steam_discovery();
+    // A hand-over load tears the old world down over the next frames: touching its objects then faulted every frame
+    // (runs 42, 44, 50) and an aborted game call mid-load may leave it half done. Stay away until the new world exists.
+    if (join::loading()) return;
     ue::UObject* pawn = local_pawn();
     std::string err;
     ue::UObject* world = ue::resolve("world", &err);
@@ -1114,6 +1197,8 @@ void frame(float) {
     bool gameplay = pawn && ue::class_name(pawn) == "IndianaPlayerCharacter_BP_C";
     bool settled = gameplay && g.now >= g.settle_until;
     g.in_gameplay = settled;
+    receive();  // after the world check: data for the old world's objects is ignored until the new one settles
+    if (g.steam) steam_discovery();
     if (g.now >= g.next_send && pawn && g.have_peer && settled) {
         g.next_send = g.now + 1.0 / 30;
         State st{};
@@ -1137,11 +1222,20 @@ void frame(float) {
         if (g.steam) core_log("steam: no data from " + steamnet::name(g.peer_id) + " for 5 s" + (g.host ? ", looking for a client again" : ""));
         g.drops++;
     }
+    if (pawn && settled && !g.host && g.saves_blocked_world != g.world_ptr) {  // again once settled: the game may lift it
+        join::block_saves(true);
+        g.saves_blocked_world = g.world_ptr;
+        core_log("saves are off in this joined game: the host keeps the campaign, your own saves stay untouched");
+    }
     if (pawn && settled) {
         setup_watches();
         process_observed();
         if (g.opt_doors) poll_doors();
         send_outgoing();
+        if (g.have_peer && g.now >= g.next_look) {
+            g.next_look = g.now + 2.0;
+            send_look();
+        }
         drive_puppet();
         if (g.opt_scan) scan_step(pawn);
         if (g.host && g.opt_story) story::host_frame(g.now, send_typed);  // polls even without a peer: the log covers the whole session
@@ -1210,6 +1304,7 @@ json status() {
     s.set("sent", static_cast<double>(g.sent)).set("recv", static_cast<double>(g.recv)).set("stale", static_cast<double>(g.stale)).set("bad", static_cast<double>(g.bad));
     s.set("peer", g.have_peer).set("puppet", g.puppet ? ue::addr(g.puppet) : std::string("none")).set("error", g.last_error);
     s.set("sameMap", g.puppet_map == g.my_map);
+    s.set("remoteArmor", g.look[0]).set("remoteHelmet", g.look[1]).set("remoteHelmetShown", g.look_helmet_shown).set("lookApplied", g.look_applied);
     s.set("story", story::status());
     s.set("doorsSent", static_cast<double>(g.doors_sent)).set("doorsApplied", static_cast<double>(g.doors_applied));
     s.set("itemsSent", static_cast<double>(g.items_sent)).set("itemsApplied", static_cast<double>(g.items_applied)).set("lastInteract", g.last_interact);
