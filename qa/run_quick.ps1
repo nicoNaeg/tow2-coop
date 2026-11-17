@@ -1,0 +1,58 @@
+# Targeted regression on one pair for the two-PC fixes (stand-in look and animation, interactions incl. dead-NPC loot,
+# map-travel hand-over), plus the owner-state and caught-fault checks. The whole suite is run_suite.ps1.
+# Usage: run_quick.ps1 -Out <evidence folder> [-NoRamCheck] [-Only 'interact and loot','...'] (the join steps always run)
+param([Parameter(Mandatory)][string]$Out, [switch]$NoRamCheck, [string[]]$Only)
+$ErrorActionPreference = 'Continue'
+$hub = 'C:\coop-anything'; $qa = "$hub\local\tow2-coop\qa"; $cfg = "$qa\tow2.gamepool.json"
+New-Item -ItemType Directory -Force $Out | Out-Null
+$log = "$Out\suite.log"; $results = [ordered]@{}
+function Step([string]$name, [scriptblock]$body) {
+    if ($Only -and $name -notin $Only -and $name -notin 'host load', 'auto-join', 'players invulnerable', 'no caught faults') { return }
+    "=== $name ($(Get-Date -Format HH:mm:ss))" | Tee-Object -FilePath $log -Append | Out-Host
+    $text = & $body 2>&1 | Out-String
+    $text | Tee-Object -FilePath $log -Append | Out-Host
+    $m = [regex]::Match($text, 'RESULT: (PASS|FAIL)')
+    if ($m.Success) { $results[$name] = $m.Groups[1].Value }
+}
+function Pids { foreach ($i in 0, 1) { (Get-Content "$hub\local\gamepool\instances\tow2\$i\sandbox\sandbox.log" | Select-String 'sandbox on: pid (\d+)' | Select-Object -Last 1).Matches[0].Groups[1].Value } }
+Set-Location $hub
+python -I local/tow2-coop/qa/owner_guard.py snapshot "$Out\owner-before.json" | Out-Host
+$coreLogs = foreach ($i in 0, 1) { "$hub\local\gamepool\instances\tow2\$i\sandbox\tow2coop.log" }
+$logStart = @{}; foreach ($f in $coreLogs) { $logStart[$f] = if (Test-Path $f) { (Get-Item $f).Length } else { 0 } }
+Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-File', "$qa\memguard.ps1", '-Out', $Out
+foreach ($i in 0, 1) {
+    python -I local/tow2-coop/qa/deploy.py --config $cfg --instance $i | Out-Null
+    python -I local/tow2-coop/qa/prep_instance.py --config $cfg --instance $i | Out-Null
+    $cr = "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes"; if (Test-Path $cr) { Remove-Item $cr -Recurse -Force }
+}
+$extra = @(); if ($NoRamCheck) { $extra += '--no-ram-check' }
+python -I tools/gamepool/gamepool.py --config $cfg up --pairs 1 --stagger 60 @extra 2>&1 | Select-Object -Last 2 | Out-Host
+Get-Process -Name 'TheOuterWorlds2-Win64-Shipping' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$hub\local\gamepool\instances\*" } | ForEach-Object { & "$qa\unminimize.ps1" -ProcessId $_.Id | Out-Null }
+Set-Location $qa
+Step 'host load' { python -I session.py --instances 0 }
+Step 'auto-join' { python -I test_autojoin.py }
+Step 'players invulnerable' { python -I god.py }
+Start-Sleep 10
+$p = Pids
+Step 'outfit and hair' { python -I test_look.py }
+Step 'stand-in animation' { python -I test_anim.py $p[1] }
+Step 'interact and loot' { python -I test_interact.py }
+Step 'resync map travel' { python -I test_resync.py B }
+foreach ($i in 0, 1) { Get-ChildItem "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes" -ErrorAction SilentlyContinue | ForEach-Object { "crash report in copy ${i}: $($_.Name)" | Tee-Object -FilePath $log -Append } }
+Step 'no caught faults' {
+    $bad = @(foreach ($f in $coreLogs) {
+        if (-not (Test-Path $f)) { continue }
+        $fs = [IO.File]::Open($f, 'Open', 'Read', 'ReadWrite'); [void]$fs.Seek([math]::Min($logStart[$f], $fs.Length), 'Begin')
+        $text = (New-Object IO.StreamReader($fs)).ReadToEnd(); $fs.Close()
+        $text -split "`n" | Where-Object { $_ -match 'co-op frame error|join error' } | ForEach-Object { "copy $(Split-Path -Leaf (Split-Path (Split-Path $f))): $_" }
+    })
+    $bad | Select-Object -First 8
+    "RESULT: $(if ($bad.Count) { 'FAIL' } else { 'PASS' }) ($($bad.Count) failure(s))"
+}
+& "$qa\close_copies.ps1" | Out-Host
+Set-Location $hub; python -I tools/gamepool/gamepool.py --config $cfg down 2>&1 | Select-Object -Last 1 | Out-Host
+New-Item -ItemType File -Force "$Out\memguard.stop" | Out-Null
+if (Test-Path "$Out\memguard.log") { Get-Content "$Out\memguard.log" | Tee-Object -FilePath $log -Append }
+python -I local/tow2-coop/qa/owner_guard.py compare "$Out\owner-before.json" 2>&1 | Out-String | Tee-Object -FilePath $log -Append | Out-Host
+"=== SUMMARY" | Tee-Object -FilePath $log -Append
+foreach ($k in $results.Keys) { "{0,-24} {1}" -f $k, $results[$k] | Tee-Object -FilePath $log -Append }

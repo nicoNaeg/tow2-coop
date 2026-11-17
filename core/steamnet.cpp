@@ -30,6 +30,7 @@ struct FriendGameInfo {  // FriendGameInfo_t
 static_assert(sizeof(FriendGameInfo) == 24, "FriendGameInfo_t layout");
 
 void *msgs_, *friends_, *netutils_;
+int rate_set_ = 0;  // send buffer and rates set (3 = all)
 uint64_t me_;
 uint32_t app_;
 int (*send_)(void*, const Identity&, const void*, uint32_t, int, int);
@@ -108,9 +109,22 @@ bool start(std::string& why) {
     if (!msgs || !friends_ || !user || !utils || !netutils_) { why = "a Steam interface is missing"; return false; }
     me_ = user_id(user), app_ = appid(utils);
     init_relay(netutils_);  // starts measuring the relay network now, so the first session connects faster
+    // Faster hand-overs: the default send rate (256 KB/s) took 7 s for a 2 MB campaign in the two-PC test. Each value
+    // is set only when the id has the expected name in this steam_api64.dll.
+    const char* (*cfg_info)(void*, int, int*, int*) = nullptr;
+    bool (*cfg_set)(void*, int, int32_t) = nullptr;
+    if (get(m, "SteamAPI_ISteamNetworkingUtils_GetConfigValueInfo", cfg_info) && get(m, "SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueInt32", cfg_set)) {
+        const std::pair<int, const char*> ids[] = {{9, "SendBufferSize"}, {10, "SendRateMin"}, {11, "SendRateMax"}};
+        const int32_t values[] = {8 << 20, 1 << 20, 1 << 20};  // 8 MB buffer, 1 MB/s
+        for (int i = 0; i < 3; i++) {
+            int type = 0, scope = 0;
+            const char* n = cfg_info(netutils_, ids[i].first, &type, &scope);
+            if (n && std::string(n) == ids[i].second && cfg_set(netutils_, ids[i].first, values[i])) rate_set_++;
+        }
+    }
     msgs_ = msgs;
     set_session_cb(netutils_, on_session_request);
-    why = "Steam link ready (app " + std::to_string(app_) + ")";
+    why = "Steam link ready (app " + std::to_string(app_) + (rate_set_ == 3 ? ", 1 MB/s" : ", default send rate") + ")";
     return true;
 }
 

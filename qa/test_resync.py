@@ -114,8 +114,14 @@ def main(which):
         check(bool(d), "travel destination loaded", DEST.split(".")[-1])
         print("travel:", safe(lambda: call("ue.call", {"ref": tm, "fn": "BeginTravelToBP", "args": {"Destination": d[0].split()[0],
               "bPassGametime": False, "bTriggerAutosave": False, "bForceBlocking": False}, "timeoutMs": 240000}, inst=0, timeout_s=250)), flush=True)
+        before = safe(lambda: call("coop.status", {}, inst=0)["resyncs"], 0)
         check(wait(lambda: "0605" in world(0), 240), "host arrived in the new map", world(0))
+        t_host = time.time()
+        # Two-PC test: the hand-over started ~15 s after the host's arrival (map settle + 5 s of "client elsewhere").
+        pushed = wait(lambda: safe(lambda: call("coop.status", {}, inst=0)["resyncs"], before) > before, 60)
+        check(pushed and time.time() - t_host < 10, "host handed the campaign over right after arriving", f"after {time.time() - t_host:.1f} s")
         check(wait(lambda: "0605" in world(1), 300), "client followed into the new map", world(1))
+        print(f"client in the new map {time.time() - t_host:.0f} s after the host", flush=True)
         wait(lambda: call("coop.status", {}, inst=0)["puppet"] != "none" and call("coop.status", {}, inst=1)["puppet"] != "none", 120)
         s0, s1 = call("coop.status", {}, inst=0), call("coop.status", {}, inst=1)
         check(s0["puppet"] != "none" and s1["puppet"] != "none", "both see each other in the new map",

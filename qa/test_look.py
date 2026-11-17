@@ -76,6 +76,13 @@ def main():
     if s0["puppet"] == "none":
         print(f"RESULT: FAIL ({fails} failure(s))")
         return fails
+    # Hair (two-PC test: the stand-in was bald without a helmet): an NPC body applies Customization only when enabled.
+    p0 = s0["puppet"].split()[0]
+    enabled = call("ue.get", {"path": f"{p0}.AppearanceComponent.bEnableCustomization"}, inst=0)
+    asset = lambda r: r.split()[2] if str(r).startswith("0x") else None  # noqa: E731  the hair asset's path
+    hair = asset(call("ue.get", {"path": f"{p0}.AppearanceComponent.Customization.Hair"}, inst=0))
+    mine = asset(call("ue.get", {"path": "pawn.AppearanceComponent.Customization.Hair"}, inst=0))
+    check(enabled is True and hair == mine, "stand-in has the player's hair (customization enabled)", f"enabled {enabled}, hair {hair} / {mine}")
     a0, h0 = worn(1, "ArmorSet"), worn(1, "Helmet")
     print("client wears", a0, "/", h0, flush=True)
     check(wait_for("ArmorSet", a0) and wait_for("Helmet", h0), "stand-in wears the client's armor set and helmet",

@@ -1,10 +1,10 @@
 # tow2-coop: two-player co-op for The Outer Worlds 2 (work in progress)
 
-Status: **v0.2.0-beta.4, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.
-Tested with two copies on one PC only.** Two tries across two PCs have not linked yet. In the first (beta.2), the mod
-looked for the game's Steam session once, too early; beta.3 waits for it. In the second (beta.3), the friend's game
-found the host, but the host never accepted the connection; beta.4 accepts a waiting connection from any Steam friend
-and logs what the host sees. Use beta.4 on both PCs (beta.1 does not connect; the log says so). Two independent copies of the game
+Status: **v0.2.0-beta.5, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.**
+First real session across two PCs on 2026-11-17 (third try, beta.4 on the host): the friend joined over Steam, both
+played and followed four map changes. beta.5 fixes what the players saw: stand-ins without walk animation or hair,
+dead enemies whose loot came back in the other world, and a long wait after the host's map change. Use beta.5 on both
+PCs (beta.1 does not connect; the log says so). Two independent copies of the game
 share one campaign owned by the host: the client joins by receiving the host's save, each player controls their own
 character, sees the other (position, rotation, walk/idle animation, the player's look, armor and helmet changes), and
 the host owns NPC health and deaths, quest progress, map travel, door states and container contents. See `TASKS.md`
@@ -26,10 +26,11 @@ Entertainment or Xbox; it ships no game files. MIT license.
 - **Combat:** NPC health and deaths follow the host; damage a client deals is sent to the host and applied there.
 - **Quests and story:** host-owned. Quest starts, objective updates (addendums) and objective global variables reach the
   client live; quest completions/failures reach it through a save resync (a short reload on the client).
-- **Travel:** host-led. When the host travels to another map, the client is handed the campaign again and follows.
+- **Travel:** host-led. When the host arrives in another map (or reloads), the client is handed the campaign again and
+  follows.
 - **Doors:** shared state; either player opens, closes or locks, the other world follows.
-- **Containers:** shared contents; an item taken by one player disappears from that container for the other, the taker
-  keeps it. Two players taking the same item at the same moment may both get it.
+- **Containers and dead NPCs:** shared contents; an item taken by one player disappears from that container or body
+  for the other, the taker keeps it. Two players taking the same item at the same moment may both get it.
 - **Disconnect:** a silent peer is dropped after 5 s (its stand-in disappears); a restarted client rejoins.
 
 ## Supported build (anything else: the mod stays off and the game runs unmodified)
@@ -46,7 +47,7 @@ Entertainment or Xbox; it ships no game files. MIT license.
 |---|---|
 | `bin/dsound.dll` (`sandbox/dsound_proxy.c`) | Proxy loaded by the game. Forwards DirectSound; loads `tow2coop.dll` from a thread. **Test copies only** (`TOW2_SANDBOX_DIR` set): redirects Saved Games, LocalAppData, Documents to the sandbox, answers Steam stat, achievement and cloud writes locally, renames the single-instance mutex; stops the game (`0x5AFE00xx`) if it cannot. |
 | `bin/core/tow2coop.dll` (`core/*.cpp`) | Build check, UE 5.4 reflection, hooks on `UGameEngine::Tick` and `ProcessEvent`; co-op: `coop.cpp` (UDP link, stand-in, NPC authority, doors, containers, resync), `story.cpp` (quests/globals), `join.cpp` (save hand-over over TCP); in test copies the hub's bridge protocol for tests. |
-| `qa/` | Test tooling: gamepool config, deploy/prep scripts, bridge client (`tow2.py`), input (`gamewin.py`), tests (`test_autojoin.py`, `test_npc_sync.py`, `test_melee.py`, `test_story.py`, `test_interact.py`, `test_look.py`, `test_resync.py`, `test_client_saves.py`, `test_resume.py`, `test_steam_late.py`, `test_join.py`, `test_rejoin.py`, `test_key.py`, `test_steam_self.py`, `test_install.ps1`), the whole regression (`run_suite.ps1`), soak (`soak_run.ps1`), memory guard (`memguard.ps1`). |
+| `qa/` | Test tooling: gamepool config, deploy/prep scripts, bridge client (`tow2.py`), input (`gamewin.py`), tests (`test_autojoin.py`, `test_npc_sync.py`, `test_melee.py`, `test_story.py`, `test_interact.py`, `test_look.py`, `test_anim.py`, `test_resync.py`, `test_client_saves.py`, `test_resume.py`, `test_steam_late.py`, `test_join.py`, `test_rejoin.py`, `test_key.py`, `test_steam_self.py`, `test_install.ps1`), the whole regression (`run_suite.ps1`), a targeted one (`run_quick.ps1 [-Only <steps>]`), soak (`soak_run.ps1`), memory guard (`memguard.ps1`). |
 
 ## Build
 
@@ -116,8 +117,12 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
   frames before loading a received campaign. Players loading from the menu by hand are not affected.
 - The remote player is a stand-in NPC with the player's face and body as at the join; their armor set and helmet follow
   changes within a few seconds (a piece you don't wear yourself shows without its mods).
-- NPC AI still runs in each world; the host corrects positions over 3 m and owns health and death; enemies do not
+- NPC AI still runs in each world; the host corrects positions over 3 m and owns health and death. An enemy attacked by
+  one player only takes the damage in the other player's world (it does not move or fight there), and enemies do not
   attack the remote player's stand-in.
+- The joined player plays a copy of the host's character, renewed at every hand-over (join, quest resync, map change):
+  items, ammo, money and XP the friend gains are replaced by the host's at the next hand-over. Each player keeping their
+  own character is the next big step (`TASKS.md`, end goal 2).
 - Quest completions reach the client by a reload (resync), not live.
 - Door and container changes are sent three times without acknowledgement; on a very lossy link one can be missed.
   (Damage the client deals is resent until the host acknowledges it; quest updates are acknowledged too.)

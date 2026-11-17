@@ -56,7 +56,7 @@ struct Outgoing {
     int sent;
 };
 constexpr uint32_t kMagic = 0x31433254;  // "T2C1": the last character is the protocol version, bump it on any packet change
-constexpr const char* kVersion = "0.2.0-beta.4";
+constexpr const char* kVersion = "0.2.0-beta.5";
 constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12;
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";
@@ -144,6 +144,9 @@ struct Ctx {
     uintptr_t world_ptr = 0, saves_blocked_world = 0;
     int port = 27960;
     double resync_cooldown = 0, mismatch_since = -1, next_resync_send = 0, fetch_quiet_until = 0;
+    bool push_pending = false;  // host: its map changed; the client follows as soon as the host can save
+    double next_push_try = 0;
+    bool puppet_in_air = false;
     int resync_sends = 0;
     uint64_t resyncs = 0, resync_requests = 0, resync_fetches = 0;
     bool watches_set = false;
@@ -159,7 +162,7 @@ struct Ctx {
     std::vector<Outgoing> outgoing;
     std::vector<uint32_t> seen_eids;
     std::unordered_map<uint64_t, ue::UObject*> interactables, inter_scan;  // doors + containers by path id
-    ue::UClass *door_class = nullptr, *container_class = nullptr;
+    ue::UClass *door_class = nullptr, *container_class = nullptr, *corpse_class = nullptr;
     double interactables_built = -100;
     uint64_t doors_sent = 0, doors_applied = 0, items_sent = 0, items_applied = 0;
     std::string last_interact;
@@ -294,6 +297,12 @@ void npc_kill(Npc& n) {
     if (!die.init(n.health, "Suicide")) return;
     alignas(16) uint8_t b[64] = {};
     b[die.off("bPreventRevival")] = 1;
+    // A death applied from the other world: its own inventory changes happen there too, they are not loot to mirror.
+    struct Applying {
+        bool was = applying_remote;
+        Applying() { applying_remote = true; }
+        ~Applying() { applying_remote = was; }
+    } guard;
     ue::process_event(n.health, die.f, b);
 }
 
@@ -302,12 +311,14 @@ void scan_step(ue::UObject* pawn) {
     if (!g.character_class) g.character_class = ue::find_class("/Script/Engine.Character");
     if (!g.door_class) g.door_class = ue::find_class("/Script/Arkansas.Door");
     if (!g.container_class) g.container_class = ue::find_class("/Script/Arkansas.Container");
+    if (!g.corpse_class) g.corpse_class = ue::find_class("/Script/Arkansas.Corpse");
     if (!g.character_class) return;
     int total = ue::num_objects(), end = std::min(total, g.scan_cursor + 20000);
     for (int i = g.scan_cursor; i < end; i++) {
         ue::UObject* o = ue::object_at(i);
         if (!o || o == pawn || o == g.puppet || ue::is_cdo(o)) continue;
-        if ((g.door_class && ue::is_a(o, g.door_class)) || (g.container_class && ue::is_a(o, g.container_class))) {
+        if ((g.door_class && ue::is_a(o, g.door_class)) || (g.container_class && ue::is_a(o, g.container_class)) ||
+            (g.corpse_class && ue::is_a(o, g.corpse_class))) {
             if (ue::alive(o)) g.inter_scan[fnv64(ue::path_of(o))] = o;
             continue;
         }
@@ -443,8 +454,8 @@ std::string bind_ip() {
     return b.empty() ? std::string("0.0.0.0") : b;
 }
 
-void request_resync(const char* reason) {
-    if (!g.host || !g.have_peer || g.now < g.resync_cooldown) return;
+void request_resync(const char* reason, bool host_moved = false) {
+    if (!g.host || !g.have_peer || (!host_moved && g.now < g.resync_cooldown)) return;
     try {
         char peer_ip[64] = "";
         inet_ntop(AF_INET, &g.peer.sin_addr, peer_ip, sizeof peer_ip);
@@ -457,6 +468,7 @@ void request_resync(const char* reason) {
         return;
     }
     g.resync_cooldown = g.now + 60.0;  // one hand-over at a time; the client needs ~30-60 s to reload
+    g.push_pending = false;
     g.resync_sends = 6, g.next_resync_send = g.now + 2.0;
     g.resyncs++;
     g.resync_reason = reason;
@@ -493,9 +505,11 @@ void send_typed(uint16_t type, const void* body, int len) {
 void setup_watches() {
     if (g.watches_set) return;
     uint32_t b = ue::make_name("HandleItemRemoved", false).index;  // door state changes go through a native delegate: polled
-    if (!b) return;
+    uint32_t c = ue::make_name("ItemRemoved", false).index;          // IndianaCharacter.ItemRemoved: a dead NPC looted
+    if (!b || !c) return;
     watch[0] = reinterpret_cast<void*>(static_cast<uintptr_t>(b));
-    watch_count.store(1, std::memory_order_release);
+    watch[1] = reinterpret_cast<void*>(static_cast<uintptr_t>(c));
+    watch_count.store(2, std::memory_order_release);
     g.watches_set = true;
 }
 
@@ -536,8 +550,16 @@ void process_observed() {
             queue_interact(1, fnv64(path), st, "");
             g.doors_sent++;
             g.last_interact = "sent door " + path.substr(path.rfind('.') + 1) + " -> " + std::to_string(st);
-        } else if (fname == "HandleItemRemoved") {
-            int off = param_offset(f, "ItemStack");
+        } else if (fname == "HandleItemRemoved" || fname == "ItemRemoved") {
+            // ItemRemoved is any character's inventory: only a dead level-placed NPC counts (looted; both worlds know
+            // it by name). A living NPC uses its own items, and each world runs its own AI (two-PC test: corpse loot).
+            if (fname == "ItemRemoved") {
+                if (o == local_pawn() || o == g.puppet || path.find("_UAID_") == std::string::npos) continue;
+                std::string err;
+                ue::UObject* hc = ue::resolve(ue::addr(o) + ".HealthComponent", &err);
+                if (!hc || ue::call(hc, ue::find_func(ue::class_of(hc), "GetHealth"), json::object()).get("ReturnValue").asNumber(1) > 0) continue;
+            }
+            int off = param_offset(f, fname == "ItemRemoved" ? "Item" : "ItemStack");
             if (off < 0 || off + 12 > 64) continue;
             ue::UObject* item;
             int32_t count;
@@ -645,6 +667,10 @@ void apply_interact(const InteractMsg& m) {
     g.seen_eids.push_back(m.eid);
     if (g.seen_eids.size() > 512) g.seen_eids.erase(g.seen_eids.begin(), g.seen_eids.begin() + 256);
     ue::UObject* actor = interactable(m.id);
+    if (!actor && m.kind == 2) {  // a looted dead NPC: the NPC registry knows it by the same path id
+        auto it = g.npcs.find(m.id);
+        if (it != g.npcs.end() && ue::alive(it->second.actor)) actor = it->second.actor;
+    }
     if (!actor) return;
     std::string err;
     applying_remote = true;
@@ -923,6 +949,8 @@ void dress_puppet() {
     if (!mine || !theirs) return;
     ue::FProperty* p = ue::find_prop(ue::class_of(mine), "Customization");
     if (!p || ue::field_type(p) != "StructProperty" || ue::find_prop(ue::class_of(theirs), "Customization") != p) return;  // same layout only
+    // An NPC body ignores Customization unless enabled: the stand-in was bald without a helmet (probe 56, pictures).
+    ue::set_path(ue::addr(theirs) + ".bEnableCustomization", json(true));
     memcpy(reinterpret_cast<uint8_t*>(theirs) + ue::prop_offset(p), reinterpret_cast<uint8_t*>(mine) + ue::prop_offset(p), ue::prop_size(p));
     json body = json::object(), head = json::object();
     ue::UObject* b = ue::resolve("pawn.AppearanceComponent.CurrentBody", &err);
@@ -947,6 +975,11 @@ void tame_puppet(bool full) {
             g.brain_stops++;
         }
     }
+    // Its movement component would zero the velocity we write every frame (the AI controller is kept): the stand-in
+    // slid in a frozen pose in the two-PC test. Off, the written velocity drives the walk (probe 56: speed 0 -> 400).
+    json no = json::object();
+    no.set("bEnabled", false);
+    call_quiet(p + ".CharacterMovement", "SetComponentTickEnabled", no);
     if (!full) return;
     try { dress_puppet(); } catch (const std::exception& e) { g.last_error = std::string("dress: ") + e.what(); }
     call_quiet(p + ".Controller", "StopMovement", json::object());
@@ -1002,6 +1035,7 @@ bool spawn_puppet(const Snapshot& s) {
     // dereference waiting to happen), but its behaviour is stopped and it can't be talked to, targeted or killed.
     ue::set_path(ue::addr(actor) + ".CharacterMovement.MovementMode", "MOVE_Walking");
     g.puppet = actor;
+    g.puppet_in_air = false;
     tame_puppet(true);
     return true;
 }
@@ -1043,8 +1077,13 @@ void drive_puppet() {
     memcpy(buf + set.off("NewRotation"), rot, 24);
     buf[set.off("bTeleport")] = 1;
     ue::process_event(g.puppet, set.f, buf);
-    // Animation reads the movement component's velocity.
+    // Animation reads the movement component's velocity, and its mode for the in-air state (bMovementStateIsInAir).
     double v[3] = {b->vx, b->vy, b->vz};
+    bool in_air = std::fabs(b->vz) > 50.0;
+    if (in_air != g.puppet_in_air) {
+        g.puppet_in_air = in_air;
+        try { ue::set_path(ue::addr(g.puppet) + ".CharacterMovement.MovementMode", in_air ? "MOVE_Falling" : "MOVE_Walking"); } catch (const std::exception&) {}
+    }
     if (ue::UObject* cmc = ue::resolve(ue::addr(g.puppet) + ".CharacterMovement")) {
         if (ue::FProperty* p = ue::find_prop(ue::class_of(cmc), "Velocity")) memcpy(reinterpret_cast<uint8_t*>(cmc) + ue::prop_offset(p), v, 24);
         if (ue::FProperty* p = ue::find_prop(ue::class_of(cmc), "ComponentVelocity")) memcpy(reinterpret_cast<uint8_t*>(cmc) + ue::prop_offset(p), v, 24);
@@ -1211,6 +1250,7 @@ void frame(float) {
         g.interactables.clear(), g.inter_scan.clear();  // old world's doors and containers
         doors.clear(), door_cursor = 0;
         g.at_menu = world && ue::path_of(world).find("MainMenu") != std::string::npos;
+        if (g.host) g.push_pending = true;  // the client follows the host's new map (or its reload) right away
         g.map_since = g.now;
         g.map_changes++;
     }
@@ -1219,6 +1259,12 @@ void frame(float) {
     bool settled = gameplay && g.now >= g.settle_until;
     g.in_gameplay = settled;
     receive();  // after the world check: data for the old world's objects is ignored until the new one settles
+    // The host's map changed: hand the campaign over as soon as it can save, not after the map settles and the client
+    // reports another map (two-PC test: 15 s, then 7 s of transfer).
+    if (g.host && g.push_pending && g.have_peer && gameplay && g.now >= g.next_push_try) {
+        g.next_push_try = g.now + 0.5;
+        request_resync("the host changed map", true);
+    }
     if (g.steam) steam_discovery();
     if (g.now >= g.next_send && pawn && g.have_peer && settled) {
         g.next_send = g.now + 1.0 / 30;
