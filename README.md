@@ -16,13 +16,21 @@ Entertainment or Xbox; it ships no game files. MIT license.
 
 ## How it plays (rules)
 
-- **Saves:** only the host saves the campaign. A game installed as client has saving switched off while the mod runs: its
-  autosave and quicksave slots are the same files as in the friend's own campaign, so a co-op autosave would overwrite
-  them. To play your own campaign alone, uninstall (or reinstall as host).
+- **Saves:** only the host saves the campaign. In a joined game the friend's saving is switched off (its autosave and
+  quicksave slots are the friend's own campaign's); the friend's own games, loaded from the main menu, save normally.
+  The mod keeps the friend's character itself (see Characters).
 - **Join:** the client starts at the main menu and joins; the host saves its current campaign ("CoopHost") and hands it
-  over; the client loads it into its own save folder `CoopHost_<host id>` (never over the client's own saves). The client
-  plays a copy of the host's character (same look, stats and inventory at join time).
-- **Players:** each player moves, fights and loots in their own world; the other player appears as a stand-in NPC body.
+  over; the client loads it into its own save folder `CoopHost_<host id>` (never over the client's own saves).
+- **Characters:** each player has their own. On the first join, the friend's character is the one of their own newest
+  save (their look, level, skills, perks), with nothing in their pockets: no items, no money. From then on the friend
+  keeps their own items (with ammo in the magazine, mods, durability), money, XP and level across every hand-over: before
+  loading the campaign the host sends, the friend's mod saves its own character (a private save named "CoopSelf") and
+  puts it into the host's campaign. The character is kept per host in `%LOCALAPPDATA%\tow2coop\characters\`. To start
+  fresh, create a character in a new game of your own first (its save becomes your newest save), then join.
+- **Trading:** put an item in any container (a chest, a crate): it appears in the same container in the other player's
+  world, where they take it. A traded weapon or armor arrives as a new copy (without its mods or level).
+- **Players:** each player moves, fights and loots in their own world; the other player appears as a stand-in NPC body
+  that wears the other player's own look, armor and helmet.
 - **Combat:** NPC health and deaths follow the host; damage a client deals is sent to the host and applied there.
 - **Quests and story:** host-owned. Quest starts, objective updates (addendums) and objective global variables reach the
   client live; quest completions/failures reach it through a save resync (a short reload on the client).

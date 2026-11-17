@@ -1,7 +1,7 @@
 # Targeted regression on one pair for the two-PC fixes (stand-in look and animation, interactions incl. dead-NPC loot,
 # map-travel hand-over), plus the owner-state and caught-fault checks. The whole suite is run_suite.ps1.
 # Usage: run_quick.ps1 -Out <evidence folder> [-NoRamCheck] [-Only 'interact and loot','...'] (the join steps always run)
-param([Parameter(Mandatory)][string]$Out, [switch]$NoRamCheck, [string[]]$Only)
+param([Parameter(Mandatory)][string]$Out, [switch]$NoRamCheck, [string[]]$Only, [switch]$Warm)
 $ErrorActionPreference = 'Continue'
 $hub = 'C:\coop-anything'; $qa = "$hub\local\tow2-coop\qa"; $cfg = "$qa\tow2.gamepool.json"
 New-Item -ItemType Directory -Force $Out | Out-Null
@@ -15,6 +15,7 @@ function Step([string]$name, [scriptblock]$body) {
     if ($m.Success) { $results[$name] = $m.Groups[1].Value }
 }
 function Pids { foreach ($i in 0, 1) { (Get-Content "$hub\local\gamepool\instances\tow2\$i\sandbox\sandbox.log" | Select-String 'sandbox on: pid (\d+)' | Select-Object -Last 1).Matches[0].Groups[1].Value } }
+if ($Warm) { foreach ($w in 0, 1) { & "$qa\warmup.ps1" -Out "$Out\warmup$w" -Instance $w -Seconds 150 | Tee-Object -FilePath $log -Append | Out-Host } }  # refill the driver's shader cache (run 67: 6.5 GB at the menu)
 Set-Location $hub
 python -I local/tow2-coop/qa/owner_guard.py snapshot "$Out\owner-before.json" | Out-Host
 $coreLogs = foreach ($i in 0, 1) { "$hub\local\gamepool\instances\tow2\$i\sandbox\tow2coop.log" }
