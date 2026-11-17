@@ -35,12 +35,17 @@ def main(log, delay):
     run = text[text.rfind("build ok:"):]  # this start only
     lines = [ln for ln in run.splitlines() if "co-op:" in ln]
     print("\n".join(lines[:4]))
-    order = [any("beta.3, Steam; client" in ln for ln in lines[:1]),
+    order = [any("beta.4, Steam; client" in ln for ln in lines[:1]),
              any("waiting for the game's Steam session (test delay)" in ln for ln in lines[1:2]),
              any("Steam link ready (app 1449110)" in ln for ln in lines[2:3])]
     check(all(order), "log: start, waiting, ready (in this order)", str(order))
     m = re.search(r"Steam link ready \(app \d+\), (\d+) s after", run)
     check(m is not None and int(m.group(1)) >= delay, "the link waited for Steam", m.group(0) if m else "no ready line")
+    # The host's accept pass (beta.4) over this account's friends: runs on real Steam without a second account.
+    a = call("coop.steamAccept", {}, inst=0, timeout_s=30)
+    check(a.get("on") is True and a.get("friends", -1) >= 0, "accept pass over the friends list", str(a))
+    text = Path(log).read_text(encoding="utf-8", errors="replace")
+    run = text[text.rfind("build ok:"):]
     errors = [ln for ln in run.splitlines() if "co-op frame error" in ln or "join error" in ln]
     check(not errors, "no caught faults", "; ".join(errors[:3]))
     print(f"RESULT: {'PASS' if not fails else 'FAIL'} ({fails} failure(s))")

@@ -1,9 +1,10 @@
 # tow2-coop: two-player co-op for The Outer Worlds 2 (work in progress)
 
-Status: **v0.2.0-beta.3, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.
-Tested with two copies on one PC only.** The first two-PC test (beta.2) never linked: the mod looked for the game's Steam
-session once, before a game started by Steam had set it up; beta.3 waits for it. Both players need beta.3 (beta.1
-does not connect; the log says so). Two independent copies of the game
+Status: **v0.2.0-beta.4, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.
+Tested with two copies on one PC only.** Two tries across two PCs have not linked yet. In the first (beta.2), the mod
+looked for the game's Steam session once, too early; beta.3 waits for it. In the second (beta.3), the friend's game
+found the host, but the host never accepted the connection; beta.4 accepts a waiting connection from any Steam friend
+and logs what the host sees. Use beta.4 on both PCs (beta.1 does not connect; the log says so). Two independent copies of the game
 share one campaign owned by the host: the client joins by receiving the host's save, each player controls their own
 character, sees the other (position, rotation, walk/idle animation, the player's look, armor and helmet changes), and
 the host owns NPC health and deaths, quest progress, map travel, door states and container contents. See `TASKS.md`
@@ -66,7 +67,7 @@ Co-op settings come from the environment (else from `tow2coop.ini`, see below): 
 another PC, `TOW2_COOP_BIND` for the host (test copies: 127.0.0.1). Two copies on one 8 GB GPU need the VRAM budget
 that `qa/prep_instance.py` writes (`Engine.ini`) and 960x540.
 
-## Install for players (beta.3 not yet tested across two PCs)
+## Install for players (beta.4 not yet tested across two PCs)
 
 Each player runs the installer on their own PC, with the game closed (it finds the game through Steam; `-GameDir`
 overrides, `-Find` only shows the folder). The two players must be **Steam friends**, each with their own copy:

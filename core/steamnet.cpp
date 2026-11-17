@@ -2,7 +2,10 @@
 #include "steamnet.hpp"
 #include <windows.h>
 #include <cstddef>
+#include <set>
 #include <utility>
+
+void core_log(const std::string& line);  // main.cpp: a line in tow2coop.log (thread-safe)
 
 namespace steamnet {
 namespace {
@@ -48,12 +51,14 @@ bool (*accept_)(void*, const Identity&);
 int (*relationship_)(void*, uint64_t);
 constexpr int kImmediateFriends = 4;  // k_EFriendFlagImmediate
 
-// A session request (someone sent first, we never wrote to them): accepted from Steam friends only. Covers a host that
-// cannot see the client's rich presence (private game details). Dispatched by the game's SteamAPI_RunCallbacks.
+// A session request (someone sent first, we never wrote to them): accepted from Steam friends only. Meant to cover a
+// host that cannot see the client's rich presence (private game details), but in the first two-PC test (beta.3) the
+// host never accepted: accept_friends() polls instead; this logs whether the callback comes at all.
 void on_session_request(void* request) {  // SteamNetworkingMessagesSessionRequest_t: the requester's identity first
     Identity* who = static_cast<Identity*>(request);
     uint64_t id = get_id_(who);
-    if (id && relationship_(friends_, id) == 3) accept_(msgs_, *who);  // k_EFriendRelationshipFriend
+    bool ok = id && relationship_(friends_, id) == 3 && accept_(msgs_, *who);  // k_EFriendRelationshipFriend
+    core_log("steam: session request from " + name(id) + (ok ? ", accepted" : ", not accepted (not a Steam friend)"));
 }
 
 template <class T>
@@ -175,6 +180,19 @@ uint64_t find_friend(const std::string& name_or_id) {
 std::string name(uint64_t user) {
     const char* v = friends_ ? friend_name_(friends_, user) : nullptr;
     return v ? v : "";
+}
+
+// A pending session from any immediate friend is accepted (AcceptSessionWithUser is a no-op without one). First two-PC
+// test (beta.3): the friend's attempts timed out every 10 s, the host never saw its presence nor got the callback.
+int accept_friends() {
+    if (!msgs_ || !friends_) return 0;
+    static std::set<uint64_t> told;
+    int n = friend_count_(friends_, kImmediateFriends);
+    for (int i = 0; i < n; i++) {
+        uint64_t f = friend_at_(friends_, i, kImmediateFriends);
+        if (accept_(msgs_, id_of(f)) && told.insert(f).second) core_log("steam: accepted a session from " + name(f));
+    }
+    return n;
 }
 
 int session_state(uint64_t peer) { return msgs_ && peer ? state_(msgs_, id_of(peer), nullptr, nullptr) : 0; }

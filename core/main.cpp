@@ -429,6 +429,11 @@ DWORD WINAPI init_thread(LPVOID) {
     reg("coop.status", [](const Value&) { return coop::status(); });
     reg("coop.set", [](const Value& p) { return coop::set_options(p); });
     reg("coop.steamProbe", [](const Value&) { return coop::steam_probe(); }, false);  // waits: off the game thread
+    reg("coop.steamAccept", [](const Value&) {  // test: the host's accept pass over the friends list, on any copy
+        Value r = Value::object();
+        r.set("on", steamnet::on()).set("friends", static_cast<double>(steamnet::accept_friends()));
+        return r;
+    }, false);
     // Join: host saves and serves its campaign over TCP (co-op port + 1); the client downloads and loads it.
     reg("coop.offer", [](const Value& p) {
         std::string bind = p.get("bind").asString(env("TOW2_COOP_BIND"));

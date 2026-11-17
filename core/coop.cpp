@@ -56,7 +56,7 @@ struct Outgoing {
     int sent;
 };
 constexpr uint32_t kMagic = 0x31433254;  // "T2C1": the last character is the protocol version, bump it on any packet change
-constexpr const char* kVersion = "0.2.0-beta.3";
+constexpr const char* kVersion = "0.2.0-beta.4";
 constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12;
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";
@@ -721,6 +721,7 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
         if (from) g.peer = *from;
         g.peer_id = from_id;
         g.have_peer = true;
+        if (g.steam) g.session = -1, core_log("steam: a friend joins: " + steamnet::name(from_id));
     }
     if (g.remote_id && h.sender != g.remote_id) { g.bad++; return; }  // shortcut: one remote player only
     if (h.type == kHello) { g.remote_id = h.sender; return; }
@@ -1091,6 +1092,17 @@ void steam_discovery() {
     // A named host is contacted directly, presence or not (its game details may be private); the host accepts friends.
     uint64_t named = pick.empty() ? 0 : steamnet::find_friend(pick);
     std::vector<uint64_t> candidates = named ? std::vector<uint64_t>{named} : steamnet::friends_in_game();
+    if (g.host) {  // a client with private game details never shows its presence: take its pending session (two-PC test)
+        steamnet::accept_friends();
+        static double next_wait_log = 0;
+        if (g.now >= next_wait_log) {  // what the host sees while nobody has joined, every 30 s
+            next_wait_log = g.now + 30.0;
+            std::string seen;
+            for (uint64_t f : candidates) seen += " " + steamnet::name(f) + " '" + steamnet::presence(f, "tow2coop") + "'";
+            core_log("steam: no client yet; friends playing:" + (seen.empty() ? std::string(" none") : seen) + "; relay " +
+                     std::to_string(steamnet::relay_status()));
+        }
+    }
     for (uint64_t f : candidates) {
         steamnet::request_presence(f);
         if (!named && steamnet::presence(f, "tow2coop") != want) continue;
