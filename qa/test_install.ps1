@@ -1,5 +1,5 @@
 # Installer check on a fake game folder in %TEMP% (never the real install): host and client settings, another mod's
-# dsound.dll refused and left alone, uninstall removes only our files. Usage: test_install.ps1
+# dsound.dll refused and left alone, an older build of the mod replaced, uninstall removes only our files. Usage: test_install.ps1
 $ErrorActionPreference = 'Stop'
 $root = Join-Path ([IO.Path]::GetTempPath()) "tow2-install-test-$PID"
 $win64 = "$root\Arkansas\Binaries\Win64"
@@ -26,6 +26,10 @@ Check $refused 'direct-IP client install without the key is refused'
 & $inst -Role client -Peer 10.0.0.5 -Key $key -GameDir $root | Out-Null
 $ini = Get-Content "$win64\tow2coop.ini"
 Check (($ini -contains 'peer=10.0.0.5:27960') -and ($ini -contains "key=$key") -and ($ini -contains 'transport=udp')) 'direct-IP client install writes the host address (default port) and the key'
+foreach ($f in 'dsound.dll', 'tow2coop.dll') { $s = [IO.File]::Open("$win64\$f", 'Append'); $s.WriteByte(0); $s.Close() }  # an older build: other bytes, same marker
+& $inst -Role host -GameDir $root | Out-Null
+$same = foreach ($f in @{ 'dsound.dll' = 'bin\dsound.dll'; 'tow2coop.dll' = 'bin\core\tow2coop.dll' }.GetEnumerator()) { (Get-FileHash "$win64\$($f.Key)").Hash -eq (Get-FileHash (Join-Path (Split-Path $PSScriptRoot) $f.Value)).Hash }
+Check (-not ($same -contains $false) -and ((Get-Content "$win64\tow2coop.ini") -contains 'role=host')) 'install over an older build of the mod replaces it (no uninstall needed)'
 & $inst -Uninstall -GameDir $root | Out-Null
 Check (-not (Test-Path "$win64\dsound.dll") -and -not (Test-Path "$win64\tow2coop.dll") -and -not (Test-Path "$win64\tow2coop.ini")) 'uninstall removes every file it placed'
 Check (Test-Path "$win64\TheOuterWorlds2-Win64-Shipping.exe") 'uninstall leaves the game alone'

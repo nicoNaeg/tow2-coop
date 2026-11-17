@@ -56,7 +56,7 @@ struct Outgoing {
     int sent;
 };
 constexpr uint32_t kMagic = 0x31433254;  // "T2C1": the last character is the protocol version, bump it on any packet change
-constexpr const char* kVersion = "0.2.0-beta.2";
+constexpr const char* kVersion = "0.2.0-beta.3";
 constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12;
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";
@@ -1058,6 +1058,15 @@ void drive_puppet() {
 void steam_discovery() {
     if (g.now < g.next_discovery) return;
     g.next_discovery = g.now + 2.0;
+    if (!steamnet::on()) {  // a game started by Steam sets up its Steam session after the mod's start (two-PC test, beta.2)
+        static const double test_delay = atof(env("TOW2_COOP_STEAM_DELAY").c_str());  // tests only: Steam shows up this late
+        static bool told = false;
+        std::string why = "test delay";
+        double t = g.now - g.start_time;
+        if (t >= test_delay && steamnet::start(why)) core_log("co-op: " + why + ", " + std::to_string(static_cast<int>(t)) + " s after the mod started");
+        else if (!told) told = true, core_log("co-op: waiting for the game's Steam session (" + why + ")");
+        return;
+    }
     const uint8_t none = 0;
     if (g.have_peer) {
         int st = steamnet::session_state(g.peer_id);
@@ -1157,14 +1166,14 @@ bool start(std::string& why) {
     if (!port) port = atoi(env("GAMEPOOL_PORT").c_str());
     if (!port) port = 27960;
     g.port = port;
-    g.steam = env("TOW2_COOP_TRANSPORT") == "steam";  // no socket, no open port: the peer is found through Steam
-    if (g.steam ? !steamnet::start(why) : !start_udp(port, why)) return false;
+    g.steam = env("TOW2_COOP_TRANSPORT") == "steam";  // no socket, no open port: the peer is found through Steam (frame)
+    if (!g.steam && !start_udp(port, why)) return false;
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
     g.me = static_cast<uint32_t>(GetCurrentProcessId() * 2654435761u ^ q.LowPart) | 1;
     g.on = true;
     g.start_time = clock_s();
-    if (g.steam) why += g.host ? "; host: Steam friends running the mod as client join" : "; client: joins a Steam friend hosting";
+    if (g.steam) why = g.host ? "Steam; host: Steam friends running the mod as client join" : "Steam; client: joins a Steam friend hosting";
     else why = std::string(g.host ? "host on port " : "client, host port ") + std::to_string(g.host ? port : ntohs(g.peer.sin_port));
     why = std::string("tow2coop ") + kVersion + ", " + why;
     return true;
@@ -1300,7 +1309,7 @@ json status() {
     s.set("transport", g.steam ? "steam" : "udp");
     if (g.steam)
         s.set("steamPeer", g.peer_id ? steamnet::name(g.peer_id) : std::string()).set("session", static_cast<double>(steamnet::session_state(g.peer_id)))
-            .set("relay", static_cast<double>(steamnet::relay_status()));
+            .set("relay", static_cast<double>(steamnet::relay_status())).set("steamUp", steamnet::on());
     s.set("sent", static_cast<double>(g.sent)).set("recv", static_cast<double>(g.recv)).set("stale", static_cast<double>(g.stale)).set("bad", static_cast<double>(g.bad));
     s.set("peer", g.have_peer).set("puppet", g.puppet ? ue::addr(g.puppet) : std::string("none")).set("error", g.last_error);
     s.set("sameMap", g.puppet_map == g.my_map);

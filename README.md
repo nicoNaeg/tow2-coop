@@ -1,8 +1,9 @@
 # tow2-coop: two-player co-op for The Outer Worlds 2 (work in progress)
 
-Status: **v0.2.0-beta.2, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.
-Tested with two copies on one PC only** (never across two PCs yet; the Steam link was checked on one copy). Both
-players need the same version: beta.2 does not connect to beta.1 (the log says so). Two independent copies of the game
+Status: **v0.2.0-beta.3, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.
+Tested with two copies on one PC only.** The first two-PC test (beta.2) never linked: the mod looked for the game's Steam
+session once, before a game started by Steam had set it up; beta.3 waits for it. Both players need beta.3 (beta.1
+does not connect; the log says so). Two independent copies of the game
 share one campaign owned by the host: the client joins by receiving the host's save, each player controls their own
 character, sees the other (position, rotation, walk/idle animation, the player's look, armor and helmet changes), and
 the host owns NPC health and deaths, quest progress, map travel, door states and container contents. See `TASKS.md`
@@ -44,7 +45,7 @@ Entertainment or Xbox; it ships no game files. MIT license.
 |---|---|
 | `bin/dsound.dll` (`sandbox/dsound_proxy.c`) | Proxy loaded by the game. Forwards DirectSound; loads `tow2coop.dll` from a thread. **Test copies only** (`TOW2_SANDBOX_DIR` set): redirects Saved Games, LocalAppData, Documents to the sandbox, answers Steam stat, achievement and cloud writes locally, renames the single-instance mutex; stops the game (`0x5AFE00xx`) if it cannot. |
 | `bin/core/tow2coop.dll` (`core/*.cpp`) | Build check, UE 5.4 reflection, hooks on `UGameEngine::Tick` and `ProcessEvent`; co-op: `coop.cpp` (UDP link, stand-in, NPC authority, doors, containers, resync), `story.cpp` (quests/globals), `join.cpp` (save hand-over over TCP); in test copies the hub's bridge protocol for tests. |
-| `qa/` | Test tooling: gamepool config, deploy/prep scripts, bridge client (`tow2.py`), input (`gamewin.py`), tests (`test_autojoin.py`, `test_npc_sync.py`, `test_melee.py`, `test_story.py`, `test_interact.py`, `test_look.py`, `test_resync.py`, `test_client_saves.py`, `test_resume.py`, `test_join.py`, `test_rejoin.py`, `test_key.py`, `test_steam_self.py`, `test_install.ps1`), the whole regression (`run_suite.ps1`), soak (`soak_run.ps1`), memory guard (`memguard.ps1`). |
+| `qa/` | Test tooling: gamepool config, deploy/prep scripts, bridge client (`tow2.py`), input (`gamewin.py`), tests (`test_autojoin.py`, `test_npc_sync.py`, `test_melee.py`, `test_story.py`, `test_interact.py`, `test_look.py`, `test_resync.py`, `test_client_saves.py`, `test_resume.py`, `test_steam_late.py`, `test_join.py`, `test_rejoin.py`, `test_key.py`, `test_steam_self.py`, `test_install.ps1`), the whole regression (`run_suite.ps1`), soak (`soak_run.ps1`), memory guard (`memguard.ps1`). |
 
 ## Build
 
@@ -65,13 +66,16 @@ Co-op settings come from the environment (else from `tow2coop.ini`, see below): 
 another PC, `TOW2_COOP_BIND` for the host (test copies: 127.0.0.1). Two copies on one 8 GB GPU need the VRAM budget
 that `qa/prep_instance.py` writes (`Engine.ini`) and 960x540.
 
-## Install for players (never tested across two PCs yet)
+## Install for players (beta.3 not yet tested across two PCs)
 
 Each player runs the installer on their own PC, with the game closed (it finds the game through Steam; `-GameDir`
 overrides, `-Find` only shows the folder). The two players must be **Steam friends**, each with their own copy:
 
     powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Role host
     powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Role client [-Friend "<host's Steam name>"]
+
+To update, run the new version's installer the same way, with the game closed: it replaces the old files (no need to
+uninstall first).
 
 The host starts the game and loads their campaign; the friend starts the game and waits at the main menu: about a
 minute later the friend receives the host's campaign and loads it. **Over Steam** (the default) there is no address, no
