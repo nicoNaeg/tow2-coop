@@ -14,5 +14,9 @@ void client_expect(uint32_t host_id);          // Steam client, game thread: the
 void on_steam_data(const char* data, int n);   // Steam client, game thread: one message of the hand-over (channel 1)
 coopbridge::json::Value client_fetch(const std::string& host, int port, uint32_t host_id);    // game thread
 void frame(uint64_t frames);                                                                                  // game thread
+std::wstring saves_folder();  // <Saved Games>\TheOuterWorlds2 as the game sees it (a test copy: its sandbox)
+std::wstring local_folder();  // <LocalAppData> as the game sees it
+bool joined();                // the world came from a hand-over (cleared at the main menu): saves stay off for the player
+void set_joined(bool on);
 coopbridge::json::Value status();                                                              // any thread
 }  // namespace join

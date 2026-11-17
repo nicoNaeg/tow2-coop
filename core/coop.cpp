@@ -12,6 +12,7 @@
 #include "story.hpp"
 #include "join.hpp"
 #include "steamnet.hpp"
+#include "character.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <cmath>
@@ -57,7 +58,7 @@ struct Outgoing {
 };
 constexpr uint32_t kMagic = 0x31433254;  // "T2C1": the last character is the protocol version, bump it on any packet change
 constexpr const char* kVersion = "0.2.0-beta.5";
-constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12;
+constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13;
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";
 
@@ -100,6 +101,7 @@ struct Look {
     char item[2][256];
     uint8_t helmet_shown;
 };
+struct FacePart { uint32_t version; uint8_t part, parts; uint16_t len; char text[1100]; };  // one piece of a player's look
 #pragma pack(pop)
 
 struct Npc {
@@ -145,7 +147,9 @@ struct Ctx {
     int port = 27960;
     double resync_cooldown = 0, mismatch_since = -1, next_resync_send = 0, fetch_quiet_until = 0;
     bool push_pending = false;  // host: its map changed; the client follows as soon as the host can save
-    double next_push_try = 0;
+    double next_push_try = 0, push_ready_at = 0;
+    std::vector<std::pair<ue::UClass*, double>> my_removals;  // items that just left the local player's inventory  // push_ready_at: gameplay seen + 2 s
+    uintptr_t snapped_world = 0;  // client: the world where it was put next to the host after a hand-over
     bool puppet_in_air = false;
     int resync_sends = 0;
     uint64_t resyncs = 0, resync_requests = 0, resync_fetches = 0;
@@ -172,6 +176,10 @@ struct Ctx {
     std::string look[2], look_applied;  // the other player's armor set and helmet; what the stand-in shows
     bool have_look = false, look_helmet_shown = true;
     double next_look = 0;
+    std::string face_in, face_applied;  // the other player's look (text), and the one on the stand-in
+    uint32_t face_version = 0;          // the look being assembled from its pieces
+    std::vector<std::string> face_parts;
+    double next_face = 0;
 } g;
 
 uint64_t fnv64(const std::string& s) {
@@ -506,10 +514,12 @@ void setup_watches() {
     if (g.watches_set) return;
     uint32_t b = ue::make_name("HandleItemRemoved", false).index;  // door state changes go through a native delegate: polled
     uint32_t c = ue::make_name("ItemRemoved", false).index;          // IndianaCharacter.ItemRemoved: a dead NPC looted
-    if (!b || !c) return;
+    uint32_t a = ue::make_name("HandleItemAdded", false).index;      // Container.HandleItemAdded: the player stored an item
+    if (!b || !c || !a) return;
     watch[0] = reinterpret_cast<void*>(static_cast<uintptr_t>(b));
     watch[1] = reinterpret_cast<void*>(static_cast<uintptr_t>(c));
-    watch_count.store(2, std::memory_order_release);
+    watch[2] = reinterpret_cast<void*>(static_cast<uintptr_t>(a));
+    watch_count.store(3, std::memory_order_release);
     g.watches_set = true;
 }
 
@@ -537,6 +547,16 @@ void process_observed() {
         std::lock_guard<std::mutex> lk(obs_mu);
         evs.swap(observed);
     }
+    g.my_removals.erase(std::remove_if(g.my_removals.begin(), g.my_removals.end(), [](const std::pair<ue::UClass*, double>& r) { return g.now - r.second > 1.0; }),
+                        g.my_removals.end());
+    ue::UObject* me = local_pawn();
+    for (auto& e : evs) {  // items that left the local player (an item stored in a container may come first in the batch)
+        if (e.obj != me || !me || ue::name_of(static_cast<ue::UFunction*>(e.fn)) != "ItemRemoved") continue;
+        int off = param_offset(static_cast<ue::UFunction*>(e.fn), "Item");
+        ue::UObject* item = nullptr;
+        if (off >= 0 && off + 8 <= 64) memcpy(&item, e.parms + off, 8);
+        if (item && ue::alive(item)) g.my_removals.push_back({ue::class_of(item), g.now});
+    }
     for (auto& e : evs) {
         auto* o = static_cast<ue::UObject*>(e.obj);
         auto* f = static_cast<ue::UFunction*>(e.fn);
@@ -550,15 +570,7 @@ void process_observed() {
             queue_interact(1, fnv64(path), st, "");
             g.doors_sent++;
             g.last_interact = "sent door " + path.substr(path.rfind('.') + 1) + " -> " + std::to_string(st);
-        } else if (fname == "HandleItemRemoved" || fname == "ItemRemoved") {
-            // ItemRemoved is any character's inventory: only a dead level-placed NPC counts (looted; both worlds know
-            // it by name). A living NPC uses its own items, and each world runs its own AI (two-PC test: corpse loot).
-            if (fname == "ItemRemoved") {
-                if (o == local_pawn() || o == g.puppet || path.find("_UAID_") == std::string::npos) continue;
-                std::string err;
-                ue::UObject* hc = ue::resolve(ue::addr(o) + ".HealthComponent", &err);
-                if (!hc || ue::call(hc, ue::find_func(ue::class_of(hc), "GetHealth"), json::object()).get("ReturnValue").asNumber(1) > 0) continue;
-            }
+        } else if (fname == "HandleItemRemoved" || fname == "ItemRemoved" || fname == "HandleItemAdded") {
             int off = param_offset(f, fname == "ItemRemoved" ? "Item" : "ItemStack");
             if (off < 0 || off + 12 > 64) continue;
             ue::UObject* item;
@@ -566,7 +578,27 @@ void process_observed() {
             memcpy(&item, e.parms + off, 8);
             memcpy(&count, e.parms + off + 8, 4);
             if (!item || !ue::alive(item) || count <= 0) continue;
-            queue_interact(2, fnv64(path), count, ue::path_of(ue::class_of(item)));
+            ue::UClass* cls = ue::class_of(item);
+            if (fname == "HandleItemAdded") {
+                // Trading: an item the player stored in a container shows up in that container for the other player.
+                // The game's own loot generation adds items too; only an item that just left the player counts.
+                auto mine = std::find_if(g.my_removals.begin(), g.my_removals.end(), [&](const std::pair<ue::UClass*, double>& r) { return r.first == cls; });
+                if (mine == g.my_removals.end()) continue;
+                g.my_removals.erase(mine);
+                queue_interact(3, fnv64(path), count, ue::path_of(cls));
+                g.items_sent++;
+                g.last_interact = "sent store " + std::to_string(count) + "x " + ue::name_of(cls);
+                continue;
+            }
+            // ItemRemoved is any character's inventory: only a dead level-placed NPC counts (looted; both worlds know
+            // it by name). A living NPC uses its own items, and each world runs its own AI (two-PC test: corpse loot).
+            if (fname == "ItemRemoved") {
+                if (o == g.puppet || o == local_pawn() || path.find("_UAID_") == std::string::npos) continue;
+                std::string err;
+                ue::UObject* hc = ue::resolve(ue::addr(o) + ".HealthComponent", &err);
+                if (!hc || ue::call(hc, ue::find_func(ue::class_of(hc), "GetHealth"), json::object()).get("ReturnValue").asNumber(1) > 0) continue;
+            }
+            queue_interact(2, fnv64(path), count, ue::path_of(cls));
             g.items_sent++;
             g.last_interact = "sent take " + std::to_string(count) + "x " + ue::name_of(ue::class_of(item));
         }
@@ -662,6 +694,8 @@ void call_on(ue::UObject* o, const char* fn, const json& args) {
     if (f) ue::call(o, f, args);
 }
 
+ue::UClass* load_class(const std::string& path);  // below: a Blueprint class by path, loaded if needed
+
 void apply_interact(const InteractMsg& m) {
     if (std::find(g.seen_eids.begin(), g.seen_eids.end(), m.eid) != g.seen_eids.end()) return;
     g.seen_eids.push_back(m.eid);
@@ -706,6 +740,20 @@ void apply_interact(const InteractMsg& m) {
                     g.last_interact = "applied door " + ue::name_of(actor) + " -> " + want;
                 }
             }
+        } else if (m.kind == 3 && m.len > 0) {
+            // The other player stored an item in this container (trading). A class from the other player (trust
+            // boundary): a /Game/ item class only, a sane count.
+            std::string cls(m.path, m.len);
+            ue::UClass* item = cls.rfind("/Game/", 0) == 0 && m.a > 0 && m.a <= 1000000 ? load_class(cls) : nullptr;
+            ue::UClass* base = ue::find_class("/Script/Arkansas.Item");
+            ue::UObject* inv = ue::resolve(ue::addr(actor) + ".InventoryComponent", &err);
+            if (item && base && ue::cdo(item) && ue::is_a(ue::cdo(item), base) && inv) {
+                json q = json::object();
+                q.set("Actor", ue::addr(actor)).set("ItemType", ue::addr(item)).set("Count", static_cast<int>(m.a)).set("bLootable", true);
+                ue::call(inv, ue::find_func(ue::class_of(inv), "GiveItemToActor"), q);
+                g.items_applied++;
+                g.last_interact = "applied store " + std::to_string(m.a) + "x " + ue::name_of(item) + " in " + ue::name_of(actor);
+            }
         } else if (m.kind == 2 && m.len > 0) {
             std::string cls(m.path, m.len);
             ue::UClass* item = ue::find_class(cls);
@@ -727,6 +775,8 @@ void apply_interact(const InteractMsg& m) {
     }
     applying_remote = false;
 }
+
+void on_face(const char* body, int len);  // below: the other player's look, in pieces
 
 // One datagram from the other player: UDP gives its address (from), Steam its SteamID (from_id).
 void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t from_id) {
@@ -812,6 +862,7 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
         send_typed(kDamageAck, &d.eid, 4);
         return;
     }
+    if (h.type == kAppearance) { on_face(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }
     if (h.type == kLook) {
         if (n != static_cast<int>(sizeof(Header) + sizeof(Look))) { g.bad++; return; }
         Look l;
@@ -926,6 +977,141 @@ void dress_outfit() {
     call_quiet(ue::addr(g.puppet) + ".AppearanceComponent", "RefreshFullAppearance", json::object());
 }
 
+const char kFaceRoot[] = "/Game/Art/CHAR/AppearanceDataAssets/";
+
+std::string asset_path(const ue::json& v) {  // "0x... Class /Path.Name" -> "/Path.Name"
+    std::string s = v.asString();
+    size_t a = s.find(' '), b = a == std::string::npos ? a : s.find(' ', a + 1);
+    return s.rfind("0x", 0) == 0 && b != std::string::npos ? s.substr(b + 1) : std::string();
+}
+
+std::string face_text() {
+    std::string out;
+    auto put = [&](const std::string& k, std::string path) {
+        if (path.empty()) return;
+        if (path.rfind(kFaceRoot, 0) == 0) path = "~" + path.substr(sizeof kFaceRoot - 1);
+        out += k + "=" + path + "\n";
+    };
+    ue::json c = ue::eval_path("pawn.AppearanceComponent.Customization");
+    for (const auto& kv : c.members()) {
+        if (kv.second.isNumber()) {
+            char b[32];
+            snprintf(b, sizeof b, "%.5g", kv.second.asNumber());
+            out += "f." + kv.first + "=" + b + "\n";
+        } else put("c." + kv.first, asset_path(kv.second));
+    }
+    put("head", asset_path(ue::eval_path("pawn.AppearanceComponent.DefaultHead")));
+    std::string err;
+    for (const char* body : {"CurrentBody", "DefaultBody"}) {
+        try { std::string b = asset_path(ue::eval_path(std::string("pawn.AppearanceComponent.") + body)); if (!b.empty()) { put("body", b); break; } } catch (const std::exception&) {}
+    }
+    try { out += "gender=" + ue::eval_path("pawn.AppearanceComponent.AppearanceGender").get("TagName").asString() +"\n"; } catch (const std::exception&) {}
+    return out;
+}
+
+// Our look to the other player, in pieces (it is ~2 KB); sent every 5 s (UDP: a lost piece comes again).
+void send_face() {
+    std::string t = face_text();
+    uint32_t v = static_cast<uint32_t>(fnv(t)) | 1;
+    size_t n = (t.size() + sizeof(FacePart::text) - 1) / sizeof(FacePart::text);
+    if (n == 0 || n > 8) return;
+    for (size_t i = 0; i < n; i++) {
+        FacePart f{};
+        f.version = v, f.part = static_cast<uint8_t>(i), f.parts = static_cast<uint8_t>(n);
+        std::string piece = t.substr(i * sizeof f.text, sizeof f.text);
+        f.len = static_cast<uint16_t>(piece.size());
+        memcpy(f.text, piece.data(), piece.size());
+        send_typed(kAppearance, &f, static_cast<int>(offsetof(FacePart, text) + piece.size()));
+    }
+}
+
+void on_face(const char* body, int len) {
+    if (len < static_cast<int>(offsetof(FacePart, text))) return;
+    FacePart f{};
+    memcpy(&f, body, std::min<size_t>(len, sizeof f));
+    if (!f.parts || f.parts > 8 || f.part >= f.parts || f.len > sizeof f.text || offsetof(FacePart, text) + f.len > static_cast<size_t>(len)) return;
+    if (f.version != g.face_version) g.face_version = f.version, g.face_parts.assign(f.parts, std::string()), g.face_parts.shrink_to_fit();
+    if (g.face_parts.size() != f.parts) return;
+    g.face_parts[f.part] = std::string(f.text, f.len) + "\x01";  // marks the piece as received (a piece may be empty)
+    std::string all;
+    for (const std::string& piece : g.face_parts) {
+        if (piece.empty()) return;
+        all += piece.substr(0, piece.size() - 1);
+    }
+    g.face_in = all;
+}
+
+// The other player's look on the stand-in. Every asset comes from the other player (trust boundary): only a /Game/
+// appearance asset of the field's own type is used; a float only for a float field.
+void dress_face() {
+    g.face_applied = g.face_in;
+    std::string p = ue::addr(g.puppet) + ".AppearanceComponent";
+    std::string err;
+    ue::UObject* comp = ue::resolve(p, &err);
+    ue::FProperty* cp = comp ? ue::find_prop(ue::class_of(comp), "Customization") : nullptr;
+    ue::UStruct* cs = cp ? ue::struct_of(cp) : nullptr;
+    if (!cs) return;
+    static std::unordered_map<std::string, std::string> types;  // field -> its type ("ObjectProperty<HairAppearances>")
+    if (types.empty()) {  // the description is kept: a range-for over a temporary's member dangles
+        json d = ue::describe_struct(cs, false);
+        for (const auto& f : d.get("props").items()) types[f.get("name").asString()] = f.get("type").asString();
+    }
+    auto load = [&](std::string path, const std::string& want) -> ue::UObject* {
+        if (!path.empty() && path[0] == '~') path = kFaceRoot + path.substr(1);
+        if (path.rfind("/Game/", 0) != 0 || path.find(' ') != std::string::npos) return nullptr;
+        ue::UObject* o = ue::find_path(path);
+        if (!o) {
+            ue::UClass* k = ue::find_class("/Script/Engine.KismetSystemLibrary");
+            json a = json::object();
+            a.set("Asset", path);
+            try { ue::call(ue::cdo(k), ue::find_func(k, "LoadAsset_Blocking"), a); } catch (const std::exception&) {}
+            o = ue::find_path(path);
+        }
+        return o && (want.empty() || ue::class_name(o) == want) ? o : nullptr;
+    };
+    int set = 0, skipped = 0;
+    std::string why;
+    std::vector<std::pair<std::string, std::string>> lines;  // head and body first: a new head may reset the rest
+    for (size_t at = 0; at < g.face_in.size();) {
+        size_t nl = g.face_in.find('\n', at);
+        std::string line = g.face_in.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+        at = nl == std::string::npos ? g.face_in.size() : nl + 1;
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = line.substr(0, eq);
+        auto kv = std::make_pair(k, line.substr(eq + 1));
+        if (k == "head" || k == "body" || k == "gender") lines.insert(lines.begin(), kv);
+        else lines.push_back(kv);
+    }
+    for (const auto& kv : lines) {
+        const std::string &k = kv.first, &v = kv.second;
+        try {
+            if (k.rfind("c.", 0) == 0 && types.count(k.substr(2))) {
+                const std::string& t = types[k.substr(2)];
+                size_t lt = t.find('<');
+                if (t.rfind("ObjectProperty<", 0) != 0 || lt == std::string::npos) continue;
+                if (ue::UObject* o = load(v, t.substr(lt + 1, t.size() - lt - 2))) ue::set_path(p + ".Customization." + k.substr(2), json(ue::addr(o))), set++;
+                else if (skipped++ == 0) why = k + " " + v;
+            } else if (k.rfind("f.", 0) == 0 && types.count(k.substr(2)) && types[k.substr(2)] == "FloatProperty") {
+                ue::set_path(p + ".Customization." + k.substr(2), json(atof(v.c_str()))), set++;
+            } else if (k == "head") {
+                if (ue::UObject* o = load(v, "")) { json a = json::object(); a.set("Head", ue::addr(o)); call_quiet(p, "SetDefaultHead", a); }
+            } else if (k == "body") {
+                if (ue::UObject* o = load(v, "")) { json a = json::object(); a.set("Body", ue::addr(o)); call_quiet(p, "SetDefaultBody", a); }
+            } else if (k == "gender" && (v == "Appearance.Gender.Male" || v == "Appearance.Gender.Female")) {
+                ue::set_path(p + ".AppearanceGender.TagName", json(v));
+            }
+        } catch (const std::exception& e) {
+            g.last_error = "face " + k + ": " + e.what();
+            if (skipped++ == 0) why = k + ": " + e.what();
+        }
+    }
+    ue::set_path(p + ".bEnableCustomization", json(true));
+    core_log("look: the other player's look on the stand-in, " + std::to_string(set) + " fields set" +
+             (skipped ? ", " + std::to_string(skipped) + " skipped (first: " + why + ")" : ""));
+    dress_outfit();  // refreshes the whole appearance
+}
+
 void send_look() {
     std::string err;
     ue::UObject* eq = ue::resolve("pawn.EquipmentComponent", &err);
@@ -943,6 +1129,7 @@ void send_look() {
 // The joined client plays a copy of the host's character, so the stand-in takes the local player's look: the
 // Customization struct (floats and shared appearance-asset pointers only, safe to copy), head and body, then a refresh.
 void dress_puppet() {
+    if (!g.face_in.empty()) { dress_face(); return; }  // the other player's own look (each player has their own character)
     std::string err;
     ue::UObject* mine = ue::resolve("pawn.AppearanceComponent", &err);
     ue::UObject* theirs = g.puppet ? ue::resolve(ue::addr(g.puppet) + ".AppearanceComponent", &err) : nullptr;
@@ -1066,6 +1253,9 @@ void drive_puppet() {
         g.next_tame = g.now + 2.0;
         tame_puppet(false);
     }
+    if (!g.face_in.empty() && g.face_in != g.face_applied) {  // the other player's look arrived or changed
+        try { dress_face(); } catch (const std::exception& e) { g.last_error = std::string("face: ") + e.what(); }
+    }
     if (g.have_look && look_key() != g.look_applied) {  // the other player changed armor or helmet
         try { dress_outfit(); } catch (const std::exception& e) { g.last_error = std::string("outfit: ") + e.what(); }
     }
@@ -1147,11 +1337,20 @@ void steam_discovery() {
         if (!named && steamnet::presence(f, "tow2coop") != want) continue;
         if (!named && !pick.empty()) continue;  // a name was given but no such friend: wait for it to show up
         g.peer_id = f, g.have_peer = true, g.session = -1;
+        if (!g.host) character::set_host("steam-" + std::to_string(f));  // the joined player's character for this host
         if (!g.host) steamnet::set_presence("tow2coop", ("join:" + std::to_string(f)).c_str());
         send_typed(kHello, &none, 0);
         core_log(std::string(g.host ? "steam: a friend joins: " : "steam: joining the host ") + steamnet::name(f));
         return;
     }
+}
+
+json face_debug() {
+    json r = json::object();
+    std::string local;
+    try { local = face_text(); } catch (const std::exception& e) { local = std::string("error: ") + e.what(); }
+    r.set("local", local).set("in", g.face_in).set("applied", !g.face_in.empty() && g.face_in == g.face_applied).set("error", g.last_error);
+    return r;
 }
 
 // Self-test of the Steam link without another player (bridge coop.steamProbe, any thread): the functions resolve, the
@@ -1250,7 +1449,8 @@ void frame(float) {
         g.interactables.clear(), g.inter_scan.clear();  // old world's doors and containers
         doors.clear(), door_cursor = 0;
         g.at_menu = world && ue::path_of(world).find("MainMenu") != std::string::npos;
-        if (g.host) g.push_pending = true;  // the client follows the host's new map (or its reload) right away
+        if (g.at_menu) join::set_joined(false);  // back at the menu: the player's own games save again
+        if (g.host) g.push_pending = true, g.push_ready_at = 0;  // the client follows the host's new map (or its reload)
         g.map_since = g.now;
         g.map_changes++;
     }
@@ -1261,7 +1461,8 @@ void frame(float) {
     receive();  // after the world check: data for the old world's objects is ignored until the new one settles
     // The host's map changed: hand the campaign over as soon as it can save, not after the map settles and the client
     // reports another map (two-PC test: 15 s, then 7 s of transfer).
-    if (g.host && g.push_pending && g.have_peer && gameplay && g.now >= g.next_push_try) {
+    if (g.host && g.push_pending && gameplay && !g.push_ready_at) g.push_ready_at = g.now + 2.0;  // placed at its saved spot
+    if (g.host && g.push_pending && g.have_peer && gameplay && g.push_ready_at && g.now >= g.push_ready_at && g.now >= g.next_push_try) {
         g.next_push_try = g.now + 0.5;
         request_resync("the host changed map", true);
     }
@@ -1290,9 +1491,24 @@ void frame(float) {
         g.drops++;
     }
     if (pawn && settled && !g.host && g.saves_blocked_world != g.world_ptr) {  // again once settled: the game may lift it
-        join::block_saves(true);
         g.saves_blocked_world = g.world_ptr;
-        core_log("saves are off in this joined game: the host keeps the campaign, your own saves stay untouched");
+        join::block_saves(join::joined());  // only a joined game: the player's own campaign saves normally
+        if (join::joined()) core_log("saves are off in this joined game: the host keeps the campaign, your own saves stay untouched");
+    }
+    if (!g.host) character::frame(g.now, pawn && settled && gameplay && join::joined());
+    if (!g.host && pawn && settled && join::joined() && g.snapped_world != g.world_ptr && g.puppet && !g.snaps.empty() &&
+        g.now - g.snaps.back().t < 1.0 && g.puppet_map == g.my_map) {
+        g.snapped_world = g.world_ptr;
+        double pos[3], vel[3];
+        float yaw = 0, pitch = 0;
+        const Snapshot& h = g.snaps.back();
+        if (read_transform(pawn, pos, yaw, pitch, vel) && std::hypot(pos[0] - h.px, pos[1] - h.py) > 1000.0) {
+            json a = json::object(), to = json::object();
+            to.set("X", h.px + 150.0 * std::cos(h.yaw * 3.14159265 / 180 + 1.5708)).set("Y", h.py + 150.0 * std::sin(h.yaw * 3.14159265 / 180 + 1.5708)).set("Z", h.pz + 50.0);
+            a.set("NewLocation", to).set("bSweep", false).set("bTeleport", true);
+            call_quiet(ue::addr(pawn), "K2_SetActorLocation", a);
+            core_log("joined " + std::to_string(static_cast<int>(std::hypot(pos[0] - h.px, pos[1] - h.py) / 100)) + " m from the host: moved next to it");
+        }
     }
     if (pawn && settled) {
         setup_watches();
@@ -1302,6 +1518,10 @@ void frame(float) {
         if (g.have_peer && g.now >= g.next_look) {
             g.next_look = g.now + 2.0;
             send_look();
+        }
+        if (g.have_peer && g.now >= g.next_face) {
+            g.next_face = g.now + 5.0;
+            try { send_face(); } catch (const std::exception& e) { g.last_error = std::string("send face: ") + e.what(); }
         }
         drive_puppet();
         if (g.opt_scan) scan_step(pawn);
@@ -1371,8 +1591,10 @@ json status() {
     s.set("sent", static_cast<double>(g.sent)).set("recv", static_cast<double>(g.recv)).set("stale", static_cast<double>(g.stale)).set("bad", static_cast<double>(g.bad));
     s.set("peer", g.have_peer).set("puppet", g.puppet ? ue::addr(g.puppet) : std::string("none")).set("error", g.last_error);
     s.set("sameMap", g.puppet_map == g.my_map);
+    s.set("faceIn", static_cast<double>(g.face_in.size())).set("faceApplied", !g.face_in.empty() && g.face_in == g.face_applied);
     s.set("remoteArmor", g.look[0]).set("remoteHelmet", g.look[1]).set("remoteHelmetShown", g.look_helmet_shown).set("lookApplied", g.look_applied);
     s.set("story", story::status());
+    if (!g.host) s.set("character", character::status());
     s.set("doorsSent", static_cast<double>(g.doors_sent)).set("doorsApplied", static_cast<double>(g.doors_applied));
     s.set("itemsSent", static_cast<double>(g.items_sent)).set("itemsApplied", static_cast<double>(g.items_applied)).set("lastInteract", g.last_interact);
     s.set("resyncs", static_cast<double>(g.resyncs)).set("resyncRequests", static_cast<double>(g.resync_requests)).set("resyncFetches", static_cast<double>(g.resync_fetches)).set("resyncReason", g.resync_reason);

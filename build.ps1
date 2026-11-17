@@ -29,7 +29,7 @@ $cxx = Join-Path $bin 'clang++.exe'
 $coreOut = Join-Path $out 'core'; New-Item -ItemType Directory -Force $coreOut | Out-Null
 $bridgeInc = Join-Path $root '..\..\tools\bridge\include'
 & $cxx -std=c++17 -O2 -Wall -Wextra -Werror -Wno-unused-parameter -shared -static -I $bridgeInc -o "$coreOut\tow2coop.dll" `
-    "$root\core\main.cpp" "$root\core\ue.cpp" "$root\core\hook.cpp" "$root\core\coop.cpp" "$root\core\join.cpp" "$root\core\story.cpp" "$root\core\steamnet.cpp" -lws2_32 -lole32 -luuid
+    "$root\core\main.cpp" "$root\core\ue.cpp" "$root\core\hook.cpp" "$root\core\coop.cpp" "$root\core\join.cpp" "$root\core\story.cpp" "$root\core\steamnet.cpp" "$root\core\savefile.cpp" "$root\core\character.cpp" -lws2_32 -lole32 -luuid
 if ($LASTEXITCODE) { throw "tow2coop.dll build failed" }
 Write-Host "built $coreOut\tow2coop.dll"
 if ($NoTest) { return }

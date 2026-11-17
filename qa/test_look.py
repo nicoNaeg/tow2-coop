@@ -83,6 +83,24 @@ def main():
     hair = asset(call("ue.get", {"path": f"{p0}.AppearanceComponent.Customization.Hair"}, inst=0))
     mine = asset(call("ue.get", {"path": "pawn.AppearanceComponent.Customization.Hair"}, inst=0))
     check(enabled is True and hair == mine, "stand-in has the player's hair (customization enabled)", f"enabled {enabled}, hair {hair} / {mine}")
+    # Each player has their own look (end goal 2): the client changes its own hair; the host's stand-in of the client
+    # follows it (look message), the client's stand-in of the host keeps the host's hair.
+    p1 = call("coop.status", {}, inst=1)["puppet"].split()[0]
+    theirs = lambda: asset(call("ue.get", {"path": f"{p0}.AppearanceComponent.Customization.Hair"}, inst=0))  # noqa: E731
+    host_hair = asset(call("ue.get", {"path": "pawn.AppearanceComponent.Customization.Hair"}, inst=0))
+    other = next((r.split()[0], r.split()[2]) for r in call("ue.find", {"class": "HairAppearances", "limit": 80}, inst=1) if r.split()[2] != host_hair)
+    old = asset(call("ue.get", {"path": "pawn.AppearanceComponent.Customization.Hair"}, inst=1))
+    call("ue.call", {"ref": "pawn.AppearanceComponent", "fn": "SetHair", "args": {"NewHair": other[0]}}, inst=1)
+    call("ue.call", {"ref": "pawn.AppearanceComponent", "fn": "RefreshFullAppearance", "args": {}}, inst=1)
+    t0 = time.time()
+    while time.time() - t0 < 15 and safe(theirs) != other[1]:
+        time.sleep(0.5)
+    check(safe(theirs) == other[1], "the host's stand-in shows the client's own new hair", f"{safe(theirs)} after {time.time() - t0:.0f} s")
+    kept = asset(call("ue.get", {"path": f"{p1}.AppearanceComponent.Customization.Hair"}, inst=1))
+    check(kept == host_hair, "the client's stand-in of the host keeps the host's hair", f"{kept}")
+    back = next(r.split()[0] for r in call("ue.find", {"class": "HairAppearances", "limit": 80}, inst=1) if r.split()[2] == old)
+    call("ue.call", {"ref": "pawn.AppearanceComponent", "fn": "SetHair", "args": {"NewHair": back}}, inst=1)
+    call("ue.call", {"ref": "pawn.AppearanceComponent", "fn": "RefreshFullAppearance", "args": {}}, inst=1)
     a0, h0 = worn(1, "ArmorSet"), worn(1, "Helmet")
     print("client wears", a0, "/", h0, flush=True)
     check(wait_for("ArmorSet", a0) and wait_for("Helmet", h0), "stand-in wears the client's armor set and helmet",

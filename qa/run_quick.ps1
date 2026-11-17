@@ -25,6 +25,7 @@ foreach ($i in 0, 1) {
     python -I local/tow2-coop/qa/prep_instance.py --config $cfg --instance $i | Out-Null
     $cr = "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes"; if (Test-Path $cr) { Remove-Item $cr -Recurse -Force }
 }
+$Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File passes 'a,b' as one string
 $extra = @(); if ($NoRamCheck) { $extra += '--no-ram-check' }
 python -I tools/gamepool/gamepool.py --config $cfg up --pairs 1 --stagger 60 @extra 2>&1 | Select-Object -Last 2 | Out-Host
 Get-Process -Name 'TheOuterWorlds2-Win64-Shipping' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$hub\local\gamepool\instances\*" } | ForEach-Object { & "$qa\unminimize.ps1" -ProcessId $_.Id | Out-Null }
@@ -37,6 +38,7 @@ $p = Pids
 Step 'outfit and hair' { python -I test_look.py }
 Step 'stand-in animation' { python -I test_anim.py $p[1] }
 Step 'interact and loot' { python -I test_interact.py }
+Step 'own character' { python -I test_character.py }
 Step 'resync map travel' { python -I test_resync.py B }
 foreach ($i in 0, 1) { Get-ChildItem "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes" -ErrorAction SilentlyContinue | ForEach-Object { "crash report in copy ${i}: $($_.Name)" | Tee-Object -FilePath $log -Append } }
 Step 'no caught faults' {

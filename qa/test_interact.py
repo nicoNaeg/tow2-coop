@@ -161,6 +161,26 @@ def main():
             looted += 1
         break
     check(looted > 0, "a dead NPC with loot in both worlds was looted")
+    # Trading (end goal 2): an item a player stores in a container shows up in the same container for the other player.
+    # The store is the game's transfer: the item leaves the player, then the container gains it (two calls, < 1 s).
+    chests = both("Container")
+    check(bool(chests), "a container in both worlds")
+    if chests:
+        _, h, c = chests[0]
+        for inst, other, mine, theirs, side in ((0, 1, h, c, "host"), (1, 0, c, h, "client")):
+            name = "Ammo_Shotgun_C"
+            k, ko = item_class(inst, name), item_class(other, name)
+            if not (k and ko):
+                check(False, f"{name} loaded in both worlds")
+                continue
+            have = call("ue.call", {"ref": "pawn.InventoryComponent", "fn": "GetItemCountOnActor", "args": {"Actor": "pawn", "ItemType": k}}, inst=inst)["ReturnValue"]
+            if have < 3:
+                call("ue.call", {"ref": "pawn.InventoryComponent", "fn": "GiveItemToActor", "args": {"Actor": "pawn", "ItemType": k, "Count": 3}}, inst=inst)
+            n_other = count(other, theirs, ko)
+            call("ue.call", {"ref": "pawn.InventoryComponent", "fn": "RemoveItemFromActor", "args": {"Actor": "pawn", "ItemType": k, "Count": 3}}, inst=inst)
+            call("ue.call", {"ref": f"{mine}.InventoryComponent", "fn": "GiveItemToActor", "args": {"Actor": mine, "ItemType": k, "Count": 3, "bLootable": True}}, inst=inst)
+            check(wait(lambda: count(other, theirs, ko) == n_other + 3, 8), f"the {side} stored 3 {name} in a container; it is in the other world's container too",
+                  f"{n_other} -> {count(other, theirs, ko)}")
     s0, s1 = call("coop.status", {}, inst=0), call("coop.status", {}, inst=1)
     print("host:", {k: s0[k] for k in ("doorsSent", "doorsApplied", "itemsSent", "itemsApplied", "lastInteract")})
     print("client:", {k: s1[k] for k in ("doorsSent", "doorsApplied", "itemsSent", "itemsApplied", "lastInteract")})

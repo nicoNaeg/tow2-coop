@@ -9,6 +9,7 @@
 #include <knownfolders.h>
 #include <shlobj.h>
 #include "join.hpp"
+#include "character.hpp"
 #include "steamnet.hpp"
 #include "ue.hpp"
 #include <atomic>
@@ -30,6 +31,7 @@ std::atomic<bool> busy{false}, ready_to_load{false};
 uint64_t bytes = 0;
 double started = 0, load_t = -1e9;  // load_t: when this core last started a LoadGame (game thread)
 bool load_ok = false;               // the game accepted that LoadGame
+std::atomic<bool> joined_world{false};
 uintptr_t load_world = 0;           // the world it was started from
 
 double now_s() { return GetTickCount64() / 1000.0; }
@@ -292,6 +294,20 @@ void client_worker(std::string host, int port, std::wstring dir) {
 }
 }  // namespace
 
+std::wstring saves_folder() { return saves_dir(); }
+
+std::wstring local_folder() {
+    KnownFolderFn f = exe_known_folder();
+    PWSTR p = nullptr;
+    if (!f || FAILED(f(FOLDERID_LocalAppData, 0, nullptr, &p)) || !p) return L"";
+    std::wstring d = p;
+    CoTaskMemFree(p);
+    return d;
+}
+
+bool joined() { return joined_world.load(); }
+void set_joined(bool on) { joined_world = on; }
+
 json host_offer(int port, const std::string& bind_ip, const std::string& allow_ip, uint64_t steam_to, uint32_t host_id) {
     if (busy.exchange(true)) throw std::runtime_error("a transfer is already running");
     std::wstring dir = saves_dir();
@@ -409,9 +425,11 @@ void block_saves(bool block) {
 // Game thread: load the received save once (the front end must have run for a while, see session.py).
 void frame(uint64_t frames) {
     if (frames < 3600 || !ready_to_load.load()) return;  // LoadGame in the first ~15 s after start crashed the engine
-    ready_to_load = false;
     std::string f;
     { std::lock_guard<std::mutex> g(mu); f = folder; }
+    // The joined player's own character goes into the received campaign first (it may save it for a few seconds).
+    if (!character::before_load(saves_dir() + L"\\" + std::wstring(f.begin(), f.end()))) { set_state("keeping your character"); return; }
+    ready_to_load = false;
     std::vector<ue::UObject*> found = ue::instances(ue::find_class("/Script/Arkansas.SaveGameManager"), false, 1);
     if (found.empty()) { set_state("failed", "no SaveGameManager to load with"); return; }
     json a = json::object();
@@ -424,6 +442,7 @@ void frame(uint64_t frames) {
     load_t = now_s();
     json r = ue::call(found[0], ue::find_func(ue::class_of(found[0]), "LoadGame"), a);
     load_ok = r.get("ReturnValue").asString().find("Success") != std::string::npos;
+    if (load_ok) joined_world = true, character::loaded();
     set_state("loaded:" + r.get("ReturnValue").asString());
 }
 

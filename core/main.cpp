@@ -10,6 +10,7 @@
 #include "coop.hpp"
 #include "join.hpp"
 #include "steamnet.hpp"
+#include "character.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdarg>
@@ -429,6 +430,8 @@ DWORD WINAPI init_thread(LPVOID) {
     reg("coop.status", [](const Value&) { return coop::status(); });
     reg("coop.set", [](const Value& p) { return coop::set_options(p); });
     reg("coop.steamProbe", [](const Value&) { return coop::steam_probe(); }, false);  // waits: off the game thread
+    reg("coop.face", [](const Value&) { return coop::face_debug(); });  // test: look texts
+    reg("coop.charSave", [](const Value&) { character::save_now(); return character::status(); });  // test: keep the character now
     reg("coop.steamAccept", [](const Value&) {  // test: the host's accept pass over the friends list, on any copy
         Value r = Value::object();
         r.set("on", steamnet::on()).set("friends", static_cast<double>(steamnet::accept_friends()));

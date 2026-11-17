@@ -45,14 +45,27 @@ def main():
     cp = call("eval", {"expr": "pawn.K2_GetActorLocation()"}, inst=1)["value"]
     d = sum((hp[k] - cp[k]) ** 2 for k in "XYZ") ** 0.5
     check(d < 800, "client spawned near the host", f"{d:.0f} units apart")
-    # The client plays a copy of the host's character, so in each world the stand-in must look like the local player.
-    for inst, s, who in ((0, s0, "host"), (1, s1, "client")):
+    # Each player has their own character (own Player.dat), and each stand-in wears the OTHER player's look (sent as a
+    # look message every 5 s): compare by asset path, the objects are different instances in the two worlds.
+    def norm(v):
+        if isinstance(v, dict):
+            return {k: norm(x) for k, x in v.items()}
+        return v.split()[2] if isinstance(v, str) and v.startswith("0x") and len(v.split()) > 2 else v
+
+    def look(inst, ref):
+        return {k: safe(lambda k=k: norm(call("eval", {"expr": f"{ref}.AppearanceComponent.{k}"}, inst=inst)["value"]))
+                for k in ("AppearanceGender", "CurrentHead", "CurrentBody", "Customization")}
+
+    for inst, other, s, who in ((0, 1, s0, "host"), (1, 0, s1, "client")):
         if s.get("puppet", "none") == "none":
             continue
-        look = {k: [safe(lambda r=r, k=k: call("eval", {"expr": f"{r}.AppearanceComponent.{k}"}, inst=inst)["value"]) for r in ("pawn", s["puppet"])]
-                for k in ("AppearanceGender", "CurrentHead", "CurrentBody", "Customization")}
-        diff = [k for k, (mine, theirs) in look.items() if mine is None or mine != theirs]
-        check(not diff, f"the stand-in in the {who}'s world wears the player's look", f"differs: {diff}" if diff else "")
+        want, diff, t1 = look(other, "pawn"), ["?"], time.time()
+        while time.time() - t1 < 20 and diff:
+            got = look(inst, s["puppet"].split()[0])
+            diff = [k for k in want if want[k] is None or got.get(k) != want[k]]
+            if diff:
+                time.sleep(1)
+        check(not diff, f"the stand-in in the {who}'s world wears the other player's look", f"differs: {diff}" if diff else "")
     print(f"client join requests {s1.get('joinRequests')}, fetches {s1.get('resyncFetches')}; host resyncs {s0.get('resyncs')} ({s0.get('resyncReason')})")
     print(f"RESULT: {'PASS' if not fails else 'FAIL'} ({fails} failure(s))")
     return fails
