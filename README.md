@@ -27,6 +27,10 @@ Entertainment or Xbox; it ships no game files. MIT license.
   loading the campaign the host sends, the friend's mod saves its own character (a private save named "CoopSelf") and
   puts it into the host's campaign. The character is kept per host in `%LOCALAPPDATA%\tow2coop\characters\`. To start
   fresh, create a character in a new game of your own first (its save becomes your newest save), then join.
+- **Progression:** level, skills and perks are each player's own (they travel with the character). XP is party XP:
+  a kill, a lock pick, a hack, a conversation or an interaction earns XP for both players (each with their own
+  multipliers); quest XP comes from the host's campaign (the friend's game does not add its own); discovering a place
+  or a collectible earns XP only for the player who finds it.
 - **Trading:** put an item in any container (a chest, a crate): it appears in the same container in the other player's
   world, where they take it. A traded weapon or armor arrives as a new copy (without its mods or level).
 - **Players:** each player moves, fights and loots in their own world; the other player appears as a stand-in NPC body
@@ -123,14 +127,16 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
 
 - Loading a save within the first ~15 s after start crashes the game (engine `LoadMap`); the client waits 60 s of
   frames before loading a received campaign. Players loading from the menu by hand are not affected.
-- The remote player is a stand-in NPC with the player's face and body as at the join; their armor set and helmet follow
-  changes within a few seconds (a piece you don't wear yourself shows without its mods).
+- The remote player is a stand-in NPC that wears the other player's own look (face, hair, body) and armor and helmet;
+  changes follow within a few seconds (a piece you don't wear yourself shows without its mods).
 - NPC AI still runs in each world; the host corrects positions over 3 m and owns health and death. An enemy attacked by
   one player only takes the damage in the other player's world (it does not move or fight there), and enemies do not
   attack the remote player's stand-in.
-- The joined player plays a copy of the host's character, renewed at every hand-over (join, quest resync, map change):
-  items, ammo, money and XP the friend gains are replaced by the host's at the next hand-over. Each player keeping their
-  own character is the next big step (`TASKS.md`, end goal 2).
+- The friend's character is kept by a private save the friend's game makes before each hand-over (join, quest resync,
+  map change) and every 3 minutes. When the game can't save at that moment (combat, a conversation), the last kept one
+  is used: what the friend gained since then (up to 3 minutes) is lost at that hand-over.
 - Quest completions reach the client by a reload (resync), not live.
+- Trading goes through containers: the player who stores an item must stand within 5 m of the container. Taking only
+  part of a stack out of a container is not mirrored (taking the whole stack is).
 - Door and container changes are sent three times without acknowledgement; on a very lossy link one can be missed.
   (Damage the client deals is resent until the host acknowledges it; quest updates are acknowledged too.)

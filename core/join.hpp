@@ -18,5 +18,6 @@ std::wstring saves_folder();  // <Saved Games>\TheOuterWorlds2 as the game sees 
 std::wstring local_folder();  // <LocalAppData> as the game sees it
 bool joined();                // the world came from a hand-over (cleared at the main menu): saves stay off for the player
 void set_joined(bool on);
+void refuse_loads(int n);     // test: the next n loads of a received campaign count as refused by the game
 coopbridge::json::Value status();                                                              // any thread
 }  // namespace join

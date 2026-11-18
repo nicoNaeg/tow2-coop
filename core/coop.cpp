@@ -20,6 +20,7 @@
 #include <deque>
 #include <string>
 #include <unordered_map>
+#include <array>
 #include <mutex>
 
 void core_log(const std::string& line);  // main.cpp: a line in tow2coop.log (what a player sends when something fails)
@@ -43,10 +44,10 @@ volatile bool applying_remote = false;  // set while we apply a remote change: i
 #pragma pack(push, 1)
 struct InteractMsg {
     uint32_t eid;   // sender-unique event id (dedupe of the 3 copies)
-    uint8_t kind;   // 1 door state, 2 container item removed
-    uint64_t id;    // fnv64 of the actor path (level-placed actors have the same path in both worlds)
-    int32_t a;      // door: EOCLState; container: count
-    uint16_t len;   // item class path length (kind 2)
+    uint8_t kind;   // 1 door state, 2 item taken, 3 item stored, 4 XP earned
+    uint64_t id;    // fnv64 of the actor path (level-placed actors have the same path in both worlds); XP: EXPGainReason
+    int32_t a;      // door: EOCLState; items: count; XP: amount before the receiver's own multipliers
+    uint16_t len;   // item class path length (kinds 2, 3)
     char path[256];
 };
 #pragma pack(pop)
@@ -56,8 +57,8 @@ struct Outgoing {
     double at[3];
     int sent;
 };
-constexpr uint32_t kMagic = 0x31433254;  // "T2C1": the last character is the protocol version, bump it on any packet change
-constexpr const char* kVersion = "0.2.0-beta.5";
+constexpr uint32_t kMagic = 0x32433254;  // "T2C2": the last character is the protocol version, bump it on any packet change
+constexpr const char* kVersion = "0.2.0-beta.6";
 constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13;
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";
@@ -180,6 +181,12 @@ struct Ctx {
     uint32_t face_version = 0;          // the look being assembled from its pieces
     std::vector<std::string> face_parts;
     double next_face = 0;
+    std::unordered_map<uint64_t, std::array<double, 3>> box_pos;                        // containers don't move
+    std::unordered_map<uint64_t, std::unordered_map<ue::UClass*, int32_t>> box_counts;  // what those near the player hold
+    double next_box_check = 0;
+    std::vector<std::pair<int32_t, uint8_t>> xp_inbox;  // XP the other player earned, until there is a player to give it to
+    uint64_t xp_sent = 0, xp_applied = 0, xp_blocked = 0, xp_details_filled = 0;
+    std::string last_xp;
 } g;
 
 uint64_t fnv64(const std::string& s) {
@@ -514,11 +521,11 @@ void setup_watches() {
     if (g.watches_set) return;
     uint32_t b = ue::make_name("HandleItemRemoved", false).index;  // door state changes go through a native delegate: polled
     uint32_t c = ue::make_name("ItemRemoved", false).index;          // IndianaCharacter.ItemRemoved: a dead NPC looted
-    uint32_t a = ue::make_name("HandleItemAdded", false).index;      // Container.HandleItemAdded: the player stored an item
-    if (!b || !c || !a) return;
+    uint32_t d = ue::make_name("OnItemCountChangedInInventory", false).index;  // part of the player's stack left (run 70)
+    if (!b || !c || !d) return;
     watch[0] = reinterpret_cast<void*>(static_cast<uintptr_t>(b));
     watch[1] = reinterpret_cast<void*>(static_cast<uintptr_t>(c));
-    watch[2] = reinterpret_cast<void*>(static_cast<uintptr_t>(a));
+    watch[2] = reinterpret_cast<void*>(static_cast<uintptr_t>(d));
     watch_count.store(3, std::memory_order_release);
     g.watches_set = true;
 }
@@ -550,9 +557,23 @@ void process_observed() {
     g.my_removals.erase(std::remove_if(g.my_removals.begin(), g.my_removals.end(), [](const std::pair<ue::UClass*, double>& r) { return g.now - r.second > 1.0; }),
                         g.my_removals.end());
     ue::UObject* me = local_pawn();
+    std::string err;
+    ue::UObject* my_inv = me ? ue::resolve(ue::addr(me) + ".InventoryComponent", &err) : nullptr;
     for (auto& e : evs) {  // items that left the local player (an item stored in a container may come first in the batch)
-        if (e.obj != me || !me || ue::name_of(static_cast<ue::UFunction*>(e.fn)) != "ItemRemoved") continue;
-        int off = param_offset(static_cast<ue::UFunction*>(e.fn), "Item");
+        auto* f = static_cast<ue::UFunction*>(e.fn);
+        std::string fname = ue::name_of(f);
+        bool removed = me && e.obj == me && fname == "ItemRemoved";  // a whole stack
+        // Part of a stack: only its count changes (EquipmentComponent / InventoryAmmoPool handlers). A gain changes it
+        // too; it only counts with a container add of the same class within 1 s.
+        bool changed = false;
+        if (my_inv && fname == "OnItemCountChangedInInventory") {
+            int io = param_offset(f, "InInventoryComponent");
+            ue::UObject* inv = nullptr;
+            if (io >= 0 && io + 8 <= 64) memcpy(&inv, e.parms + io, 8);
+            changed = inv == my_inv;
+        }
+        if (!removed && !changed) continue;
+        int off = param_offset(f, removed ? "Item" : "ItemStack");
         ue::UObject* item = nullptr;
         if (off >= 0 && off + 8 <= 64) memcpy(&item, e.parms + off, 8);
         if (item && ue::alive(item)) g.my_removals.push_back({ue::class_of(item), g.now});
@@ -570,7 +591,7 @@ void process_observed() {
             queue_interact(1, fnv64(path), st, "");
             g.doors_sent++;
             g.last_interact = "sent door " + path.substr(path.rfind('.') + 1) + " -> " + std::to_string(st);
-        } else if (fname == "HandleItemRemoved" || fname == "ItemRemoved" || fname == "HandleItemAdded") {
+        } else if (fname == "HandleItemRemoved" || fname == "ItemRemoved") {
             int off = param_offset(f, fname == "ItemRemoved" ? "Item" : "ItemStack");
             if (off < 0 || off + 12 > 64) continue;
             ue::UObject* item;
@@ -579,17 +600,6 @@ void process_observed() {
             memcpy(&count, e.parms + off + 8, 4);
             if (!item || !ue::alive(item) || count <= 0) continue;
             ue::UClass* cls = ue::class_of(item);
-            if (fname == "HandleItemAdded") {
-                // Trading: an item the player stored in a container shows up in that container for the other player.
-                // The game's own loot generation adds items too; only an item that just left the player counts.
-                auto mine = std::find_if(g.my_removals.begin(), g.my_removals.end(), [&](const std::pair<ue::UClass*, double>& r) { return r.first == cls; });
-                if (mine == g.my_removals.end()) continue;
-                g.my_removals.erase(mine);
-                queue_interact(3, fnv64(path), count, ue::path_of(cls));
-                g.items_sent++;
-                g.last_interact = "sent store " + std::to_string(count) + "x " + ue::name_of(cls);
-                continue;
-            }
             // ItemRemoved is any character's inventory: only a dead level-placed NPC counts (looted; both worlds know
             // it by name). A living NPC uses its own items, and each world runs its own AI (two-PC test: corpse loot).
             if (fname == "ItemRemoved") {
@@ -603,6 +613,75 @@ void process_observed() {
             g.last_interact = "sent take " + std::to_string(count) + "x " + ue::name_of(ue::class_of(item));
         }
     }
+}
+
+// Trading: what the containers near the player hold (every 0.25 s). A container that gained items of a class the
+// player just lost got them from the player: a new stack, or added to one it had (the game fires no event for that,
+// run 71). The other world's same container gets them too.
+std::unordered_map<ue::UClass*, int32_t> box_items(ue::UObject* box) {
+    std::unordered_map<ue::UClass*, int32_t> out;
+    std::string err;
+    ue::UObject* inv = ue::resolve(ue::addr(box) + ".InventoryComponent", &err);
+    static int items_off = -2;
+    if (!inv) return out;
+    if (items_off == -2) {
+        ue::FProperty* p = ue::find_prop(ue::class_of(inv), "Items");  // InventoryComponent.Items: TArray<FItemStack>
+        items_off = p ? ue::prop_offset(p) : -1;
+    }
+    if (items_off < 0) return out;
+    struct Stack { ue::UObject* item; int32_t count; uint8_t rest[12]; };  // FItemStack: Item, Count, bLootable (0x18)
+    static_assert(sizeof(Stack) == 0x18, "FItemStack size");
+    const Stack* data;
+    int32_t num;
+    memcpy(&data, reinterpret_cast<const uint8_t*>(inv) + items_off, 8);
+    memcpy(&num, reinterpret_cast<const uint8_t*>(inv) + items_off + 8, 4);
+    if (!data || num <= 0 || num > 4096 || !ue::readable(data, static_cast<size_t>(num) * sizeof(Stack))) return out;
+    for (int i = 0; i < num; i++)
+        if (data[i].item && data[i].count > 0 && ue::alive(data[i].item)) out[ue::class_of(data[i].item)] += data[i].count;
+    return out;
+}
+
+void watch_boxes(ue::UObject* pawn) {
+    if (g.now < g.next_box_check || !g.container_class) return;
+    g.next_box_check = g.now + 0.25;
+    double me[3], vel[3];
+    float yaw, pitch;
+    if (!read_transform(pawn, me, yaw, pitch, vel)) return;
+    static Fn loc;
+    int budget = 64;  // new containers located per pass
+    std::unordered_map<uint64_t, std::unordered_map<ue::UClass*, int32_t>> close_by;  // ('near' is a Windows macro)
+    for (auto& kv : g.interactables) {
+        ue::UObject* box = kv.second;
+        if (!ue::alive(box) || !ue::is_a(box, g.container_class)) continue;
+        auto at = g.box_pos.find(kv.first);
+        if (at == g.box_pos.end()) {
+            if (budget-- <= 0 || !loc.init(box, "K2_GetActorLocation")) continue;
+            alignas(16) uint8_t b[64] = {};
+            ue::process_event(box, loc.f, b);
+            std::array<double, 3> p;
+            memcpy(p.data(), b + loc.off("ReturnValue"), 24);
+            at = g.box_pos.emplace(kv.first, p).first;
+        }
+        double dx = at->second[0] - me[0], dy = at->second[1] - me[1], dz = at->second[2] - me[2];
+        if (dx * dx + dy * dy + dz * dz > 500.0 * 500.0) continue;
+        auto items = box_items(box);
+        auto was = g.box_counts.find(kv.first);
+        if (was != g.box_counts.end()) {
+            for (const auto& it : items) {
+                auto w = was->second.find(it.first);
+                int32_t gained = it.second - (w == was->second.end() ? 0 : w->second);
+                if (gained <= 0) continue;
+                auto mine = std::find_if(g.my_removals.begin(), g.my_removals.end(), [&](const std::pair<ue::UClass*, double>& r) { return r.first == it.first; });
+                if (mine == g.my_removals.end()) continue;  // the game's own loot, not the player's
+                g.my_removals.erase(mine);
+                queue_interact(3, kv.first, gained, ue::path_of(it.first));
+                g.items_sent++;
+                g.last_interact = "sent store " + std::to_string(gained) + "x " + ue::name_of(it.first);
+            }
+        }
+        close_by[kv.first] = std::move(items);
+    }
+    g.box_counts.swap(close_by);  // a container the player left is looked at afresh when they come back
 }
 
 void send_outgoing() {
@@ -696,10 +775,27 @@ void call_on(ue::UObject* o, const char* fn, const json& args) {
 
 ue::UClass* load_class(const std::string& path);  // below: a Blueprint class by path, loaded if needed
 
-void apply_interact(const InteractMsg& m) {
-    if (std::find(g.seen_eids.begin(), g.seen_eids.end(), m.eid) != g.seen_eids.end()) return;
-    g.seen_eids.push_back(m.eid);
+bool first_time(uint32_t eid) {  // each event goes out three times
+    if (std::find(g.seen_eids.begin(), g.seen_eids.end(), eid) != g.seen_eids.end()) return false;
+    g.seen_eids.push_back(eid);
     if (g.seen_eids.size() > 512) g.seen_eids.erase(g.seen_eids.begin(), g.seen_eids.begin() + 256);
+    return true;
+}
+
+// XP the other player earned (kind 4). Taken in any world state: it waits in the inbox for a player (it often comes
+// with a map change, while this world loads).
+bool take_xp(const char* body, int len) {
+    InteractMsg m{};
+    if (len != static_cast<int>(offsetof(InteractMsg, path))) return false;
+    memcpy(&m, body, len);
+    if (m.kind != 4) return false;
+    g.recv++;
+    if (first_time(m.eid) && m.a > 0 && m.a <= 1000000 && m.id <= 13) g.xp_inbox.push_back({m.a, static_cast<uint8_t>(m.id)});  // trust boundary
+    return true;
+}
+
+void apply_interact(const InteractMsg& m) {
+    if (!first_time(m.eid)) return;
     ue::UObject* actor = interactable(m.id);
     if (!actor && m.kind == 2) {  // a looted dead NPC: the NPC registry knows it by the same path id
         auto it = g.npcs.find(m.id);
@@ -751,6 +847,8 @@ void apply_interact(const InteractMsg& m) {
                 json q = json::object();
                 q.set("Actor", ue::addr(actor)).set("ItemType", ue::addr(item)).set("Count", static_cast<int>(m.a)).set("bLootable", true);
                 ue::call(inv, ue::find_func(ue::class_of(inv), "GiveItemToActor"), q);
+                auto snap = g.box_counts.find(m.id);
+                if (snap != g.box_counts.end()) snap->second[item] += m.a;
                 g.items_applied++;
                 g.last_interact = "applied store " + std::to_string(m.a) + "x " + ue::name_of(item) + " in " + ue::name_of(actor);
             }
@@ -809,6 +907,7 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
     g.remote_id = h.sender;
     g.remote_last_seq = h.seq;
     if (h.type == kResync && !g.host) { g.last_recv_t = g.now; client_fetch_resync(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }
+    if (h.type == kInteract && take_xp(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)))) { g.last_recv_t = g.now; return; }
     if (!g.in_gameplay || g.now < g.settle_until) { g.last_recv_t = g.now; g.stale++; return; }  // not in a settled world: data ignored
     if (h.type == kResync && !g.host) {  // handled even while not settled: the client may be anywhere
         client_fetch_resync(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)));
@@ -1353,6 +1452,73 @@ json face_debug() {
     return r;
 }
 
+// ---------------------------------------------------------------- party XP
+// The game's AddXP (hooked in main.cpp) sees every XP gain with its reason. Kills, lock picks, hacks, conversations,
+// interactions, automechs and taming are shared both ways; quest XP comes from the host's campaign only (the client's
+// own quest XP is dropped: its quest graph follows the host's); discoveries, collectibles, bits and debug XP stay with
+// the player who earned them (each player discovers and picks up on their own).
+AddXpFn add_xp_original = nullptr, add_xp_entry = nullptr;
+namespace {
+constexpr int kXpOffset = 0x93C;  // UPlayerInfoComponent's XP (int32), from AddXP's code in build CL-2994920
+constexpr uint16_t kSharedXp = 1 << 0 | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 10 | 1 << 11 | 1 << 12, kQuestXp = 1 << 1 | 1 << 2;
+
+ue::UObject* player_info() {
+    std::string err;
+    return ue::resolve("pawn.PlayerInfoComponent", &err);
+}
+
+std::string xp_reason(uint8_t r) {
+    static const char* n[] = {"enemy killed", "quest", "quest objective", "discovery", "hack", "lock pick", "conversation",
+                              "collectible", "debug", "travel destination", "interaction", "automech", "creature tamed", "bits"};
+    return r < 14 ? n[r] : "?";
+}
+
+void apply_xp_inbox() {
+    if (g.xp_inbox.empty() || !add_xp_original) return;
+    if (!g.host && !join::joined()) { g.xp_inbox.clear(); return; }  // the friend's own campaign: not the co-op character
+    ue::UObject* pic = player_info();
+    if (!pic) return;
+    for (const auto& x : g.xp_inbox) {
+        alignas(16) uint8_t details[16] = {};  // the game's own callers pass an empty TArray here
+        bool gained = add_xp_original(pic, x.first, x.second, details);  // the original: no echo back
+        void* data;
+        memcpy(&data, details, sizeof data);
+        if (data) g.xp_details_filled++;  // shortcut: entries a listener adds are not freed (none seen in tests); free them if this counts up
+        if (gained) g.xp_applied++;
+        g.last_xp = std::string(gained ? "got " : "at max level, no ") + std::to_string(x.first) + " XP (" + xp_reason(x.second) + ") from the other player";
+    }
+    g.xp_inbox.clear();
+}
+}  // namespace
+
+bool xp_blocked(void* self, uint8_t reason) {
+    try {
+        if (reason > 13 || !((kQuestXp >> reason) & 1) || !g.on || g.host || !g.remote_id || !join::joined() || self != player_info()) return false;
+        g.xp_blocked++;
+        g.last_xp = "own " + xp_reason(reason) + " XP dropped: the host's comes instead";
+        return true;
+    } catch (const std::exception&) { return false; }  // called from game code: nothing may escape
+}
+
+void on_xp(void* self, int32_t xp, uint8_t reason) {
+    try {
+        if (reason > 13 || !(((kSharedXp | (g.host ? kQuestXp : 0)) >> reason) & 1) || !g.on || !g.remote_id || xp <= 0) return;
+        if ((!g.host && !join::joined()) || self != player_info()) return;  // the friend's own campaign is not shared
+        queue_interact(4, reason, xp, "");
+        g.xp_sent++;
+        g.last_xp = "sent " + std::to_string(xp) + " XP (" + xp_reason(reason) + ")";
+    } catch (const std::exception&) {}
+}
+
+json xp_test(int xp, int reason) {  // test bridge: an XP gain through the game's AddXP, as gameplay makes one
+    ue::UObject* pic = player_info();
+    if (!pic || !add_xp_entry) throw std::runtime_error(!pic ? "no player" : "AddXP is not hooked");
+    alignas(16) uint8_t details[16] = {};
+    json r = json::object();
+    r.set("gained", add_xp_entry(pic, xp, static_cast<uint8_t>(reason), details));
+    return r;
+}
+
 // Self-test of the Steam link without another player (bridge coop.steamProbe, any thread): the functions resolve, the
 // relay network comes up, and a message addressed to yourself comes back on channel 9.
 json steam_probe() {
@@ -1447,6 +1613,7 @@ void frame(float) {
         g.puppet = nullptr;  // it belonged to the old world
         g.npcs.clear(), g.scanning.clear(), g.scan_cursor = 0;
         g.interactables.clear(), g.inter_scan.clear();  // old world's doors and containers
+        g.box_pos.clear(), g.box_counts.clear();
         doors.clear(), door_cursor = 0;
         g.at_menu = world && ue::path_of(world).find("MainMenu") != std::string::npos;
         if (g.at_menu) join::set_joined(false);  // back at the menu: the player's own games save again
@@ -1513,7 +1680,9 @@ void frame(float) {
     if (pawn && settled) {
         setup_watches();
         process_observed();
+        watch_boxes(pawn);
         if (g.opt_doors) poll_doors();
+        apply_xp_inbox();
         send_outgoing();
         if (g.have_peer && g.now >= g.next_look) {
             g.next_look = g.now + 2.0;
@@ -1597,6 +1766,9 @@ json status() {
     if (!g.host) s.set("character", character::status());
     s.set("doorsSent", static_cast<double>(g.doors_sent)).set("doorsApplied", static_cast<double>(g.doors_applied));
     s.set("itemsSent", static_cast<double>(g.items_sent)).set("itemsApplied", static_cast<double>(g.items_applied)).set("lastInteract", g.last_interact);
+    if (ue::UObject* pic = player_info()) s.set("xp", static_cast<double>(*reinterpret_cast<const int32_t*>(reinterpret_cast<const uint8_t*>(pic) + kXpOffset)));
+    s.set("xpHook", add_xp_original != nullptr).set("xpSent", static_cast<double>(g.xp_sent)).set("xpApplied", static_cast<double>(g.xp_applied));
+    s.set("xpBlocked", static_cast<double>(g.xp_blocked)).set("xpPending", static_cast<double>(g.xp_inbox.size())).set("xpDetails", static_cast<double>(g.xp_details_filled)).set("lastXp", g.last_xp);
     s.set("resyncs", static_cast<double>(g.resyncs)).set("resyncRequests", static_cast<double>(g.resync_requests)).set("resyncFetches", static_cast<double>(g.resync_fetches)).set("resyncReason", g.resync_reason);
     s.set("npcs", static_cast<double>(g.npcs.size())).set("npcSent", static_cast<double>(g.npc_sent)).set("npcApplied", static_cast<double>(g.npc_applied));
     s.set("npcKilled", static_cast<double>(g.npc_killed)).set("npcSnapped", static_cast<double>(g.npc_snapped));

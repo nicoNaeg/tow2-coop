@@ -163,6 +163,7 @@ def main():
     check(looted > 0, "a dead NPC with loot in both worlds was looted")
     # Trading (end goal 2): an item a player stores in a container shows up in the same container for the other player.
     # The store is the game's transfer: the item leaves the player, then the container gains it (two calls, < 1 s).
+    # The second store adds to the stack the first one made (run 71: that fires no Container.HandleItemAdded).
     chests = both("Container")
     check(bool(chests), "a container in both worlds")
     if chests:
@@ -173,6 +174,12 @@ def main():
             if not (k and ko):
                 check(False, f"{name} loaded in both worlds")
                 continue
+            # the player walks up to the container first: the mod watches what the containers near the player hold
+            here = call("ue.call", {"ref": mine, "fn": "K2_GetActorLocation"}, inst=inst)["ReturnValue"]
+            stood = call("ue.call", {"ref": "pawn", "fn": "K2_GetActorLocation"}, inst=inst)["ReturnValue"]
+            to = {"X": here["X"] + 100, "Y": here["Y"], "Z": here["Z"] + 100}
+            call("ue.call", {"ref": "pawn", "fn": "K2_SetActorLocation", "args": {"NewLocation": to, "bSweep": False, "bTeleport": True}}, inst=inst)
+            time.sleep(1.5)
             have = call("ue.call", {"ref": "pawn.InventoryComponent", "fn": "GetItemCountOnActor", "args": {"Actor": "pawn", "ItemType": k}}, inst=inst)["ReturnValue"]
             if have < 3:
                 call("ue.call", {"ref": "pawn.InventoryComponent", "fn": "GiveItemToActor", "args": {"Actor": "pawn", "ItemType": k, "Count": 3}}, inst=inst)
@@ -181,6 +188,8 @@ def main():
             call("ue.call", {"ref": f"{mine}.InventoryComponent", "fn": "GiveItemToActor", "args": {"Actor": mine, "ItemType": k, "Count": 3, "bLootable": True}}, inst=inst)
             check(wait(lambda: count(other, theirs, ko) == n_other + 3, 8), f"the {side} stored 3 {name} in a container; it is in the other world's container too",
                   f"{n_other} -> {count(other, theirs, ko)}")
+            # back where it stood (run 73: placed above the container, the client could not load the next hand-over)
+            call("ue.call", {"ref": "pawn", "fn": "K2_SetActorLocation", "args": {"NewLocation": stood, "bSweep": False, "bTeleport": True}}, inst=inst)
     s0, s1 = call("coop.status", {}, inst=0), call("coop.status", {}, inst=1)
     print("host:", {k: s0[k] for k in ("doorsSent", "doorsApplied", "itemsSent", "itemsApplied", "lastInteract")})
     print("client:", {k: s1[k] for k in ("doorsSent", "doorsApplied", "itemsSent", "itemsApplied", "lastInteract")})

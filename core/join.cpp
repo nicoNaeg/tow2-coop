@@ -31,6 +31,10 @@ std::atomic<bool> busy{false}, ready_to_load{false};
 uint64_t bytes = 0;
 double started = 0, load_t = -1e9;  // load_t: when this core last started a LoadGame (game thread)
 bool load_ok = false;               // the game accepted that LoadGame
+double refused_since = -1, retry_at = 0;  // the game refused the load (a fall, combat, a conversation): tried again
+double refused_fetch = -1;                // which hand-over (its start time) was refused
+std::atomic<int> test_refusals{0};
+int refusals = 0;
 std::atomic<bool> joined_world{false};
 uintptr_t load_world = 0;           // the world it was started from
 
@@ -306,6 +310,7 @@ std::wstring local_folder() {
 }
 
 bool joined() { return joined_world.load(); }
+void refuse_loads(int n) { test_refusals = n; }
 void set_joined(bool on) { joined_world = on; }
 
 json host_offer(int port, const std::string& bind_ip, const std::string& allow_ip, uint64_t steam_to, uint32_t host_id) {
@@ -424,11 +429,14 @@ void block_saves(bool block) {
 
 // Game thread: load the received save once (the front end must have run for a while, see session.py).
 void frame(uint64_t frames) {
-    if (frames < 3600 || !ready_to_load.load()) return;  // LoadGame in the first ~15 s after start crashed the engine
+    if (frames < 3600 || !ready_to_load.load() || now_s() < retry_at) return;  // LoadGame in the first ~15 s after start crashed the engine
     std::string f;
-    { std::lock_guard<std::mutex> g(mu); f = folder; }
-    // The joined player's own character goes into the received campaign first (it may save it for a few seconds).
-    if (!character::before_load(saves_dir() + L"\\" + std::wstring(f.begin(), f.end()))) { set_state("keeping your character"); return; }
+    double fetch;
+    { std::lock_guard<std::mutex> g(mu); f = folder, fetch = started; }
+    if (refused_fetch != fetch) refused_since = -1;  // a new hand-over: its own splice and refusal clock
+    // The joined player's own character goes into the received campaign first (it may save it for a few seconds); a
+    // retry after a refused load finds it there already.
+    if (refused_since < 0 && !character::before_load(saves_dir() + L"\\" + std::wstring(f.begin(), f.end()))) { set_state("keeping your character"); return; }
     ready_to_load = false;
     std::vector<ue::UObject*> found = ue::instances(ue::find_class("/Script/Arkansas.SaveGameManager"), false, 1);
     if (found.empty()) { set_state("failed", "no SaveGameManager to load with"); return; }
@@ -440,17 +448,29 @@ void frame(uint64_t frames) {
     load_world = reinterpret_cast<uintptr_t>(ue::resolve("world", &err));
     load_ok = false;
     load_t = now_s();
-    json r = ue::call(found[0], ue::find_func(ue::class_of(found[0]), "LoadGame"), a);
-    load_ok = r.get("ReturnValue").asString().find("Success") != std::string::npos;
+    std::string res = test_refusals > 0 ? (test_refusals--, std::string("Restricted (test)"))
+                                        : ue::call(found[0], ue::find_func(ue::class_of(found[0]), "LoadGame"), a).get("ReturnValue").asString();
+    load_ok = res.find("Success") != std::string::npos;
+    double t = now_s();
+    if (!load_ok && res.find("Restricted") != std::string::npos && (refused_since < 0 || t - refused_since < 120)) {
+        if (refused_since < 0) refused_since = t, refused_fetch = fetch, core_log("hand-over: the game refuses to load now (" + res + "), trying again every 2 s");
+        refusals++;
+        block_saves(joined());  // still in the joined world: its saves stay off
+        ready_to_load = true, retry_at = t + 2.0;
+        set_state("waiting: the game refuses to load now");
+        return;
+    }
+    if (refused_since >= 0) core_log("hand-over: " + std::string(load_ok ? "loading" : "gave up") + " after " + std::to_string(static_cast<int>(t - refused_since)) + " s of refusals");
+    refused_since = -1;
     if (load_ok) joined_world = true, character::loaded();
-    set_state("loaded:" + r.get("ReturnValue").asString());
+    set_state("loaded:" + res);
 }
 
 json status() {
     std::lock_guard<std::mutex> g(mu);
     json s = json::object();
     s.set("state", state).set("error", error).set("bytes", static_cast<double>(bytes)).set("folder", folder);
-    s.set("seconds", started ? now_s() - started : 0.0);
+    s.set("seconds", started ? now_s() - started : 0.0).set("refused", static_cast<double>(refusals));
     return s;
 }
 }  // namespace join

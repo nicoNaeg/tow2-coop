@@ -22,6 +22,7 @@ function Up([switch]$KeepSaves) {
         if ($KeepSaves) { python -I local/tow2-coop/qa/prep_instance.py --config $cfg --instance $i --keep-saves | Out-Null }
         else { python -I local/tow2-coop/qa/prep_instance.py --config $cfg --instance $i | Out-Null }
         $cr = "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes"; if (Test-Path $cr) { Remove-Item $cr -Recurse -Force }
+        $kept = "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\tow2coop\characters"; if (Test-Path $kept) { Remove-Item $kept -Recurse -Force }  # a first join: no character kept from an earlier run
     }
     # --stagger: the client starts only after the host's start-up memory peak (runs 25-29), so the two never add up
     python -I tools/gamepool/gamepool.py --config $cfg up --pairs 1 --stagger 60 2>&1 | Select-Object -Last 2 | Out-Host
@@ -52,6 +53,7 @@ Step 'story' { python -I test_story.py }
 Step 'interact' { python -I test_interact.py }
 Step 'outfit follows' { python -I test_look.py }
 Step 'stand-in animation' { python -I test_anim.py $p[1] }
+Step 'party XP' { python -I test_xp.py }
 Step 'resync quest outcome' { python -I test_resync.py A }
 Step 'resync map travel' { python -I test_resync.py B }
 Step 'client saves (session)' { python -I test_client_saves.py "$hub\local\gamepool\instances\tow2\1\sandbox" session "$hub\local\the-outer-worlds-2\test-saves\TheOuterWorlds2" }

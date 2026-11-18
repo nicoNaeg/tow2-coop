@@ -25,6 +25,7 @@ foreach ($i in 0, 1) {
     python -I local/tow2-coop/qa/deploy.py --config $cfg --instance $i | Out-Null
     python -I local/tow2-coop/qa/prep_instance.py --config $cfg --instance $i | Out-Null
     $cr = "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes"; if (Test-Path $cr) { Remove-Item $cr -Recurse -Force }
+    $kept = "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\tow2coop\characters"; if (Test-Path $kept) { Remove-Item $kept -Recurse -Force }  # a first join: no character kept from an earlier run
 }
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File passes 'a,b' as one string
 $extra = @(); if ($NoRamCheck) { $extra += '--no-ram-check' }
@@ -39,6 +40,7 @@ $p = Pids
 Step 'outfit and hair' { python -I test_look.py }
 Step 'stand-in animation' { python -I test_anim.py $p[1] }
 Step 'interact and loot' { python -I test_interact.py }
+Step 'party XP' { python -I test_xp.py }
 Step 'own character' { python -I test_character.py }
 Step 'resync map travel' { python -I test_resync.py B }
 foreach ($i in 0, 1) { Get-ChildItem "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes" -ErrorAction SilentlyContinue | ForEach-Object { "crash report in copy ${i}: $($_.Name)" | Tee-Object -FilePath $log -Append } }

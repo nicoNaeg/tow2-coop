@@ -31,6 +31,9 @@ constexpr uint8_t kTickBytes[14] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0x
 constexpr uint8_t kCtorBytes[10] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x30};
 constexpr uint8_t kPoolFnBytes[11] = {0x48, 0x83, 0xEC, 0x28, 0x80, 0x3D, 0x49, 0x7C, 0x39, 0x09, 0x00};  // GetNamePool: cmp [ready], 0
 constexpr uint32_t kPoolFnRva = 0x109EFEC;
+// UPlayerInfoComponent::AddXP(XP, EXPGainReason, TArray* details): every XP gain but the debug command's (inlined)
+constexpr uint32_t kAddXpRva = 0x139E03C;
+constexpr uint8_t kAddXpBytes[20] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x41, 0x56, 0x41, 0x57};
 
 uint8_t* g_base;
 std::string g_logpath, g_status = "starting", g_verify_report;
@@ -129,6 +132,14 @@ void hk_pe(ue::UObject* o, ue::UFunction* f, void* p) {
             if (coop::watch[i] == reinterpret_cast<void*>(static_cast<uintptr_t>(name))) { coop::observe(o, f, p); break; }
     }
     o_pe(o, f, p);
+}
+
+coop::AddXpFn o_add_xp;
+bool hk_add_xp(void* self, int32_t xp, uint8_t reason, void* details) {
+    if (coop::xp_blocked(self, reason)) return false;  // the client's own quest XP: the host's comes instead
+    bool gained = o_add_xp(self, xp, reason, details);
+    if (gained) coop::on_xp(self, xp, reason);
+    return gained;
 }
 
 Value trace_stop(const Value& params) {
@@ -426,6 +437,10 @@ DWORD WINAPI init_thread(LPVOID) {
     if (!o_tick) { g_status = "tick hook failed: " + err; logmsg("%s", g_status.c_str()); return 0; }
     o_pe = reinterpret_cast<PeFn>(hook::install(g_base + kRvas.process_event, kPeBytes, sizeof kPeBytes, reinterpret_cast<void*>(hk_pe), err));
     if (!o_pe) { g_status = "ProcessEvent hook failed: " + err; logmsg("%s", g_status.c_str()); }
+    o_add_xp = reinterpret_cast<coop::AddXpFn>(hook::install(g_base + kAddXpRva, kAddXpBytes, sizeof kAddXpBytes, reinterpret_cast<void*>(hk_add_xp), err));
+    if (o_add_xp) coop::add_xp_original = o_add_xp, coop::add_xp_entry = reinterpret_cast<coop::AddXpFn>(g_base + kAddXpRva);
+    else logmsg("XP sharing off: %s", err.c_str());
+    reg("coop.xp", [](const Value& p) { return coop::xp_test(static_cast<int>(p.get("xp").asInt(10)), static_cast<int>(p.get("reason").asInt(0))); });  // test
     std::string coop_why;
     reg("coop.status", [](const Value&) { return coop::status(); });
     reg("coop.set", [](const Value& p) { return coop::set_options(p); });
@@ -465,6 +480,7 @@ DWORD WINAPI init_thread(LPVOID) {
                                   static_cast<uint32_t>(p.get("hostId").asInt(0)));
     });
     reg("coop.joinStatus", [](const Value&) { return join::status(); }, false);
+    reg("coop.refuseLoads", [](const Value& p) { join::refuse_loads(static_cast<int>(p.get("n").asInt(1))); return Value(true); }, false);  // test
     g_coop_on = coop::start(coop_why);
     logmsg("co-op: %s", coop_why.c_str());
     start_bridge();

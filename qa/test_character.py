@@ -41,6 +41,11 @@ def level(inst):
     return call("ue.call", {"ref": "pawn.PlayerInfoComponent", "fn": "GetLevel"}, inst=inst)["ReturnValue"]
 
 
+def reloaded(changes):
+    s = call("coop.status", {}, inst=1)
+    return s["mapChanges"] > changes and s["settled"] and s["puppet"] != "none" and level(1) > 0
+
+
 def wait(pred, timeout):
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -81,11 +86,17 @@ def main():
     check(wait(lambda: 0 <= call("coop.status", {}, inst=1)["character"]["lastSaved"] < 30, 40), "the client kept its character (private save)",
           str(safe(lambda: call("coop.status", {}, inst=1)["character"])))
     # A new hand-over: the host reloads its campaign; the client follows with its own character.
-    before = call("coop.status", {}, inst=1)["resyncFetches"]
+    st = call("coop.status", {}, inst=1)
+    before, changes = st["resyncFetches"], st["mapChanges"]
+    refused = call("coop.joinStatus", {}, inst=1).get("refused", 0)
+    call("coop.refuseLoads", {"n": 3}, inst=1)  # the game refuses the client's next loads (a fall, combat): it tries again
     sgm = call("ue.find", {"class": "SaveGameManager"}, inst=0)[0].split()[0]
     safe(lambda: call("ue.call", {"ref": sgm, "fn": "LoadGame", "args": {"Filename": HOST_SAVE, "bPreValidateMetadata": True}, "timeoutMs": 240000}, inst=0, timeout_s=260))
     check(wait(lambda: call("coop.status", {}, inst=1)["resyncFetches"] > before, 180), "the host handed its reloaded campaign over")
-    check(wait(lambda: call("coop.status", {}, inst=1)["puppet"] != "none" and level(1) > 0, 300), "the client reloaded and sees the host")
+    # the client loads in a new world (run 70: the old world still answered right after the fetch started)
+    check(wait(lambda: reloaded(changes), 300), "the client reloaded and sees the host")
+    js = call("coop.joinStatus", {}, inst=1)
+    check(js.get("refused", 0) - refused == 3 and "Success" in js.get("state", ""), "the client loaded after the game refused 3 times", str(js))
     time.sleep(5)
     after = {"bits": count(1, "Bit_Cartridge_C"), "ammo": count(1, "Ammo_Bullets_Short_C"), "level": level(1)}
     print("client after the hand-over:", after, "character:", call("coop.status", {}, inst=1)["character"])
