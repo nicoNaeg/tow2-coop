@@ -2,7 +2,7 @@
 
 Status: **v0.2.0-beta.6, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.**
 beta.6 gives each player their own character: the friend joins with nothing and keeps what they pick up, their own
-look, level and XP (XP earned together is shared), and the two players trade items through containers. Tested on one
+look, level and XP (XP earned together is shared); trading items is not usable yet. Tested on one
 PC with two copies (runs 70-76); the first real session across two PCs (2026-11-17, beta.4) ran the earlier features.
 Use beta.6 on both PCs (an older version on the other PC does not connect; the log says so). Two independent copies of
 the game share one campaign owned by the host: the client joins by receiving the host's save, each player controls their
@@ -31,8 +31,10 @@ Entertainment or Xbox; it ships no game files. MIT license.
   a kill, a lock pick, a hack, a conversation or an interaction earns XP for both players (each with their own
   multipliers); quest XP comes from the host's campaign (the friend's game does not add its own); discovering a place
   or a collectible earns XP only for the player who finds it.
-- **Trading:** put an item in any container (a chest, a crate): it appears in the same container in the other player's
-  world, where they take it. A traded weapon or armor arrives as a new copy (without its mods or level).
+- **Trading (not usable yet):** an item stored in a container shows up in the same container in the other player's
+  world, where they take it (a traded weapon or armor arrives as a new copy, without its mods or level). But in the
+  containers tried (a bag and a crate of a faction), the game's own popup only offers to take, and the inventory has
+  no "drop": players have no way yet to put an item where the other can take it. A way to give items is still to come.
 - **Players:** each player moves, fights and loots in their own world; the other player appears as a stand-in NPC body
   that wears the other player's own look, armor and helmet.
 - **Combat:** NPC health and deaths follow the host; damage a client deals is sent to the host and applied there.
@@ -136,7 +138,7 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
   map change) and every 3 minutes. When the game can't save at that moment (combat, a conversation), the last kept one
   is used: what the friend gained since then (up to 3 minutes) is lost at that hand-over.
 - Quest completions reach the client by a reload (resync), not live.
-- Trading goes through containers: the player who stores an item must stand within 5 m of the container. Taking only
-  part of a stack out of a container is not mirrored (taking the whole stack is).
+- Trading: see the rules above (players can't put items in world containers). Taking only part of a stack out of a
+  container is not mirrored (taking the whole stack is).
 - Door and container changes are sent three times without acknowledgement; on a very lossy link one can be missed.
   (Damage the client deals is resent until the host acknowledges it; quest updates are acknowledged too.)

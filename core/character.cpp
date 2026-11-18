@@ -101,6 +101,7 @@ void poll_save() {
         if (savefile::read_player(self_dir(), p, err) && savefile::write_file(store_path(), p)) {
             std::lock_guard<std::mutex> g(mu);
             last_saved = t;
+            note.clear();
             source = "kept";
         } else {
             std::lock_guard<std::mutex> g(mu);
@@ -194,14 +195,13 @@ void set_host(const std::string& k) {
 }
 
 bool before_load(const std::wstring& dir) {
-    // Leaving a joined world: keep the character first. The game may refuse a save for a moment (run 62: "Restricted"
-    // right after another save): try again for up to 6 s, then the last kept character goes in.
+    // Leaving a joined world: keep the character first, with one private save. The game refuses a save while another
+    // one is still running ("Restricted", probe 80): try again for up to 6 s, then the last kept character goes in.
     static double first_try = -1;
-    if (!saving && player_pawn() && join::joined() && !protect) {
-        double t = now_s();
-        if (first_try < 0) first_try = t;
-        if (!start_save() && t - first_try < 6.0) return false;
-    }
+    double t = now_s();
+    if (first_try < 0 || t - first_try > 30.0) first_try = t;  // a new hand-over (an older attempt was abandoned)
+    bool kept_now = last_saved >= first_try;                   // this hand-over's save is done
+    if (!kept_now && !saving && t - first_try < 6.0 && player_pawn() && join::joined() && !protect && !start_save()) return false;
     if (saving) {
         poll_save();
         if (saving) return false;

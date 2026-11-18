@@ -445,9 +445,8 @@ void frame(uint64_t frames) {
     set_state("loading");
     block_saves(false);  // a joined game has saves off, which may refuse the load too; the new world blocks them again
     std::string err;
-    load_world = reinterpret_cast<uintptr_t>(ue::resolve("world", &err));
+    uintptr_t world_before = reinterpret_cast<uintptr_t>(ue::resolve("world", &err));
     load_ok = false;
-    load_t = now_s();
     std::string res = test_refusals > 0 ? (test_refusals--, std::string("Restricted (test)"))
                                         : ue::call(found[0], ue::find_func(ue::class_of(found[0]), "LoadGame"), a).get("ReturnValue").asString();
     load_ok = res.find("Success") != std::string::npos;
@@ -462,6 +461,7 @@ void frame(uint64_t frames) {
     }
     if (refused_since >= 0) core_log("hand-over: " + std::string(load_ok ? "loading" : "gave up") + " after " + std::to_string(static_cast<int>(t - refused_since)) + " s of refusals");
     refused_since = -1;
+    load_world = world_before, load_t = t;  // a load in progress (a refused one is not: co-op keeps running meanwhile)
     if (load_ok) joined_world = true, character::loaded();
     set_state("loaded:" + res);
 }

@@ -97,6 +97,9 @@ def main():
     check(wait(lambda: reloaded(changes), 300), "the client reloaded and sees the host")
     js = call("coop.joinStatus", {}, inst=1)
     check(js.get("refused", 0) - refused == 3 and "Success" in js.get("state", ""), "the client loaded after the game refused 3 times", str(js))
+    # one private save at the hand-over (runs 70-76: a second one, refused while the first was finishing, cost 6 s)
+    ch = call("coop.status", {}, inst=1)["character"]
+    check("refused" not in ch.get("note", "") and ch.get("lastSaved", -1) >= 0, "the client kept its character at the hand-over", str(ch))
     time.sleep(5)
     after = {"bits": count(1, "Bit_Cartridge_C"), "ammo": count(1, "Ammo_Bullets_Short_C"), "level": level(1)}
     print("client after the hand-over:", after, "character:", call("coop.status", {}, inst=1)["character"])
