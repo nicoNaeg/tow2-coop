@@ -1,14 +1,14 @@
 # tow2-coop: two-player co-op for The Outer Worlds 2 (work in progress)
 
-Status: **v0.2.0-beta.5, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.**
-First real session across two PCs on 2026-11-17 (third try, beta.4 on the host): the friend joined over Steam, both
-played and followed four map changes. beta.5 fixes what the players saw: stand-ins without walk animation or hair,
-dead enemies whose loot came back in the other world, and a long wait after the host's map change. Use beta.5 on both
-PCs (beta.1 does not connect; the log says so). Two independent copies of the game
-share one campaign owned by the host: the client joins by receiving the host's save, each player controls their own
-character, sees the other (position, rotation, walk/idle animation, the player's look, armor and helmet changes), and
-the host owns NPC health and deaths, quest progress, map travel, door states and container contents. See `TASKS.md`
-for the acceptance matrix with PASS / PARTIAL / NOT TESTED and evidence.
+Status: **v0.2.0-beta.6, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.**
+beta.6 gives each player their own character: the friend joins with nothing and keeps what they pick up, their own
+look, level and XP (XP earned together is shared), and the two players trade items through containers. Tested on one
+PC with two copies (runs 70-76); the first real session across two PCs (2026-11-17, beta.4) ran the earlier features.
+Use beta.6 on both PCs (an older version on the other PC does not connect; the log says so). Two independent copies of
+the game share one campaign owned by the host: the client joins by receiving the host's save, each player controls their
+own character, sees the other (position, rotation, walk/idle animation, the player's look, armor and helmet changes),
+and the host owns NPC health and deaths, quest progress, map travel, door states and container contents. See
+`TASKS.md` for the acceptance matrix with PASS / PARTIAL / NOT TESTED and evidence.
 
 Download: the release zip (installer, loader, mod, this README). Each player needs their own copy of the game on Steam
 (a Steam Families shared copy can't be played by two people at once). Unofficial fan mod, not affiliated with Obsidian
@@ -80,7 +80,7 @@ Co-op settings come from the environment (else from `tow2coop.ini`, see below): 
 another PC, `TOW2_COOP_BIND` for the host (test copies: 127.0.0.1). Two copies on one 8 GB GPU need the VRAM budget
 that `qa/prep_instance.py` writes (`Engine.ini`) and 960x540.
 
-## Install for players (beta.4 not yet tested across two PCs)
+## Install for players
 
 Each player runs the installer on their own PC, with the game closed (it finds the game through Steam; `-GameDir`
 overrides, `-Find` only shows the folder). The two players must be **Steam friends**, each with their own copy:
