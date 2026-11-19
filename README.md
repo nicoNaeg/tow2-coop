@@ -1,22 +1,27 @@
 # tow2-coop: two-player co-op for The Outer Worlds 2 (work in progress)
 
-Status: **v0.3.0, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.**
-0.3.0: host and join from the game's own main menu (no command, no role at install); the other player's stand-in holds
-their weapon with its mods and uses it (shots, swings, a gun's bash, reloads, holstering) and crouches with them;
-enemies the game spawns during play are shared. The 0.2.0 betas gave each player their own character: the friend joins with nothing and keeps what they pick up, their own
+Status: **v0.4.0, a test build: co-op through Steam (friends, or public games; no IP or port), or direct IP.**
+0.4.0: a Windows installer (`tow2coop-setup.exe`); public games anyone can join, and Steam's "Join game" from the
+friends list; the game's menus no longer pause it in co-op, while conversations are shared (the other player sees the
+screen, can choose too, and their game pauses meanwhile); the host's companions show where they are in both worlds; the
+friend's character is kept a few seconds after it changes; doors, containers and XP are resent until confirmed; a
+quest the friend completes gives its XP to both. 0.3.0: host and join from the game's own main menu; the other
+player's stand-in holds their weapon with its mods and uses it, and crouches with them; enemies the game spawns
+during play are shared. The 0.2.0 betas gave each player their own character: the friend joins with nothing and keeps what they pick up, their own
 look, level and XP (XP earned together is shared), and players give each other items through the other's stand-in. A
 map change no longer waits for a save: when one player travels, the other starts the same travel at once and both
 arrive together. Fights are shared: an enemy that spots either player starts the fight in both games, and the enemies
 spread over both players. Tested on one PC with two copies (runs 70-111); the first real session across two PCs
-(2026-11-17, beta.4) ran the earlier features. 0.3.0 was tested on one PC too (runs 112-134).
-Use 0.3.0 on both PCs (an older version on the other PC does not connect; the log says so). Two independent copies of
+(2026-11-17, beta.4) ran the earlier features. 0.3.0 and 0.4.0 were tested on one PC too (runs 112-143).
+Use 0.4.0 on both PCs (an older version on the other PC does not connect; the log says so). Two independent copies of
 the game share one campaign owned by the host: the client joins by receiving the host's save, each player controls their
 own character, sees the other (position, rotation, walk/idle animation, the player's look, armor and helmet changes),
 and the host owns NPC health and deaths, quest progress, door states and container contents; either player can lead a
 map change. See
 `TASKS.md` for the acceptance matrix with PASS / PARTIAL / NOT TESTED and evidence.
 
-Download: the release zip (installer, loader, mod, this README). Each player needs their own copy of the game on Steam
+Download: `tow2coop-setup.exe` (the installer, with the mod inside), or the release zip (the same files and a
+script installer). Each player needs their own copy of the game on Steam
 (a Steam Families shared copy can't be played by two people at once). Unofficial fan mod, not affiliated with Obsidian
 Entertainment or Xbox; it ships no game files. MIT license.
 
@@ -123,24 +128,30 @@ that `qa/prep_instance.py` writes (`Engine.ini`) and 960x540.
 
 ## Install for players
 
-Each player runs the installer on their own PC, with the game closed (it finds the game through Steam; `-GameDir`
-overrides, `-Find` only shows the folder). The two players must be **Steam friends**, each with their own copy:
+Each player runs **`tow2coop-setup.exe`** on their own PC, with the game closed: it finds the game through Steam
+(*Change...* picks another folder), and *Install* (or *Update*) places the mod; *Uninstall* removes it. Windows may
+warn about an unsigned program (*More info*, *Run anyway*). Each player needs their own copy of the game.
+
+Both players install the same: who hosts and who joins is picked in the game's main menu. The script installer from
+the zip does the same from a command line:
 
     powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
 
-Both players run the same: who hosts and who joins is picked in the game's main menu. (`-Role host` or
+ (`-Role host` or
 `-Role client [-Friend "<host's Steam name>"]` instead set it for good: the host always hosts, the friend always joins.)
 
 To update, run the new version's installer the same way, with the game closed: it replaces the old files (no need to
 uninstall first).
 
-In the main menu, the host picks the co-op choice and *I'll host*, then loads their campaign; the friend picks the
-co-op choice, *I'll join a friend's game* and the host: about a minute later the friend receives the host's campaign and
+In the main menu, the host picks the co-op choice and *I'll host* (Steam friends) or *I'll host: anyone can join
+(public game)*, then loads their campaign; the other player picks the co-op choice, *I'll join a friend's game* and
+the host (friends who host and public games are listed), or uses *Join game* on the host in the Steam friends list (it
+starts the game if needed; from a game of their own, they go back to the main menu first): about a minute later the friend receives the host's campaign and
 loads it (with `-Role` set at install, no menu choice: the friend's game joins by itself). **Over Steam** (the default) there is no address, no
 open port and no firewall prompt: the game's own Steam session carries everything through Valve's relay, encrypted.
 The players find each other through Steam rich presence (the host shows `tow2coop=host`, the friend shows
 `tow2coop=join:<host>`); `-Friend` names the host when several friends host, or when the host's game details are
-private. Only Steam friends are accepted.
+private. Only Steam friends are accepted, and in a public game the players in its Steam lobby.
 
 **Direct IP** instead (`-Transport udp`, or a client given `-Peer`): the host's run prints a key, the friend runs
 `install.ps1 -Role client -Peer <host address> -Key <key>`, and the host's PC must accept UDP 27960 and TCP 27961
@@ -150,8 +161,8 @@ campaign goes only to that player's address.
 The installer places `dsound.dll` (loader), `tow2coop.dll` (the mod) and `tow2coop.ini` (settings, section `[coop]`:
 `role`, `transport`, `host`, `peer`, `port`, `key`, `bind`) in `<game dir>\Arkansas\Binaries\Win64\`, refuses to
 replace another mod's `dsound.dll`, and changes nothing of the game. When something goes wrong, `tow2coop.log` next to
-the mod says what the link did (who was found, session state, hand-over). `qa/test_install.ps1` checks the installer
-on a fake game folder; `qa/test_steam_self.py` checks the Steam hand-over on one copy (the copy sends its campaign to
+the mod says what the link did (who was found, session state, hand-over). `qa/test_setup.ps1` and
+`qa/test_install.ps1` check the two installers on a fake game folder; `qa/test_steam_self.py` checks the Steam hand-over on one copy (the copy sends its campaign to
 itself over Steam, compares every byte and loads it).
 
 ## Remove
@@ -164,16 +175,14 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
 
 ## Known issues
 
-- Keep the host's game window un-minimized while a friend joins or a hand-over runs (a quest resync, the host loading a
-  save): the game finishes a save only while its window is drawn (a minimized copy's save never completes, so the
-  hand-over fails). Switching to another window without minimizing is fine.
+- While a hand-over save runs (a join, a resync, a reload), a minimized game is shown again behind the other windows
+  for those few seconds (a minimized game never finishes a save), then minimized again.
 - A join or a resync waits while the host can't save (combat, a conversation, a menu): it happens a few seconds after.
 
 - Loading a save within the first ~15 s after start crashes the game (engine `LoadMap`); the client waits 60 s of
   frames before loading a received campaign. Players loading from the menu by hand are not affected.
 - The remote player is a stand-in NPC that wears the other player's own look (face, hair, body) and armor and helmet;
-  changes follow within a few seconds (a piece you don't wear yourself shows without its mods). When the other
-  player crouches or stands up, the stand-in's walk animation can stop for a second or so while it changes stance.
+  changes follow within a few seconds (a piece you don't wear yourself shows without its mods).
 - Enemies run the game's own AI in both games, on the same target: their two copies can be 1-2 m apart (eased back
   together, snapped past 6 m).
 - The friend's hits are told to the host by the game's "last hitter" of the enemy: a hit of the friend's in the same tenth
@@ -182,27 +191,35 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
   hives, hatches or doors. When both games spawn one of the same kind more than 15 m apart, each gets a copy of the
   other's (one more enemy).
 - The co-op choice is in the main menu only (not in the pause menu: to start hosting, go back to the main menu). It is
-  picked with the mouse or its number key, not yet with a gamepad. Public games (strangers) and Steam's own
-  "Join game" are not there yet: the list shows Steam friends who host.
-- While the host's game is paused in a fight (a menu, or one of the game's own screens such as a flaw offer), the
-  host's enemies wait; the friend's keep fighting the way the host's game last said.
+  picked with the mouse or its number key, not yet with a gamepad. Public games and Steam's "Join game" were tested on
+  one Steam account only (a public game made, searched for, left); a join between two accounts is still to try.
+- In co-op the game's menus (pause, inventory, map, a flaw offer) no longer pause it: the world goes on, as in a
+  multiplayer game. A conversation is shared: the other player sees a simple screen of it (the speaker, the line, the
+  responses as text; no camera, no voice), can choose too (keys 1-9), and their game pauses meanwhile. The
+  conversation itself runs in the starter's game, which keeps running as in the base game (paused, the conversation
+  itself stopped at its first line).
 - Co-op combat was tested against Ursopods (melee creatures) and an Order soldier fighting nearby; a large fight with
   many armed humans was not tried yet.
-- The friend's character is kept by a private save the friend's game makes every 3 minutes and before a hand-over
-  that isn't a reload (a map change the friend could not follow). On the host's reloads and after the friend's death,
-  the last kept one is used: what the friend gained since then (up to 3 minutes) is lost, as the world goes back too.
-  When the game can't save at the moment (combat, a conversation), the last kept one is used as well.
+- The friend's character is kept by a private save the friend's game makes about 5 s after it changes (items, money,
+  XP; at most one every 15 s), every 3 minutes, and before a hand-over that isn't a reload. On the host's reloads and
+  after the friend's death the last kept one is used: what the friend gained in the last seconds is lost, more when the
+  game could not save then (combat, a conversation), as the world goes back too.
 - Giving items: keyboard and mouse only (E opens the screen; a gamepad's interact button doesn't). The bots test the
   giving with the game's inventory functions, not with mouse clicks in the screen.
 - Following a travel was tested with the game's travel into and out of an interior and with fast travel; ship travel
   was not tried yet.
 - Quest outcomes made in the friend's game are set on the host's quest directly when the host's own quest graph has
-  not got there by itself: the host's game then shows no "quest completed" message and gives no quest XP for it.
+  not got there by itself: the host gets the quest's XP from the friend's game (and shares it back), but its game shows
+  no "quest completed" banner for it.
 - In a joined game the friend can't load one of their own saves (Continue, Load and Quickload bring back the host's
   current game): to play their own campaign, go back to the main menu first. After a death the friend comes back with
   the character as last kept (up to 3 minutes earlier). If the host is in a fight, that reload waits until the host's
   game can save again.
 - Continue on the death screen was not clicked by the bots (it follows the real mouse): they call the game's LoadGame,
   which is what Continue does.
-- Door and container changes are sent three times without acknowledgement; on a very lossy link one can be missed.
-  (Damage the client deals is resent until the host acknowledges it; quest updates are acknowledged too.)
+- Out of a fight the friend's world shows the host's companions where they are in the host's world (they follow the
+  host); in a fight they have their own AI in each world again.
+- A player without a character of their own (no save, nothing kept) is told in the join list to make one first, with a
+  New Game of their own; joining from the very start of the host's new game waits until the host's game can save.
+  Not yet tried from start to end.
+- `tow2coop-setup.exe` is not signed: Windows SmartScreen may warn before it runs.

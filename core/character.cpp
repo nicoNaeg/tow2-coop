@@ -19,6 +19,12 @@ bool saving = false, strip_pending = false, protect = false;  // protect: the wo
 double save_started = 0, last_check = 0, next_periodic = 0, last_saved = -1, kept_only_until = -1;
 long long last_size = -1;
 constexpr double kEvery = 180.0;  // a private save every 3 minutes keeps a crash from losing much
+// Change-driven keeping: a private save ~5 s after the character changed (its items or money, or XP), at most one every
+// 15 s; the 3-minute save stays for what isn't watched (skills, perks, an item's own state). Clock: now_s().
+double dirty_since = -1, last_change = -1, next_try = 0, next_fp = 0;
+uint64_t kept_fp = 0, saving_fp = 0, cur_fp = 0;
+bool fp_reset = true;
+uint64_t saves_by_change = 0;
 
 double now_s() { return GetTickCount64() / 1000.0; }
 
@@ -39,6 +45,28 @@ std::wstring self_dir() { return join::saves_folder() + L"\\CoopSelf"; }
 ue::UObject* save_manager() {
     std::vector<ue::UObject*> found = ue::instances(ue::find_class("/Script/Arkansas.SaveGameManager"), false, 1);
     return found.empty() ? nullptr : found[0];
+}
+
+ue::UObject* player_pawn();
+
+// The player's items and money (ItemStack: Item, Count): a hash that changes with a pickup, a sale, money, a use.
+uint64_t items_fp() {
+    if (!player_pawn()) return 0;
+    std::string err;
+    ue::UObject* inv = ue::resolve("pawn.InventoryComponent", &err);
+    ue::FProperty* p = inv ? ue::find_prop(ue::class_of(inv), "Items") : nullptr;
+    if (!p) return 0;
+    const uint8_t* arr = reinterpret_cast<const uint8_t*>(inv) + ue::prop_offset(p);
+    const uint8_t* data = *reinterpret_cast<const uint8_t* const*>(arr);
+    int32_t num = *reinterpret_cast<const int32_t*>(arr + 8);
+    if (!data || num < 0 || num > 5000) return 0;
+    uint64_t h = 1469598103934665603ull ^ static_cast<uint64_t>(num);
+    for (int32_t i = 0; i < num; i++) {
+        const uint8_t* e = data + static_cast<size_t>(i) * 0x18;
+        uint64_t v[2] = {*reinterpret_cast<const uint64_t*>(e), static_cast<uint64_t>(*reinterpret_cast<const int32_t*>(e + 8))};
+        for (uint64_t x : v) h = (h ^ x) * 1099511628211ull;
+    }
+    return h;
 }
 
 ue::UObject* player_pawn() {
@@ -114,6 +142,8 @@ void poll_save() {
             last_saved = t;
             note.clear();
             source = "kept";
+            kept_fp = saving_fp;
+            dirty_since = last_change > save_started ? last_change : -1;  // a change during the save: kept next time
         } else {
             std::lock_guard<std::mutex> g(mu);
             note = "could not keep the character: " + err;
@@ -202,6 +232,14 @@ void strip() {
 
 bool dead() { return player_dead(); }
 
+bool has_own() {  // a kept character for any host, or a save of the player's own campaign
+    std::wstring dir = join::local_folder() + L"\\tow2coop\\characters\\*.player";
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(dir.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) { FindClose(h); return true; }
+    return !newest_own_save().empty();
+}
+
 void set_host(const std::string& k) {
     std::lock_guard<std::mutex> g(mu);
     key = k;
@@ -225,7 +263,12 @@ bool before_load(const std::wstring& dir) {
 
 void use_kept_next() { kept_only_until = now_s() + 60.0; }
 
-void loaded() { next_periodic = now_s() + kEvery; }
+void loaded() { next_periodic = now_s() + kEvery, fp_reset = true, dirty_since = -1, last_change = -1; }
+
+void changed() {  // game thread: XP gained (the AddXP hook)
+    last_change = now_s();
+    if (dirty_since < 0) dirty_since = last_change;
+}
 
 void frame(double now, bool joined_gameplay) {
     poll_save();
@@ -236,9 +279,24 @@ void frame(double now, bool joined_gameplay) {
         next_periodic = now + 5.0;  // keep the emptied character soon
         return;
     }
-    if (!saving && !protect && now >= next_periodic) {
+    double t = now_s();
+    if (t >= next_fp) {
+        next_fp = t + 2.0;
+        uint64_t fp = items_fp();
+        if (fp_reset && fp) kept_fp = fp, fp_reset = false;
+        else if (fp && fp != cur_fp && fp != kept_fp) {
+            last_change = t;
+            if (dirty_since < 0) dirty_since = t;
+        }
+        if (fp) cur_fp = fp;
+    }
+    bool due = dirty_since >= 0 && t - dirty_since >= 5.0 && t >= next_try;
+    if (!saving && !protect && (due || now >= next_periodic)) {
         next_periodic = now + kEvery;
-        start_save();
+        next_try = t + 15.0;
+        saving_fp = cur_fp;
+        if (due) saves_by_change++;
+        if (!start_save()) next_try = t + 10.0;  // refused now (a fight, a conversation): soon again
     }
 }
 
@@ -249,6 +307,7 @@ coopbridge::json::Value status() {
     json s = json::object();
     s.set("host", key).set("source", source).set("saving", saving).set("stripPending", strip_pending).set("protect", protect);
     s.set("lastSaved", last_saved < 0 ? -1.0 : now_s() - last_saved).set("note", note);
+    s.set("dirtyFor", dirty_since < 0 ? -1.0 : now_s() - dirty_since).set("savesByChange", static_cast<double>(saves_by_change));
     return s;
 }
 }  // namespace character

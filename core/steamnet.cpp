@@ -2,6 +2,8 @@
 #include "steamnet.hpp"
 #include <windows.h>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <set>
 #include <utility>
 
@@ -75,6 +77,8 @@ Identity id_of(uint64_t user) {
 }
 }  // namespace
 
+bool start_lobbies(HMODULE m);  // below
+
 bool start(std::string& why) {
     if (msgs_) return true;
     HMODULE m = GetModuleHandleW(L"steam_api64.dll");
@@ -124,7 +128,9 @@ bool start(std::string& why) {
     }
     msgs_ = msgs;
     set_session_cb(netutils_, on_session_request);
-    why = "Steam link ready (app " + std::to_string(app_) + (rate_set_ == 3 ? ", 1 MB/s" : ", default send rate") + ")";
+    bool lobbies = start_lobbies(m);
+    why = "Steam link ready (app " + std::to_string(app_) + (rate_set_ == 3 ? ", 1 MB/s" : ", default send rate") +
+          (lobbies ? ", public games" : ", no public games") + ")";
     return true;
 }
 
@@ -207,6 +213,201 @@ int accept_friends() {
         if (accept_(msgs_, id_of(f)) && told.insert(f).second) core_log("steam: accepted a session from " + name(f));
     }
     return n;
+}
+
+// ---------------------------------------------------------------- public games and "Join game"
+namespace {
+#pragma pack(push, 8)
+struct LobbyCreated { int32_t result; uint64_t lobby; };                                   // LobbyCreated_t 513
+struct LobbyMatchList { uint32_t count; };                                                 // LobbyMatchList_t 510
+struct LobbyEnter { uint64_t lobby; uint32_t perms; bool locked; uint32_t response; };     // LobbyEnter_t 504
+struct LobbyJoinRequested { uint64_t lobby, friend_id; };                                  // GameLobbyJoinRequested_t 333
+struct PresenceJoinRequested { uint64_t friend_id; char connect[256]; };                   // GameRichPresenceJoinRequested_t 337
+#pragma pack(pop)
+static_assert(sizeof(LobbyCreated) == 16 && sizeof(LobbyEnter) == 24 && sizeof(PresenceJoinRequested) == 264, "Steam callback layouts");
+
+void *mm_, *utils_;
+uint64_t (*create_lobby_)(void*, int, int);
+uint64_t (*join_lobby_)(void*, uint64_t);
+void (*leave_lobby_)(void*, uint64_t);
+uint64_t (*request_list_)(void*);
+void (*filter_string_)(void*, const char*, const char*, int);
+void (*filter_distance_)(void*, int);
+void (*filter_count_)(void*, int);
+void (*filter_slots_)(void*, int);
+uint64_t (*lobby_at_)(void*, int);
+const char* (*lobby_get_)(void*, uint64_t, const char*);
+bool (*lobby_put_)(void*, uint64_t, const char*, const char*);
+uint64_t (*lobby_owner_)(void*, uint64_t);
+int (*lobby_count_)(void*, uint64_t);
+uint64_t (*lobby_member_)(void*, uint64_t, int);
+bool (*call_done_)(void*, uint64_t, bool*);
+bool (*call_result_)(void*, uint64_t, void*, int, int, bool*);
+void (*register_cb_)(void*, int);
+uint64_t creating_ = 0, searching_ = 0, joining_ = 0, lobby_ = 0, joined_owner_ = 0, join_request_ = 0, lobby_request_ = 0;
+double last_search_ = -100;
+std::vector<Lobby> found_;
+std::string want_version_, want_name_;
+bool hosting_lobby_ = false;
+
+double now_s() { return GetTickCount64() / 1000.0; }
+
+// SteamAPI_RegisterCallback takes a CCallbackBase of the SDK's (MSVC) layout: a vtable of Run(void*, bool, call) and
+// Run(void*) (MSVC orders the two overloads in reverse) and GetCallbackSizeBytes(), then the flags and the callback id.
+// Both Run slots go to one function: the callback's data is the first argument either way.
+struct CallbackObj {
+    void** vtable;
+    uint8_t flags;
+    int32_t id;
+};
+static_assert(offsetof(CallbackObj, flags) == 8 && offsetof(CallbackObj, id) == 12, "CCallbackBase layout");
+void on_callback(CallbackObj* self, void* data) {  // the game's SteamAPI_RunCallbacks (game thread)
+    if (self->id == 337) {
+        auto* r = static_cast<PresenceJoinRequested*>(data);
+        std::string c(r->connect, strnlen(r->connect, sizeof r->connect));
+        size_t at = c.find("-tow2coop_join=");
+        uint64_t host = at == std::string::npos ? 0 : strtoull(c.c_str() + at + 15, nullptr, 10);
+        core_log("steam: \"Join game\" from the friends list for " + name(r->friend_id) + (host ? "" : " (not a co-op game)"));
+        if (host) join_request_ = host;
+    } else if (self->id == 333) {
+        auto* r = static_cast<LobbyJoinRequested*>(data);
+        core_log("steam: a lobby invite from " + name(r->friend_id) + " accepted");
+        lobby_request_ = r->lobby;
+    }
+}
+int callback_size(CallbackObj* self) { return self->id == 337 ? static_cast<int>(sizeof(PresenceJoinRequested)) : static_cast<int>(sizeof(LobbyJoinRequested)); }
+void* callback_vtable[3] = {reinterpret_cast<void*>(on_callback), reinterpret_cast<void*>(on_callback), reinterpret_cast<void*>(callback_size)};
+CallbackObj join_cb_ = {callback_vtable, 0, 337}, invite_cb_ = {callback_vtable, 0, 333};
+
+template <class T>
+bool done(uint64_t& call, int id, T& out) {  // a pending call's result, once
+    bool failed = false;
+    if (!call || !call_done_(utils_, call, &failed)) return false;
+    bool ok = !failed && call_result_(utils_, call, &out, static_cast<int>(sizeof out), id, &failed) && !failed;
+    call = 0;
+    return ok;
+}
+}  // namespace
+
+bool lobbies_on() { return mm_ != nullptr; }
+
+bool start_lobbies(HMODULE m) {  // from start(): optional, the friends' co-op works without it
+    void* (*acc_mm)() = nullptr;
+    void* (*acc_utils)() = nullptr;
+    bool ok = get(m, "SteamAPI_SteamMatchmaking_v009", acc_mm) && get(m, "SteamAPI_SteamUtils_v010", acc_utils) &&
+              get(m, "SteamAPI_ISteamMatchmaking_CreateLobby", create_lobby_) && get(m, "SteamAPI_ISteamMatchmaking_JoinLobby", join_lobby_) &&
+              get(m, "SteamAPI_ISteamMatchmaking_LeaveLobby", leave_lobby_) && get(m, "SteamAPI_ISteamMatchmaking_RequestLobbyList", request_list_) &&
+              get(m, "SteamAPI_ISteamMatchmaking_AddRequestLobbyListStringFilter", filter_string_) &&
+              get(m, "SteamAPI_ISteamMatchmaking_AddRequestLobbyListDistanceFilter", filter_distance_) &&
+              get(m, "SteamAPI_ISteamMatchmaking_AddRequestLobbyListResultCountFilter", filter_count_) &&
+              get(m, "SteamAPI_ISteamMatchmaking_AddRequestLobbyListFilterSlotsAvailable", filter_slots_) &&
+              get(m, "SteamAPI_ISteamMatchmaking_GetLobbyByIndex", lobby_at_) && get(m, "SteamAPI_ISteamMatchmaking_GetLobbyData", lobby_get_) &&
+              get(m, "SteamAPI_ISteamMatchmaking_SetLobbyData", lobby_put_) && get(m, "SteamAPI_ISteamMatchmaking_GetLobbyOwner", lobby_owner_) &&
+              get(m, "SteamAPI_ISteamMatchmaking_GetNumLobbyMembers", lobby_count_) &&
+              get(m, "SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex", lobby_member_) &&
+              get(m, "SteamAPI_ISteamUtils_IsAPICallCompleted", call_done_) && get(m, "SteamAPI_ISteamUtils_GetAPICallResult", call_result_) &&
+              get(m, "SteamAPI_RegisterCallback", register_cb_);
+    if (!ok) return false;
+    utils_ = acc_utils(), mm_ = acc_mm();
+    if (!mm_ || !utils_) { mm_ = nullptr; return false; }
+    register_cb_(&join_cb_, 337);
+    register_cb_(&invite_cb_, 333);
+    return true;
+}
+
+void lobby_poll() {
+    if (!mm_) return;
+    LobbyCreated c{};
+    if (creating_ && done(creating_, 513, c)) {
+        if (c.result == 1 && c.lobby) {
+            lobby_ = c.lobby;
+            if (!hosting_lobby_) { leave_lobby_(mm_, lobby_); lobby_ = 0; }  // hosting stopped meanwhile
+            else {
+                lobby_put_(mm_, lobby_, "tow2coop", want_version_.c_str());
+                lobby_put_(mm_, lobby_, "host", want_name_.c_str());
+                core_log("steam: public game open (lobby " + std::to_string(lobby_) + ")");
+            }
+        } else core_log("steam: the public game could not be made (result " + std::to_string(c.result) + ")");
+    }
+    LobbyMatchList l{};
+    if (searching_ && done(searching_, 510, l)) {
+        found_.clear();
+        for (uint32_t i = 0; i < l.count && i < 20; i++) {
+            uint64_t id = lobby_at_(mm_, static_cast<int>(i));
+            uint64_t owner = lobby_owner_(mm_, id);
+            if (!id || owner == me_) continue;
+            const char* h = lobby_get_(mm_, id, "host");
+            found_.push_back({id, owner, h ? std::string(h).substr(0, 48) : std::string()});
+        }
+    }
+    LobbyEnter e{};
+    if (joining_ && done(joining_, 504, e)) {
+        if (e.response == 1) lobby_ = e.lobby, joined_owner_ = lobby_owner_(mm_, e.lobby);  // k_EChatRoomEnterResponseSuccess
+        else core_log("steam: could not enter the public game (" + std::to_string(e.response) + ")");
+    }
+    if (lobby_request_) {  // an invite accepted from Steam: enter it, then its owner is the host to join
+        uint64_t l2 = lobby_request_;
+        lobby_request_ = 0;
+        lobby_join(l2);
+    }
+}
+
+void lobby_host(const std::string& version, const std::string& host_name) {
+    want_version_ = version, want_name_ = host_name, hosting_lobby_ = true;
+    if (!mm_ || lobby_ || creating_) return;
+    creating_ = create_lobby_(mm_, 3, 2);  // k_ELobbyTypeInvisible, two players
+}
+
+void lobby_leave() {
+    hosting_lobby_ = false, joined_owner_ = 0;
+    if (mm_ && lobby_) leave_lobby_(mm_, lobby_);
+    lobby_ = 0;
+}
+
+uint64_t lobby_id() { return lobby_; }
+
+void lobby_set(const char* key, const char* value) {
+    if (mm_ && lobby_ && hosting_lobby_) lobby_put_(mm_, lobby_, key, value);
+}
+
+void lobby_accept_members() {
+    if (!mm_ || !lobby_ || !msgs_) return;
+    int n = lobby_count_(mm_, lobby_);
+    for (int i = 0; i < n && i < 8; i++) {
+        uint64_t u = lobby_member_(mm_, lobby_, i);
+        if (u && u != me_) accept_(msgs_, id_of(u));
+    }
+}
+
+void lobby_search(const std::string& version) {
+    if (!mm_ || searching_ || now_s() - last_search_ < 3.0) return;
+    last_search_ = now_s();
+    filter_string_(mm_, "tow2coop", version.c_str(), 0);  // k_ELobbyComparisonEqual: the same version only
+    filter_slots_(mm_, 1);
+    filter_distance_(mm_, 3);  // k_ELobbyDistanceFilterWorldwide
+    filter_count_(mm_, 20);
+    searching_ = request_list_(mm_);
+}
+
+std::vector<Lobby> lobby_results() { return found_; }
+
+void lobby_join(uint64_t lobby) {
+    if (!mm_ || !lobby) return;
+    if (lobby_) leave_lobby_(mm_, lobby_), lobby_ = 0;
+    hosting_lobby_ = false, joined_owner_ = 0;
+    joining_ = join_lobby_(mm_, lobby);
+}
+
+uint64_t lobby_joined() {
+    uint64_t o = joined_owner_;
+    joined_owner_ = 0;
+    return o;
+}
+
+uint64_t take_join_request() {
+    uint64_t h = join_request_;
+    join_request_ = 0;
+    return h;
 }
 
 int session_state(uint64_t peer) { return msgs_ && peer ? state_(msgs_, id_of(peer), nullptr, nullptr) : 0; }

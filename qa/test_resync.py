@@ -147,6 +147,13 @@ def main(which):
             ok = wait(lambda: state(0, gid) == end, 20)
             same = safe(lambda: call("eval", {"expr": "world"}, inst=0)["value"].split()[0]) == w0 and call("coop.status", {}, inst=0)["resyncs"] == r0
             check(ok and same, "the host's campaign has the same outcome, without a reload", f"host {safe(lambda: state(0, gid))}, world kept {same}")
+            if end == "Succeeded":  # the quest's XP: the client's game gave it (its own is dropped), the host takes it and shares it
+                got = wait(lambda: (call("coop.status", {}, inst=0).get("xp") or 0) > (xp0[0] or 0)
+                           and (call("coop.status", {}, inst=1).get("xp") or 0) > (xp0[1] or 0), 15)
+                s0, s1 = call("coop.status", {}, inst=0), call("coop.status", {}, inst=1)
+                check(bool(got), "the quest's XP reached both players",
+                      f"host {xp0[0]} -> {s0.get('xp')} (credited {s0.get('questXpCredited')}), client {xp0[1]} -> {s1.get('xp')} "
+                      f"(its own dropped {s1.get('xpBlocked')}); {s0.get('lastXp')}")
     if "B" in which:
         # B1: the client starts the same travel as the host (no hand-over). B2 (following off on the client): the
         # fallback, the host hands its campaign over once in the new map.

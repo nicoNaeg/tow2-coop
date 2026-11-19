@@ -82,9 +82,11 @@ def main():
     host = {"bits": count(0, "Bit_Cartridge_C"), "level": level(0)}
     print("client now:", mine, "host:", host)
     check(mine == {"bits": 123, "ammo": 50, "level": lvl0 + 2}, "the client gained money, ammo and two levels")
-    call("coop.charSave", {}, inst=1)
-    check(wait(lambda: 0 <= call("coop.status", {}, inst=1)["character"]["lastSaved"] < 30, 40), "the client kept its character (private save)",
-          str(safe(lambda: call("coop.status", {}, inst=1)["character"])))
+    # Kept by itself a few seconds after the change (no 3-minute wait): the mod watches the items and the XP.
+    by0 = call("coop.status", {}, inst=1)["character"].get("savesByChange", 0)
+    check(wait(lambda: call("coop.status", {}, inst=1)["character"].get("savesByChange", 0) > by0
+               and call("coop.status", {}, inst=1)["character"].get("dirtyFor", 0) < 0 and not call("coop.status", {}, inst=1)["character"]["saving"], 60),
+          "the client kept its character by itself after the change (private save)", str(safe(lambda: call("coop.status", {}, inst=1)["character"])))
     # A new hand-over: the host reloads its campaign; the client follows with its own character.
     st = call("coop.status", {}, inst=1)
     before, changes = st["resyncFetches"], st["mapChanges"]

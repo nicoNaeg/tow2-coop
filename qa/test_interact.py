@@ -202,6 +202,27 @@ def main():
                   f"{n_other + 3} -> {count(other, theirs, ko)}")
             # back where it stood (run 73: placed above the container, the client could not load the next hand-over)
             call("ue.call", {"ref": "pawn", "fn": "K2_SetActorLocation", "args": {"NewLocation": stood, "bSweep": False, "bTeleport": True}}, inst=inst)
+    # Over a lossy link (each copy drops 60 % of these packets and of their acknowledgements): every change still
+    # arrives, resent until acknowledged (they went out three times before: a quarter of them could be lost).
+    if used:
+        path, h, c = used
+        r0 = call("coop.status", {}, inst=0)["interactsResent"]
+        for i in (0, 1):
+            call("coop.set", {"dropInteract": 0.6}, inst=i)
+        try:
+            for want, f in (("Open", "AttemptOpen"), ("Closed", "AttemptClose"), ("Open", "AttemptOpen"), ("Closed", "AttemptClose")):
+                call("ue.call", {"ref": h + ".OCLComponent", "fn": f, "args": {"bForce": True, "bIgnoreLockStatus": True}}, inst=0)
+                wait(lambda: ocl(0, h) == want, 4)
+                settled = (want, "Opening" if want == "Open" else "Closing")
+                check(wait(lambda: ocl(1, c) in settled, 12), f"over a lossy link: the host's door -> {want}, the client's followed", ocl(1, c))
+                time.sleep(1.0)
+        finally:
+            for i in (0, 1):
+                call("coop.set", {"dropInteract": 0}, inst=i)
+        s0 = call("coop.status", {}, inst=0)
+        check(s0["interactsResent"] > r0, "the lost ones were resent", f"{s0['interactsResent'] - r0} resends")
+        check(wait(lambda: call("coop.status", {}, inst=0)["interactsPending"] == 0, 10), "and all acknowledged in the end",
+              f"{call('coop.status', {}, inst=0)['interactsPending']} pending")
     s0, s1 = call("coop.status", {}, inst=0), call("coop.status", {}, inst=1)
     print("host:", {k: s0[k] for k in ("doorsSent", "doorsApplied", "itemsSent", "itemsApplied", "lastInteract")})
     print("client:", {k: s1[k] for k in ("doorsSent", "doorsApplied", "itemsSent", "itemsApplied", "lastInteract")})

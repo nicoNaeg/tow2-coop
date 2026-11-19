@@ -1,7 +1,6 @@
 """One world for both players, on a joined pair (copy 0 host, copy 1 client, both in gameplay):
 A. Clock: the host's calendar jumps 3 hours (as waiting or sleeping does): the client's follows within seconds.
-B. Menus: the host opens its inventory (the game pauses): the client's NPCs are not pulled back to the host's frozen
-   ones, and the client's clock waits for the host's.
+B. Menus: the host opens its inventory: in co-op the game does not pause (0.4.0), and both clocks keep together.
 C. Fast travel: the host fast-travels across the map: the client travels with it and lands next to it.
 Usage: python -I test_world.py <host pid> [ABC]"""
 import math
@@ -79,10 +78,8 @@ def main(host_pid, which):
         s1 = st(1)["npcSnapped"]
         held, g = st(1).get("clockHeld"), gap()
         game.key("ESCAPE")
-        check(paused is True, "the host's inventory pauses its game", str(paused))
-        check(s1 - s0 <= 2, "the client's NPCs were not pulled back while the host's game was paused", f"snaps {s0} -> {s1} in 15 s (before the fix: 45)")
-        check(g < 0.05, "the client's clock did not run away from the host's paused one", f"gap {g:.3f} h after 15 s (unchecked it grows ~0.1 h), held {held}")
-        check(wait(lambda: st(1).get("clockHeld") is False, 10), "the client's clock runs freely once the host's does", str(st(1).get("clockHeld")))
+        check(paused is False, "the host's inventory leaves its game running (co-op: menus never pause)", str(paused))
+        check(g < 0.05, "both clocks kept together meanwhile", f"gap {g:.3f} h after 15 s, held {held}, snaps {s0} -> {s1}")
     if "C" in which:
         tm = call("ue.find", {"class": "TravelManager"}, inst=0)[0].split()[0]
         p0 = pos(0)

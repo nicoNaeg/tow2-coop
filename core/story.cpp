@@ -75,7 +75,7 @@ struct State {
     uint32_t applied = 0;       // highest seq of the other side's that we applied
     uint32_t dropped_to = 0;    // client: its changes up to here were made before a reload, never sent
     double next_send = 0;
-    uint64_t applied_count = 0, skipped_count = 0, sent_packets = 0;
+    uint64_t applied_count = 0, skipped_count = 0, sent_packets = 0, forced = 0;
     std::string last_applied;
     // client: outcomes the client could not apply directly (complete/fail): checked again after a grace period
     struct Pending { Guid id; int32_t target; double at; };
@@ -248,7 +248,10 @@ void apply(const Event& e) {
             // the quest's own state takes the host's outcome (what GetQuestState_BP reads). Without the lookup, the
             // synced inputs may still let the client's quest graph get there; if not after 5 s, a save resync.
             uint8_t* quest = find_quest && g.qm ? find_quest(g.qm, id.b) : nullptr;
-            if (quest && ue::readable(quest + kQuestStateOffset, 1)) quest[kQuestStateOffset] = static_cast<uint8_t>(e.a);
+            if (quest && ue::readable(quest + kQuestStateOffset, 1)) {
+                quest[kQuestStateOffset] = static_cast<uint8_t>(e.a);
+                if (e.a == 2) g.forced++;  // no quest XP from this game for it: the other side's comes (coop.cpp)
+            }
             g.pending.push_back({id, e.a, g.now + 5.0});
         } else { g.skipped_count++; return; }
         snprintf(what, sizeof what, "quest %s -> %d", q.name.c_str(), e.a);
@@ -292,6 +295,8 @@ bool ensure_loaded() {
     g.loaded = true;
     return true;
 }
+
+uint64_t forced_completions() { return g.forced; }
 
 void reset_peer() { g.peer_acked = 0, g.applied = 0; }  // a (re)joined client: replay ours (idempotent), take its anew
 

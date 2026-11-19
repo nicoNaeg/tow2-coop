@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <unordered_set>
 #include <string>
 #include <unordered_map>
 #include <array>
@@ -67,15 +68,15 @@ struct InteractMsg {
     char path[1024];
 };
 #pragma pack(pop)
-struct Outgoing {
+struct Outgoing {  // sent until the other game acknowledges it (kInteractAck), 120 s at most
     InteractMsg m;
     int size;
-    double at[3];
+    double next, until;
     int sent;
 };
-constexpr uint32_t kMagic = 0x34433254;  // "T2C4": the last character is the protocol version, bump it on any packet change
-constexpr const char* kVersion = "0.3.0";
-constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13, kTravel = 14, kClock = 15, kCombat = 16, kSpawns = 17, kSpawnOffers = 18, kWeaponMods = 19;
+constexpr uint32_t kMagic = 0x35433254;  // "T2C5": the last character is the protocol version, bump it on any packet change
+constexpr const char* kVersion = "0.4.0";
+constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13, kTravel = 14, kClock = 15, kCombat = 16, kSpawns = 17, kSpawnOffers = 18, kWeaponMods = 19, kInteractAck = 20, kConversation = 21, kConvPick = 22, kParty = 23;
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";
 
@@ -241,7 +242,9 @@ struct Ctx {
     double crouch_tick_until = 0;                     // the stand-in's movement component ticks until then (its crouch)
     double crouch_since = 0, next_crouch_ask = 0, next_crouch_retry = 0;
     float standin_half = 0, standin_half_crouched = 0;  // its capsule's half height standing (read at spawn), crouched
-    uint64_t standin_mods_installed = 0, standin_crouches = 0, crouch_misses = 0;
+    uint64_t standin_mods_installed = 0, standin_crouches = 0, crouch_misses = 0, standin_respawns = 0;
+    double standin_friction = -1, standin_braking = -1;  // its movement component's own, kept while a crouch zeroes them
+    int crouch_miss_streak = 0;
     // Enemies the game spawned during play, shared (see "enemies the game spawns during play")
     std::unordered_map<uint64_t, Spawned> spawned;        // by shared id (the host's)
     std::unordered_map<ue::UObject*, uint64_t> spawn_ids; // client: this world's actor -> shared id (the scan registers it)
@@ -252,6 +255,9 @@ struct Ctx {
     // The co-op menu: the player picks host or join in the main menu (role "auto")
     bool menu_mode = false, role_chosen = true, start_host = false;
     uint64_t join_target = 0, menu_picks = 0;  // join_target: the Steam friend picked in the menu
+    bool host_public = false, join_public = false;  // a public game (a Steam lobby): anyone may join / we join a stranger
+    uint64_t pending_join = 0;                       // a host to join from Steam ("Join game", an invite, the command line)
+    bool public_wanted = false;                      // a public game picked in the menu: joined once its lobby is entered
     uint64_t spawn_copies = 0, spawn_matched = 0, spawn_removed = 0;
     int resync_sends = 0;
     uint64_t resyncs = 0, resync_requests = 0, resync_fetches = 0;
@@ -263,10 +269,22 @@ struct Ctx {
     double start_time = 0, next_join_request = 0, map_since = 0;
     bool at_menu = false;
     bool opt_story = true, opt_doors = true, opt_npcs = true, opt_scan = true, opt_follow = true;  // coop.set
+    bool opt_no_pause = true, opt_party = true, opt_conv_pause = true, conv_paused = false;
+    uint64_t pauses_lifted = 0;
+    // shared conversations: the other player's (its screen's texts: speaker, line, responses) and a pick sent to ours
+    std::vector<std::string> peer_conv;
+    bool peer_conv_open = false, conv_sent_open = false, mirror_shown = false, mirror_paused = false;
+    double peer_conv_at = 0, next_conv_send = 0, last_conv_full = 0;
+    int conv_close_left = 0, conv_pick = 0;
+    std::string conv_last_sent;
+    uint64_t conv_states_sent = 0, conv_picks_sent = 0, conv_picks_done = 0, mirrors_shown = 0;
     uint64_t dmg_resent = 0, join_requests = 0;
     uint32_t next_eid = 1;
     std::vector<Outgoing> outgoing;
-    std::vector<uint32_t> seen_eids;
+    std::unordered_set<uint32_t> seen_eids;
+    std::deque<uint32_t> seen_order;
+    double opt_drop_interact = 0;  // test: this share of door/item/XP packets and their acknowledgements is not sent
+    uint64_t interacts_resent = 0, interacts_lost = 0, interact_acks = 0;
     std::unordered_map<uint64_t, ue::UObject*> interactables, inter_scan;  // doors + containers by path id
     ue::UClass *door_class = nullptr, *container_class = nullptr, *corpse_class = nullptr;
     double interactables_built = -100;
@@ -286,6 +304,9 @@ struct Ctx {
     std::unordered_map<uint64_t, std::unordered_map<ue::UClass*, int32_t>> box_counts;  // what those near the player hold
     double next_box_check = 0;
     std::vector<std::pair<int32_t, uint8_t>> xp_inbox;  // XP the other player earned, until there is a player to give it to
+    std::vector<std::pair<int32_t, double>> quest_xp_held;  // host: the friend's quest XP (kind 7), waiting for a forced completion
+    std::vector<double> quest_credits;                      // host: quests completed here by force, waiting for that XP
+    uint64_t forced_seen = 0, quest_xp_credited = 0;
     uint64_t xp_sent = 0, xp_applied = 0, xp_blocked = 0, xp_details_filled = 0;
     std::string last_xp;
     ue::UObject *travel_seen = nullptr, *travel_following = nullptr;  // our travel destination last frame; the one we follow
@@ -318,6 +339,12 @@ struct Ctx {
     uint64_t combat_pins = 0, combat_detections = 0, combat_hints_sent = 0, combat_hints_in = 0, combat_recs_in = 0, combat_handoffs = 0;
     int combat_fights = 0, combat_owned = 0;  // host: NPCs fighting a player now; those the client's world decides
     std::unordered_map<uint64_t, ue::UObject*> party, party_scan;  // this world's companions, by "party:" + class
+    struct PartySnap { double t; float p[3], yaw, v[3]; };
+    std::unordered_map<uint64_t, std::pair<PartySnap, PartySnap>> party_in;  // client: the host's companions (previous, latest)
+    std::unordered_set<ue::UObject*> party_tamed;                            // client: companions driven from the host's
+    bool party_calm_in = false;
+    double party_in_at = 0, next_party_send = 0;
+    uint64_t party_tames = 0, party_releases = 0;
     ue::UObject* standin_team_for = nullptr;  // the stand-in whose team was last set, and to what
     ue::UClass* puppet_cls = nullptr;         // the stand-in's class (identity check, see standin_ok)
     bool standin_fighting = false, peer_fight = false;
@@ -1140,7 +1167,11 @@ void queue_interact(uint8_t kind, uint64_t id, int32_t a, const std::string& pat
     o.m.len = static_cast<uint16_t>(std::min<size_t>(path.size(), sizeof o.m.path));
     memcpy(o.m.path, path.data(), o.m.len);
     o.size = static_cast<int>(offsetof(InteractMsg, path)) + o.m.len;
-    o.at[0] = g.now, o.at[1] = g.now + 0.1, o.at[2] = g.now + 0.3;  // three copies: UDP
+    o.next = g.now, o.until = g.now + 120.0, o.sent = 0;
+    if (kind == 1)  // a door's newer state replaces one still unacknowledged: an older one arriving last would win
+        g.outgoing.erase(std::remove_if(g.outgoing.begin(), g.outgoing.end(), [&](const Outgoing& x) { return x.m.kind == 1 && x.m.id == id; }),
+                         g.outgoing.end());
+    if (g.outgoing.size() >= 4000) g.outgoing.erase(g.outgoing.begin()), g.interacts_lost++;  // the other game is gone
     g.outgoing.push_back(o);
 }
 
@@ -1295,15 +1326,42 @@ void watch_boxes(ue::UObject* pawn) {
     g.box_counts.swap(close_by);  // a container the player left is looked at afresh when they come back
 }
 
+bool test_drop() { return g.opt_drop_interact > 0 && (rand() % 1000) < g.opt_drop_interact * 1000; }
+
+// Door, item and XP events: resent until the other game acknowledges them (0.2 s apart at first, then 1 s, then 3 s).
 void send_outgoing() {
     for (size_t i = 0; i < g.outgoing.size();) {
         Outgoing& o = g.outgoing[i];
-        while (o.sent < 3 && g.now >= o.at[o.sent]) {
-            send_typed(kInteract, &o.m, o.size);
-            o.sent++;
+        if (g.now >= o.until) {
+            if (g.interacts_lost++ % 50 == 0) core_log("interact: an event was not acknowledged in 120 s (kind " + std::to_string(o.m.kind) + ")");
+            g.outgoing.erase(g.outgoing.begin() + i);
+            continue;
         }
-        if (o.sent >= 3) g.outgoing.erase(g.outgoing.begin() + i);
-        else i++;
+        if (g.now >= o.next) {
+            if (!test_drop()) send_typed(kInteract, &o.m, o.size);
+            if (o.sent > 0) g.interacts_resent++;
+            o.sent++;
+            o.next = g.now + (o.sent < 5 ? 0.2 : o.sent < 15 ? 1.0 : 3.0);
+        }
+        i++;
+    }
+}
+
+void ack_interact(uint32_t eid) {  // taken (applied, or kept for later): the other game stops sending it
+    if (test_drop()) return;
+    uint8_t b[5];
+    b[0] = 1;
+    memcpy(b + 1, &eid, 4);
+    send_typed(kInteractAck, b, sizeof b);
+}
+
+void on_interact_ack(const char* body, int len) {
+    if (len < 1 || len != 1 + 4 * static_cast<uint8_t>(body[0])) { g.bad++; return; }
+    for (int k = 0; k < static_cast<uint8_t>(body[0]); k++) {
+        uint32_t eid;
+        memcpy(&eid, body + 1 + 4 * k, 4);
+        for (size_t i = 0; i < g.outgoing.size(); i++)
+            if (g.outgoing[i].m.eid == eid) { g.outgoing.erase(g.outgoing.begin() + i); g.interact_acks++; break; }
     }
 }
 
@@ -1386,10 +1444,10 @@ void call_on(ue::UObject* o, const char* fn, const json& args) {
 
 ue::UClass* load_class(const std::string& path);  // below: a Blueprint class by path, loaded if needed
 
-bool first_time(uint32_t eid) {  // each event goes out three times
-    if (std::find(g.seen_eids.begin(), g.seen_eids.end(), eid) != g.seen_eids.end()) return false;
-    g.seen_eids.push_back(eid);
-    if (g.seen_eids.size() > 512) g.seen_eids.erase(g.seen_eids.begin(), g.seen_eids.begin() + 256);
+bool first_time(uint32_t eid) {  // an event may arrive again (resent until acknowledged): applied once
+    if (!g.seen_eids.insert(eid).second) return false;
+    g.seen_order.push_back(eid);
+    if (g.seen_order.size() > 16384) g.seen_eids.erase(g.seen_order.front()), g.seen_order.pop_front();
     return true;
 }
 
@@ -1399,9 +1457,13 @@ bool take_xp(const char* body, int len) {
     InteractMsg m{};
     if (len != static_cast<int>(offsetof(InteractMsg, path))) return false;
     memcpy(&m, body, len);
-    if (m.kind != 4) return false;
+    if (m.kind != 4 && m.kind != 7) return false;
     g.recv++;
-    if (first_time(m.eid) && m.a > 0 && m.a <= 1000000 && m.id <= 13) g.xp_inbox.push_back({m.a, static_cast<uint8_t>(m.id)});  // trust boundary
+    if (first_time(m.eid) && m.a > 0 && m.a <= 1000000 && m.id <= 13) {  // trust boundary
+        if (m.kind == 4) g.xp_inbox.push_back({m.a, static_cast<uint8_t>(m.id)});
+        else if (g.host) g.quest_xp_held.push_back({m.a, g.now});
+    }
+    ack_interact(m.eid);
     return true;
 }
 
@@ -1626,11 +1688,13 @@ void follow_travel(ue::UObject* pawn) {
 // they confirm it; back to you after 20 s without an answer). A given weapon or armor arrives as a new copy with the
 // same level and rarity, without its mods.
 std::atomic<bool> give_key{false};
+std::atomic<bool> window_input{false};  // the player clicked or typed in the game's window (keep_drawn_for_saves)
 WNDPROC game_proc = nullptr;
 HWND game_hwnd = nullptr;
 
 LRESULT CALLBACK key_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if (msg == WM_KEYDOWN && w == 'E' && !(l & (1 << 30))) give_key = true;  // a new press (bit 30: a repeat)
+    if (msg == WM_KEYDOWN || msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || (msg == WM_ACTIVATE && LOWORD(w) == WA_CLICKACTIVE)) window_input = true;
     if (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_CHAR) {  // the co-op menu's digits (main menu)
         int d = msg == WM_CHAR ? (w >= '1' && w <= '9' ? static_cast<int>(w - '0') : 0)
               : w >= '1' && w <= '9' ? static_cast<int>(w - '0') : w >= VK_NUMPAD1 && w <= VK_NUMPAD9 ? static_cast<int>(w - VK_NUMPAD0) : 0;
@@ -2045,6 +2109,27 @@ float raw_hour(ue::UObject* c) {
     try { return f ? static_cast<float>(ue::call(c, f, json::object()).get("ReturnValue").asNumber(-1)) : -1.0f; } catch (const std::exception&) { return -1.0f; }
 }
 
+// Co-op never pauses (owner, 2026-11-19: "c'est multi"): the game's menus, its conversations and screens pause the
+// world with the engine's own pause, the persistent level's WorldSettings.PauserPlayerState (probe 105: the player's
+// state while the pause menu or the inventory is open). While the other player is in the game it is lifted at once:
+// the menu stays open, the world goes on, as in a multiplayer game.
+bool in_conversation();  // below: the local player is in a conversation
+
+void keep_running() {
+    if (g.mirror_shown || in_conversation()) return;  // a conversation pauses both games (owner): its pause stays
+    std::string err;
+    ue::UObject* ws = ue::resolve("world.PersistentLevel.WorldSettings", &err);
+    static ue::FProperty* prop = nullptr;
+    static ue::UClass* cls = nullptr;
+    if (!ws) return;
+    if (ue::class_of(ws) != cls) cls = ue::class_of(ws), prop = ue::find_prop(cls, "PauserPlayerState");
+    if (!prop) return;
+    void** pauser = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(ws) + ue::prop_offset(prop));
+    if (!*pauser) return;
+    *pauser = nullptr;
+    if (g.pauses_lifted++ < 5) core_log("co-op: a pause of the game lifted (the other player plays on)");
+}
+
 bool game_paused() {
     static ue::UObject* gs = ue::cdo(ue::find_class("/Script/Engine.GameplayStatics"));
     ue::UFunction* f = gs ? ue::find_func(ue::class_of(gs), "IsGamePaused") : nullptr;
@@ -2189,6 +2274,50 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
     g.remote_id = h.sender;
     g.remote_last_seq = h.seq;
     if (h.type == kResync && !g.host) { g.last_recv_t = g.now; client_fetch_resync(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }
+    if (h.type == kConversation) {  // the other player's conversation screen: open flag, then its lines
+        int len = n - static_cast<int>(sizeof(Header));
+        const char* body = buf + sizeof(Header);
+        if (len < 1) { g.bad++; return; }
+        g.peer_conv_open = body[0] != 0, g.peer_conv_at = g.now, g.last_recv_t = g.now;
+        g.peer_conv.clear();
+        std::string rest(body + 1, len - 1);
+        for (size_t at = 0; at < rest.size() && g.peer_conv.size() < 12;) {
+            size_t e = rest.find('\n', at);
+            if (e == std::string::npos) e = rest.size();
+            g.peer_conv.push_back(rest.substr(at, e - at));
+            at = e + 1;
+        }
+        return;
+    }
+    if (h.type == kParty && !g.host) {  // the host's companions: calm flag, count, then id, position, yaw, velocity each
+        int len = n - static_cast<int>(sizeof(Header));
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(buf + sizeof(Header));
+        constexpr int kRec = 8 + 7 * 4;
+        if (len < 2 || len != 2 + b[1] * kRec || b[1] > 8) { g.bad++; return; }
+        g.party_calm_in = b[0] != 0, g.party_in_at = g.now, g.last_recv_t = g.now;
+        for (int i = 0; i < b[1]; i++) {
+            const uint8_t* r = b + 2 + i * kRec;
+            uint64_t id;
+            Ctx::PartySnap s{};
+            memcpy(&id, r, 8);
+            memcpy(s.p, r + 8, 12), memcpy(&s.yaw, r + 20, 4), memcpy(s.v, r + 24, 12);
+            s.t = g.now;
+            bool sane = std::isfinite(s.p[0]) && std::isfinite(s.p[1]) && std::isfinite(s.p[2]) && std::isfinite(s.yaw);  // trust boundary
+            if (!sane) continue;
+            auto& e = g.party_in[id];
+            e.first = e.second.t > 0 ? e.second : s, e.second = s;
+        }
+        return;
+    }
+    if (h.type == kConvPick) {  // the other player picked a response on its mirror of our conversation
+        if (n == static_cast<int>(sizeof(Header)) + 1) {
+            int k = static_cast<uint8_t>(buf[sizeof(Header)]);
+            if (k >= 1 && k <= 9) g.conv_pick = k;  // trust boundary
+        }
+        g.last_recv_t = g.now;
+        return;
+    }
+    if (h.type == kInteractAck) { g.last_recv_t = g.now; on_interact_ack(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }
     if (h.type == kInteract && take_xp(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)))) { g.last_recv_t = g.now; return; }
     if (h.type == kTravel) { g.last_recv_t = g.now; on_travel(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }  // even while settling
     if (h.type == kInteract && take_gift(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)))) { g.last_recv_t = g.now; return; }
@@ -2205,6 +2334,7 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
         if (m.len > sizeof m.path || body != static_cast<int>(offsetof(InteractMsg, path)) + m.len) { g.bad++; return; }
         g.recv++;
         apply_interact(m);
+        ack_interact(m.eid);
         return;
     }
     if (h.type == kResyncRequest && g.host) {
@@ -2623,7 +2753,7 @@ void destroy_puppet() {
     g.puppet = nullptr;
     g.standin_weapon = nullptr, g.standin_weapon_path.clear(), g.standin_drawn = true, g.standin_aiming = false, g.trigger_down = false;
     g.standin_mods_applied.clear(), g.standin_crouched = false, g.crouch_tick_until = 0, g.next_crouch_retry = 0;
-    g.standin_half = 0, g.standin_half_crouched = 0;
+    g.standin_half = 0, g.standin_half_crouched = 0, g.standin_friction = -1, g.standin_braking = -1, g.crouch_miss_streak = 0;
 }
 
 // A deferred spawn of `cls`, kept out of the saves: the flag only counts before the actor finishes spawning (run 32:
@@ -2671,7 +2801,7 @@ bool spawn_puppet(const Snapshot& s) {
     g.puppet_in_air = false;
     g.standin_weapon = nullptr, g.standin_weapon_path.clear(), g.standin_drawn = true, g.standin_aiming = false, g.trigger_down = false;
     g.standin_mods_applied.clear(), g.standin_crouched = false, g.crouch_tick_until = 0, g.next_crouch_retry = 0;
-    g.standin_half = 0, g.standin_half_crouched = 0;
+    g.standin_half = 0, g.standin_half_crouched = 0, g.standin_friction = -1, g.standin_braking = -1, g.crouch_miss_streak = 0;
     tame_puppet(true);
     return true;
 }
@@ -3066,6 +3196,16 @@ void drive_gestures() {
         if (want_crouch != g.standin_crouched) g.standin_crouches++;
         g.standin_crouched = want_crouch;
         g.crouch_since = g.now, g.crouch_tick_until = g.now + 3.0, g.next_crouch_ask = 0;  // until it matches, 3 s at most
+        // No braking while its movement component ticks: the velocity written every frame keeps the walk animation going
+        // (a ticking component braked it to 0: the walk stopped for the change, 8a).
+        if (g.standin_braking < 0)
+            try {
+                g.standin_friction = ue::eval_path(pz + ".CharacterMovement.GroundFriction").asNumber(-1);
+                g.standin_braking = ue::eval_path(pz + ".CharacterMovement.BrakingDecelerationWalking").asNumber(-1);
+            } catch (const std::exception&) {}
+        if (g.standin_braking >= 0 && g.standin_friction >= 0)
+            for (const char* f : {".CharacterMovement.GroundFriction", ".CharacterMovement.BrakingDecelerationWalking"})
+                try { ue::set_path(pz + f, json(0.0)); } catch (const std::exception&) {}
     }
     if (g.crouch_tick_until > 0) {
         if (g.now >= g.next_crouch_ask) {  // asked again while it differs: its mode may have changed under it
@@ -3082,11 +3222,33 @@ void drive_gestures() {
         // its crouch took ~0.7 s, standing up 0.3 s (probe 103); standing up fails while its standing capsule wouldn't fit
         if ((is == want_crouch && g.now >= g.crouch_since + 1.0) || g.now >= g.crouch_tick_until) {
             g.crouch_tick_until = 0;
-            if (is != want_crouch) g.crouch_misses++, g.next_crouch_retry = g.now + 5.0;
             json off = json::object();
             off.set("bEnabled", false);
             call_quiet(pz + ".CharacterMovement", "SetComponentTickEnabled", off);
             try { ue::set_path(pz + ".CharacterMovement.MovementMode", g.puppet_in_air ? "MOVE_Falling" : "MOVE_Walking"); } catch (const std::exception&) {}
+            if (g.standin_braking >= 0 && g.standin_friction >= 0)
+                try {
+                    ue::set_path(pz + ".CharacterMovement.GroundFriction", json(g.standin_friction));
+                    ue::set_path(pz + ".CharacterMovement.BrakingDecelerationWalking", json(g.standin_braking));
+                } catch (const std::exception&) {}
+            if (is == want_crouch) g.crouch_miss_streak = 0;
+            else {  // standing up was refused once after a fight (run 129): what was around, for the log
+                g.crouch_misses++, g.crouch_miss_streak++, g.next_crouch_retry = g.now + 5.0;
+                double a[3], b[3], v[3];
+                float yaw, pitch;
+                std::string where;
+                if (ue::UObject* me = local_pawn())
+                    if (read_transform(me, a, yaw, pitch, v) && read_transform(g.puppet, b, yaw, pitch, v))
+                        where = ", " + std::to_string(static_cast<int>(std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1])))) +
+                                " cm from you, " + std::to_string(static_cast<int>(b[2] - a[2])) + " cm above";
+                core_log(std::string("stand-in: could not ") + (want_crouch ? "crouch" : "stand up") + " (try " + std::to_string(g.crouch_miss_streak) + where + ")");
+                if (g.crouch_miss_streak >= 3) {  // still not after 3 tries (~15 s): a new stand-in, standing as spawned
+                    core_log("stand-in: a new one after 3 tries");
+                    g.standin_respawns++;
+                    destroy_puppet();
+                    return;
+                }
+            }
         }
     }
     if (g.look_weapon != g.standin_weapon_path && g.now >= g.next_weapon_try) {
@@ -3330,10 +3492,18 @@ void steam_discovery() {
                      std::to_string(g.recv) + ", rejected " + std::to_string(g.bad) + (g.puppet ? ", stand-in shown" : ", no stand-in"));
         }
         steamnet::set_presence("tow2coop", g.host ? "host" : ("join:" + std::to_string(g.peer_id)).c_str());
+        steamnet::set_presence("connect", "");  // two players only: no "Join game" while playing
         if (st != 3) send_typed(kHello, &none, 0);  // keeps asking until the session is up
         return;
     }
     steamnet::set_presence("tow2coop", g.host ? "host" : "");
+    if (g.host) {  // "Join game" for friends (rich presence connect); a public game: a lobby whose members are accepted
+        steamnet::set_presence("connect", ("-tow2coop_join=" + std::to_string(steamnet::me())).c_str());
+        if (g.host_public) {
+            steamnet::lobby_host(kVersion, steamnet::name(steamnet::me()));
+            steamnet::lobby_accept_members();
+        }
+    }
     std::string want = g.host ? "join:" + std::to_string(steamnet::me()) : std::string("host");
     std::string pick = g.host ? std::string() : env("TOW2_COOP_HOST");
     // A named host is contacted directly, presence or not (its game details may be private); the host accepts friends.
@@ -3354,7 +3524,7 @@ void steam_discovery() {
         steamnet::request_presence(f);
         if (!named && steamnet::presence(f, "tow2coop") != want) continue;
         if (!named && !pick.empty()) continue;  // a name was given but no such friend: wait for it to show up
-        if (named && !g.host && steamnet::presence(f, "tow2coop") != "host") continue;  // the chosen host: once it hosts
+        if (named && !g.host && !g.join_public && steamnet::presence(f, "tow2coop") != "host") continue;  // the chosen host: once it hosts
         g.peer_id = f, g.have_peer = true, g.session = -1;
         if (!g.host) character::set_host("steam-" + std::to_string(f));  // the joined player's character for this host
         if (!g.host) steamnet::set_presence("tow2coop", ("join:" + std::to_string(f)).c_str());
@@ -3444,23 +3614,46 @@ void apply_xp_inbox() {
 }
 }  // namespace
 
-bool xp_blocked(void* self, uint8_t reason) {
+bool xp_blocked(void* self, int32_t xp, uint8_t reason) {
     try {
         if (reason > 13 || !((kQuestXp >> reason) & 1) || !g.on || g.host || !g.remote_id || !join::joined() || self != player_info()) return false;
         g.xp_blocked++;
         g.last_xp = "own " + xp_reason(reason) + " XP dropped: the host's comes instead";
+        // A quest this game completed may be set on the host's by force (its quest graph not there yet), and then the
+        // host's game gives no XP for it: the host takes this one then, as its own, and shares it back (kind 7).
+        if (reason == 1 && xp > 0) queue_interact(7, reason, xp, "");
         return true;
     } catch (const std::exception&) { return false; }  // called from game code: nothing may escape
 }
 
 void on_xp(void* self, int32_t xp, uint8_t reason) {
     try {
+        if (!g.host && join::joined() && xp > 0 && self == player_info()) character::changed();  // kept soon
         if (reason > 13 || !(((kSharedXp | (g.host ? kQuestXp : 0)) >> reason) & 1) || !g.on || !g.remote_id || xp <= 0) return;
         if ((!g.host && !join::joined()) || self != player_info()) return;  // the friend's own campaign is not shared
         queue_interact(4, reason, xp, "");
         g.xp_sent++;
         g.last_xp = "sent " + std::to_string(xp) + " XP (" + xp_reason(reason) + ")";
     } catch (const std::exception&) {}
+}
+
+// Host: the friend's quest-completed XP goes in for a quest this game completed by force (the friend's outcome), one
+// for one, within 30 s; through the game's AddXP (its XP notification shows, the friend gets it back as shared XP).
+void match_quest_xp() {
+    uint64_t f = story::forced_completions();
+    for (; g.forced_seen < f; g.forced_seen++) g.quest_credits.push_back(g.now);
+    auto old = [](double t) { return g.now - t > 30.0; };
+    g.quest_credits.erase(std::remove_if(g.quest_credits.begin(), g.quest_credits.end(), old), g.quest_credits.end());
+    g.quest_xp_held.erase(std::remove_if(g.quest_xp_held.begin(), g.quest_xp_held.end(), [&](const std::pair<int32_t, double>& x) { return old(x.second); }),
+                          g.quest_xp_held.end());
+    ue::UObject* pic = g.quest_credits.empty() || g.quest_xp_held.empty() ? nullptr : player_info();
+    if (!pic || !add_xp_entry) return;
+    alignas(16) uint8_t details[16] = {};
+    int32_t xp = g.quest_xp_held.front().first;
+    add_xp_entry(pic, xp, 1, details);
+    g.quest_xp_held.erase(g.quest_xp_held.begin()), g.quest_credits.erase(g.quest_credits.begin());
+    g.quest_xp_credited++;
+    core_log("story: " + std::to_string(xp) + " quest XP for a quest the other player completed");
 }
 
 json xp_test(int xp, int reason) {  // test bridge: an XP gain through the game's AddXP, as gameplay makes one
@@ -3470,6 +3663,27 @@ json xp_test(int xp, int reason) {  // test bridge: an XP gain through the game'
     json r = json::object();
     r.set("gained", add_xp_entry(pic, xp, static_cast<uint8_t>(reason), details));
     return r;
+}
+
+// Self-test of public games on one Steam account (bridge coop.lobbyProbe, off the game thread): an invisible lobby (not
+// shown to friends; no rich presence is set) is made, described, searched for (a search leaves out our own), then left.
+json lobby_probe() {
+    json r = json::object();
+    std::string why;
+    if (!steamnet::start(why) || !steamnet::lobbies_on()) return r.set("ok", false).set("why", why.empty() ? "no public games" : why);
+    std::string tag = "probe-" + std::to_string(GetTickCount64() % 1000000);
+    steamnet::lobby_host(tag, "probe");
+    double t0 = GetTickCount64() / 1000.0;
+    while (!steamnet::lobby_id() && GetTickCount64() / 1000.0 - t0 < 15.0) steamnet::lobby_poll(), Sleep(100);
+    r.set("lobby", std::to_string(steamnet::lobby_id())).set("madeIn", GetTickCount64() / 1000.0 - t0);
+    if (steamnet::lobby_id()) {
+        steamnet::lobby_search(tag);
+        double t1 = GetTickCount64() / 1000.0;
+        while (GetTickCount64() / 1000.0 - t1 < 6.0) steamnet::lobby_poll(), Sleep(100);
+        r.set("searched", true).set("found", static_cast<double>(steamnet::lobby_results().size()));
+    }
+    steamnet::lobby_leave();
+    return r.set("ok", true).set("left", steamnet::lobby_id() == 0);
 }
 
 // Self-test of the Steam link without another player (bridge coop.steamProbe, any thread): the functions resolve, the
@@ -3568,13 +3782,14 @@ struct MenuState {
     std::vector<int> actions;
     std::vector<std::pair<ue::UObject*, uint8_t>> hidden;  // the game's responses we collapsed, and their visibility
     std::vector<uint64_t> hosts;     // level 2: Steam friends who host
+    std::vector<steamnet::Lobby> publics;  // level 2: public games (Steam lobbies of this version)
     double search_from = 0, next_refresh = 0;
     int lang = -1;                   // 0 English, 1 French (the game's language)
 } menu;
 
 double menu_last[2] = {};  // the last click, in viewport pixels (test bridge)
 
-enum MenuAction { kOpen = 1, kHost, kStopHosting, kJoinList, kStopJoining, kBack, kSearch, kJoinDirect, kJoinFriend = 100 };
+enum MenuAction { kOpen = 1, kHost, kStopHosting, kJoinList, kStopJoining, kBack, kSearch, kJoinDirect, kHostPublic, kJoinFriend = 100, kJoinPublic = 200 };
 
 const char* tr(const char* en, const char* fr) {
     if (menu.lang < 0) {
@@ -3761,10 +3976,13 @@ std::vector<uint64_t> hosting_friends() {
 void choose_off() {
     if (g.steam && steamnet::on()) {
         steamnet::set_presence("tow2coop", "");
+        steamnet::set_presence("connect", "");
+        steamnet::lobby_leave();
         if (g.have_peer) steamnet::close(g.peer_id);
         g.have_peer = false;
     }
     g.role_chosen = false, g.join_target = 0, g.snaps.clear(), g.remote_id = 0, g.remote_last_seq = 0, g.gestures_synced = false;
+    g.host_public = false, g.join_public = false, g.public_wanted = false;
     destroy_puppet();
     core_log("co-op menu: co-op off");
 }
@@ -3780,13 +3998,19 @@ void menu_act(int action) {
     if (action == kOpen) menu.level = 1;
     else if (action == kBack) menu.level = menu.level == 2 ? 1 : 0;
     else if (action == kHost) choose_role(true, 0), menu.level = 0;
+    else if (action == kHostPublic) choose_role(true, 0), g.host_public = true, menu.level = 0;
     else if (action == kStopHosting || action == kStopJoining) choose_off(), menu.level = 0;
     else if (action == kJoinList || action == kSearch) {
-        menu.level = 2, menu.search_from = g.now, menu.next_refresh = 0, menu.hosts.clear();
+        menu.level = 2, menu.search_from = g.now, menu.next_refresh = 0, menu.hosts.clear(), menu.publics.clear();
         if (steam_up())
             for (uint64_t f : steamnet::friends_in_game()) steamnet::request_presence(f);
     } else if (action == kJoinDirect) choose_role(false, 0), menu.level = 0;
-    else if (action >= kJoinFriend && action - kJoinFriend < static_cast<int>(menu.hosts.size())) choose_role(false, menu.hosts[action - kJoinFriend]), menu.level = 0;
+    else if (action >= kJoinPublic && action - kJoinPublic < static_cast<int>(menu.publics.size())) {
+        if (g.role_chosen) choose_off();
+        steamnet::lobby_join(menu.publics[action - kJoinPublic].id);  // entered: its owner is the host (frame)
+        g.public_wanted = true, menu.level = 0;
+        core_log("co-op menu: joining the public game of " + menu.publics[action - kJoinPublic].host);
+    } else if (action >= kJoinFriend && action - kJoinFriend < static_cast<int>(menu.hosts.size())) choose_role(false, menu.hosts[action - kJoinFriend]), menu.level = 0;
     g.menu_picks++;
 }
 
@@ -3804,14 +4028,20 @@ std::vector<std::pair<std::string, int>> menu_wanted() {
     bool playing = g.role_chosen && g.have_peer && !g.snaps.empty() && g.now - g.snaps.back().t < 5.0;
     if (menu.level == 0) {
         std::string s = playing ? fill(tr("Co-op: playing with {}.", "Co-op : tu joues avec {}."), peer_name())
+                      : hosting && g.host_public ? tr("Co-op: my game is open to everyone (public).", "Co-op : ma partie est ouverte à tous (publique).")
                       : hosting ? tr("Co-op: my game is open to my Steam friends.", "Co-op : ma partie est ouverte à mes amis Steam.")
+                      : g.public_wanted ? tr("Co-op: joining a public game...", "Co-op : je rejoins une partie publique...")
                       : joining ? fill(tr("Co-op: joining {}...", "Co-op : je rejoins {}..."), peer_name())
                       : tr("Let's play together (co-op).", "Jouons ensemble (co-op).");
         v.push_back({s, kOpen});
     } else if (menu.level == 1) {
         bool can_host = g.steam || g.start_host, can_join = g.steam || !g.start_host;  // a direct-IP copy keeps its set role
         if (hosting) v.push_back({tr("I'll stop hosting.", "Je n'héberge plus."), kStopHosting});
-        else if (can_host) v.push_back({tr("I'll host: my Steam friends can join my game.", "J'héberge : mes amis Steam pourront me rejoindre."), kHost});
+        else if (can_host) {
+            v.push_back({tr("I'll host: my Steam friends can join my game.", "J'héberge : mes amis Steam pourront me rejoindre."), kHost});
+            if (g.steam && steamnet::lobbies_on())
+                v.push_back({tr("I'll host: anyone can join (public game).", "J'héberge : tout le monde peut me rejoindre (partie publique)."), kHostPublic});
+        }
         if (joining) v.push_back({tr("I'll stop joining.", "J'arrête de rejoindre."), kStopJoining});
         else if (can_join) v.push_back({tr("I'll join a friend's game.", "Je rejoins la partie d'un ami."), kJoinList});
         v.push_back({tr("Never mind.", "Laisse tomber."), kBack});
@@ -3819,9 +4049,20 @@ std::vector<std::pair<std::string, int>> menu_wanted() {
         if (!g.steam) {
             v.push_back({tr("Join the host at the configured address.", "Rejoindre l'hôte à l'adresse configurée."), kJoinDirect});
         } else {
+            // New game together: without a character of their own the player would join as an emptied copy of the
+            // host's (its look too): their own new game makes one (the character creator), then they come back here.
+            static double checked = -100;
+            static bool own = true;
+            if (g.now - checked > 5.0) checked = g.now, own = character::has_own();
+            if (!own)
+                v.push_back({tr("You have no character yet: start a New Game to make yours, save, then come back to join.",
+                                "Tu n'as pas encore de personnage : lance une Nouvelle partie pour créer le tien, sauvegarde, puis reviens rejoindre."), kBack});
             for (size_t i = 0; i < menu.hosts.size() && i < 7; i++)
                 v.push_back({fill(tr("Join {}.", "Rejoindre {}."), steamnet::name(menu.hosts[i])), kJoinFriend + static_cast<int>(i)});
-            if (menu.hosts.empty())
+            for (size_t i = 0; i < menu.publics.size() && v.size() < 7; i++)
+                v.push_back({fill(tr("Join {} (public game).", "Rejoindre {} (partie publique)."), menu.publics[i].host.empty() ? std::string("?") : menu.publics[i].host),
+                             kJoinPublic + static_cast<int>(i)});
+            if (menu.hosts.empty() && menu.publics.empty())
                 v.push_back({g.now - menu.search_from < 2.5 ? tr("Looking for friends who host...", "Je cherche des amis qui hébergent...")
                                                               : tr("Nobody is hosting right now. Look again.", "Personne n'héberge pour l'instant. Cherche encore."), kSearch});
             else
@@ -3848,7 +4089,7 @@ void menu_frame() {
             shown = b[vis.off("ReturnValue")] && (menu.level > 0 || game_responses().size() >= 2);
         }
     }
-    menu_listen.store(shown);
+    menu_listen.store(shown || g.mirror_shown);
     if (!shown) {
         if (menu.level || !menu.mine.empty() || !menu.hidden.empty()) menu_reset();
         return;
@@ -3885,13 +4126,48 @@ void menu_frame() {
         menu_act(menu.actions[pick]);
         if (menu.level != before) clear_mine();  // other entries now
     }
-    if (menu.level == 2 && g.now >= menu.next_refresh) menu.next_refresh = g.now + 1.0, menu.hosts = hosting_friends();
+    if (menu.level == 2 && g.now >= menu.next_refresh) {
+        menu.next_refresh = g.now + 1.0, menu.hosts = hosting_friends();
+        if (g.steam && steamnet::on()) steamnet::lobby_search(kVersion), menu.publics = steamnet::lobby_results();
+    }
     show_game(menu.level == 0);
     first = menu.level == 0 ? static_cast<int>(game_responses().size()) + 1 : 1;
     show_entries(menu_wanted(), first);
     menu_own = menu.level == 0 ? first : -1;  // the window procedure: the digit that is ours (-1: all of them)
 }
 }  // namespace
+
+// Steam: lobby calls complete; "Join game" from the friends list (or an invite, or the command line) joins that host
+// from the main menu (in a game of their own, the player goes back to the main menu first); a public game picked in the
+// menu is joined once its lobby is entered.
+void steam_requests() {
+    static bool cmdline_read = false;
+    if (!cmdline_read) {  // Steam started the game for "Join game": the connect string is on the command line
+        cmdline_read = true;
+        std::string c = GetCommandLineA();
+        size_t at = c.find("-tow2coop_join=");
+        if (at != std::string::npos) g.pending_join = strtoull(c.c_str() + at + 15, nullptr, 10), core_log("co-op: started to join a friend's game (Steam)");
+    }
+    if (!g.steam || !steamnet::on()) return;
+    steamnet::lobby_poll();
+    if (uint64_t h = steamnet::take_join_request()) g.pending_join = h;
+    if (uint64_t owner = steamnet::lobby_joined()) {
+        if (g.public_wanted) {
+            choose_role(false, owner);
+            g.join_public = true;  // a stranger's game: no rich presence to read, its lobby is the invitation
+        }
+        g.public_wanted = false;
+    }
+    if (g.pending_join && g.menu_mode && g.at_menu) {
+        uint64_t h = g.pending_join;
+        g.pending_join = 0;
+        choose_role(false, h);
+        core_log("co-op: joining " + steamnet::name(h) + " (Steam)");
+    } else if (g.pending_join) {
+        static uint64_t told = 0;
+        if (told != g.pending_join) told = g.pending_join, core_log("co-op: go back to the main menu to join " + steamnet::name(g.pending_join));
+    }
+}
 
 json menu_status() {
     json m = json::array(), rects = json::array();
@@ -3911,6 +4187,340 @@ json menu_status() {
     return s;
 }
 
+// ---------------------------------------------------------------- companions out of a fight
+// Owner, 2026-11-19 (point 4): one party, the host's. Each world's companions follow their own player, so the two
+// worlds disagreed on where they were. Out of a fight the client's world shows them where they are in the host's
+// (driven like the stand-in: their AI paused, placed each frame, walking from the velocity); in a fight they get their
+// own AI back in each world, as co-op combat wants.
+namespace {
+void host_send_party(ue::UObject* pawn) {
+    if (g.now < g.next_party_send) return;
+    g.next_party_send = g.now + 0.2;
+    uint8_t buf[2 + 8 * 36];
+    buf[0] = g.now >= g.party_fight_until && !pawn_in_combat(pawn) ? 1 : 0, buf[1] = 0;
+    for (auto& kv : g.party) {
+        if (buf[1] >= 8 || !ue::alive(kv.second)) continue;
+        double pos[3], vel[3];
+        float yaw, pitch;
+        if (!read_transform(kv.second, pos, yaw, pitch, vel)) continue;
+        uint8_t* r = buf + 2 + buf[1] * 36;
+        float f[7] = {static_cast<float>(pos[0]), static_cast<float>(pos[1]), static_cast<float>(pos[2]), yaw,
+                      static_cast<float>(vel[0]), static_cast<float>(vel[1]), static_cast<float>(vel[2])};
+        memcpy(r, &kv.first, 8), memcpy(r + 8, f, sizeof f);
+        buf[1]++;
+    }
+    send_typed(kParty, buf, 2 + buf[1] * 36);
+}
+
+void party_ai(ue::UObject* c, bool on) {
+    std::string a = ue::addr(c);
+    json reason = json::object(), tick = json::object();
+    reason.set("Reason", "coop party");
+    tick.set("bEnabled", on);
+    call_quiet(a + ".Controller.BrainComponent", on ? "RestartLogic" : "StopLogic", on ? json::object() : reason);
+    call_quiet(a + ".CharacterMovement", "SetComponentTickEnabled", tick);
+    if (!on) call_quiet(a + ".Controller", "StopMovement", json::object());
+}
+
+void client_drive_party(ue::UObject* pawn) {
+    bool calm = g.party_calm_in && g.now - g.party_in_at < 2.0 && g.now >= g.party_fight_until && !pawn_in_combat(pawn);
+    static Fn set;
+    if (!base_fn(set, "/Script/Engine.Actor", "K2_SetActorLocationAndRotation")) return;
+    for (auto& kv : g.party) {
+        ue::UObject* c = kv.second;
+        if (!c || !ue::alive(c)) continue;
+        auto it = g.party_in.find(kv.first);
+        bool drive = calm && it != g.party_in.end() && g.now - it->second.second.t < 2.0;
+        bool tamed = g.party_tamed.count(c) != 0;
+        if (!drive) {
+            if (tamed) party_ai(c, true), g.party_tamed.erase(c), g.party_releases++;
+            continue;
+        }
+        if (!tamed) party_ai(c, false), g.party_tamed.insert(c), g.party_tames++;
+        const Ctx::PartySnap &a = it->second.first, &b = it->second.second;
+        double k = std::min(1.0, std::max(0.0, (g.now - b.t) / 0.2));  // toward the newest over one send interval
+        double pos[3] = {a.p[0] + (b.p[0] - a.p[0]) * k, a.p[1] + (b.p[1] - a.p[1]) * k, a.p[2] + (b.p[2] - a.p[2]) * k};
+        double rot[3] = {0, b.yaw, 0}, v[3] = {b.v[0], b.v[1], b.v[2]};
+        alignas(16) uint8_t buf[512] = {};
+        memcpy(buf + set.off("NewLocation"), pos, 24);
+        memcpy(buf + set.off("NewRotation"), rot, 24);
+        buf[set.off("bTeleport")] = 1;
+        ue::process_event(c, set.f, buf);
+        if (ue::UObject* cmc = ue::resolve(ue::addr(c) + ".CharacterMovement")) {
+            if (ue::FProperty* vp = ue::find_prop(ue::class_of(cmc), "Velocity")) memcpy(reinterpret_cast<uint8_t*>(cmc) + ue::prop_offset(vp), v, 24);
+            if (ue::FProperty* vp = ue::find_prop(ue::class_of(cmc), "ComponentVelocity")) memcpy(reinterpret_cast<uint8_t*>(cmc) + ue::prop_offset(vp), v, 24);
+        }
+    }
+    for (auto t = g.party_tamed.begin(); t != g.party_tamed.end();) {  // gone from the party (or the world): forget it
+        bool still = false;
+        for (auto& kv : g.party) still = still || kv.second == *t;
+        if (!still || !ue::alive(*t)) t = g.party_tamed.erase(t);
+        else ++t;
+    }
+}
+}  // namespace
+
+// ---------------------------------------------------------------- shared conversations
+// Owner, 2026-11-19: a conversation pauses the game and concerns both players: when one starts a conversation, the
+// other's game shows its screen (the speaker, the line, the responses) and pauses too; either player picks (1-9).
+// The conversation runs in the starter's game only (its scripts, items and XP happen once; the story sync carries its
+// outcome): the other side shows a mirror of the game's own response lines (probe 106: a ConversationWidget made
+// without a conversation shows nothing; the response widgets alone do).
+namespace {
+ue::UObject* conv_lib_cdo() {
+    static ue::UObject* cdo = nullptr;
+    if (!cdo)
+        if (ue::UClass* k = ue::find_class("/Script/Arkansas.ConversationBlueprintLibrary")) cdo = ue::cdo(k);
+    return cdo;
+}
+
+ue::UObject* conv_screen() {  // the conversation screen on show (ConversationWidget_BP_C)
+    static ue::UClass* k = ue::find_class("/Script/Arkansas.ConversationWidget");
+    static Fn vis;
+    if (!k || !base_fn(vis, "/Script/UMG.Widget", "IsVisible")) return nullptr;
+    for (ue::UObject* o : ue::instances(k, false, 8)) {
+        alignas(16) uint8_t b[16] = {};
+        ue::process_event(o, vis.f, b);
+        if (b[vis.off("ReturnValue")]) return o;
+    }
+    return nullptr;
+}
+
+std::string text_of(const std::string& path) {
+    std::string err;
+    ue::UObject* t = ue::resolve(path, &err);
+    ue::UFunction* f = t ? ue::find_func(ue::class_of(t), "GetText") : nullptr;
+    if (!f) return "";
+    try {
+        std::string s = ue::call(t, f, json::object()).get("ReturnValue").asString();
+        for (char& c : s)
+            if (c == '\n' || c == '\r') c = ' ';
+        return s;
+    } catch (const std::exception&) { return ""; }
+}
+
+std::vector<std::string> read_conversation() {  // speaker, line, then the responses (empty: no screen)
+    std::vector<std::string> v;
+    ue::UObject* c = conv_screen();
+    if (!c) return v;
+    std::string w = ue::addr(c);
+    v.push_back(text_of(w + ".SpeakerTextBlock").substr(0, 40));
+    v.push_back(text_of(w + ".ConversationMessage.MessageTextBlock").substr(0, 420));
+    static ue::FProperty* arr = nullptr;
+    if (!arr) arr = ue::find_prop(ue::class_of(c), "SelectableResponseWidgets");
+    if (!arr) return v;
+    struct TArr { ue::UObject** data; int32_t num, max; };
+    TArr a;
+    memcpy(&a, reinterpret_cast<uint8_t*>(c) + ue::prop_offset(arr), sizeof a);
+    for (int i = 0; i < a.num && i < 9 && a.data; i++)
+        if (a.data[i] && ue::alive(a.data[i])) v.push_back(text_of(ue::addr(a.data[i]) + ".MessageTextBlock").substr(0, 110));
+    return v;
+}
+
+void send_conversation(bool open, const std::vector<std::string>& lines) {
+    std::string body(1, open ? '\1' : '\0');
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (body.size() + lines[i].size() + 1 > 1380) break;
+        body += (i ? "\n" : "") + lines[i];
+    }
+    send_typed(kConversation, body.data(), static_cast<int>(body.size()));
+    g.conv_states_sent++;
+}
+
+struct Mirror {
+    std::vector<ue::UObject*> rows;
+    std::vector<std::string> texts;
+} mirror;
+
+ue::UObject* mirror_row() {  // a response line of the game's own, alone in the viewport, on one line
+    std::string err;
+    ue::UObject* pc = ue::resolve("pc", &err);
+    static ue::UClass* cls = nullptr;
+    if (!cls) cls = load_class("/Game/UI/Conversation/ConversationResponse_BP.ConversationResponse_BP_C");
+    ue::UClass* lib = ue::find_class("/Script/UMG.WidgetBlueprintLibrary");
+    if (!pc || !cls || !lib) return nullptr;
+    json a = json::object();
+    a.set("WorldContextObject", ue::addr(pc)).set("WidgetType", ue::addr(cls)).set("OwningPlayer", ue::addr(pc));
+    std::string r;
+    try { r = ue::call(ue::cdo(lib), ue::find_func(lib, "Create"), a).get("ReturnValue").asString(); } catch (const std::exception&) {}
+    ue::UObject* w = r.rfind("0x", 0) == 0 ? ue::resolve(r.substr(0, r.find(' ')), &err) : nullptr;
+    if (!w) return nullptr;
+    json z = json::object();
+    z.set("ZOrder", 60);
+    call_quiet(ue::addr(w), "AddToViewport", z);
+    if (ue::UObject* n = ue::resolve(ue::addr(w) + ".ResponseNumberTextBlock", &err)) set_visibility(n, 1);
+    json nw = json::object(), nat = json::object();
+    nw.set("InAutoTextWrap", false), nat.set("InWrapTextAt", 0.0);
+    call_quiet(ue::addr(w) + ".MessageTextBlock", "SetAutoWrapText", nw);
+    call_quiet(ue::addr(w) + ".MessageTextBlock", "SetWrapTextAt", nat);
+    return w;
+}
+
+void mirror_clear() {
+    for (ue::UObject* w : mirror.rows)
+        if (w && ue::alive(w)) call_quiet(ue::addr(w), "RemoveFromParent", json::object());
+    mirror.rows.clear(), mirror.texts.clear();
+}
+
+void set_paused(bool on) {
+    static Fn f;
+    std::string err;
+    ue::UObject* pc = ue::resolve("pc", &err);
+    static ue::UObject* gs = ue::cdo(ue::find_class("/Script/Engine.GameplayStatics"));
+    if (!pc || !gs || !base_fn(f, "/Script/Engine.GameplayStatics", "SetGamePaused")) return;
+    alignas(16) uint8_t b[32] = {};
+    memcpy(b + f.off("WorldContextObject"), &pc, 8);
+    b[f.off("bPaused")] = on ? 1 : 0;
+    ue::process_event(gs, f.f, b);
+}
+
+void mirror_show(const std::vector<std::string>& c) {  // c: speaker, line, responses
+    std::vector<std::string> rows;
+    std::string head = c.size() > 0 ? c[0] : std::string(), line = c.size() > 1 ? c[1] : std::string();
+    // the line, cut at spaces into rows that fit (a tag of rich text is never cut)
+    std::string first = head.empty() ? std::string() : head + " : ";
+    if (line.find('<') != std::string::npos || line.size() + first.size() <= 90) rows.push_back(first + line);
+    else {
+        std::string cur = first;
+        size_t at = 0;
+        while (at < line.size() && rows.size() < 3) {
+            size_t sp = line.find(' ', at);
+            std::string word = line.substr(at, sp == std::string::npos ? std::string::npos : sp - at);
+            if (cur.size() + word.size() > 90 && cur.size() > first.size()) rows.push_back(cur), cur.clear();
+            cur += (cur.empty() || cur == first ? "" : " ") + word;
+            at = sp == std::string::npos ? line.size() : sp + 1;
+        }
+        if (!cur.empty() && rows.size() < 3) rows.push_back(cur);
+    }
+    for (size_t i = 2; i < c.size(); i++) rows.push_back(std::to_string(i - 1) + ". " + c[i]);
+    rows.push_back(fill(tr("({} talks; 1-9: you choose too)", "({} parle ; 1-9 : tu choisis aussi)"), peer_name()));
+    if (rows == mirror.texts) return;
+    while (mirror.rows.size() < rows.size()) {
+        ue::UObject* w = mirror_row();
+        if (!w) return;
+        mirror.rows.push_back(w);
+    }
+    while (mirror.rows.size() > rows.size()) {
+        if (ue::alive(mirror.rows.back())) call_quiet(ue::addr(mirror.rows.back()), "RemoveFromParent", json::object());
+        mirror.rows.pop_back();
+    }
+    double vp[2] = {1920, 1080};
+    static Fn size;
+    std::string err;
+    ue::UObject* pc = ue::resolve("pc", &err);
+    static ue::UObject* lib = nullptr;
+    if (!lib)
+        if (ue::UClass* k = ue::find_class("/Script/UMG.WidgetLayoutLibrary")) lib = ue::cdo(k);
+    if (lib && pc && base_fn(size, "/Script/UMG.WidgetLayoutLibrary", "GetViewportSize")) {
+        alignas(16) uint8_t b[64] = {};
+        memcpy(b + size.off("WorldContextObject"), &pc, 8);
+        ue::process_event(lib, size.f, b);
+        memcpy(vp, b + size.off("ReturnValue"), 16);
+    }
+    double dy = vp[1] * 0.045, y0 = vp[1] * 0.9 - dy * static_cast<double>(rows.size());
+    for (size_t i = 0; i < rows.size(); i++) {
+        ue::UObject* w = mirror.rows[i];
+        json t = json::object(), pos = json::object(), xy = json::object();
+        t.set("InText", rows[i]);
+        call_quiet(ue::addr(w) + ".MessageTextBlock", "SetText", t);
+        xy.set("X", vp[0] * 0.26).set("Y", y0 + dy * static_cast<double>(i));
+        pos.set("Position", xy).set("bRemoveDPIScale", true);
+        call_quiet(ue::addr(w), "SetPositionInViewport", pos);
+    }
+    mirror.texts = rows;
+}
+
+void conversation_frame() {
+    bool mine = in_conversation();
+    if (g.now >= g.next_conv_send) {  // ours, to the other player: its screen 4 times a second, all of it once a second
+        g.next_conv_send = g.now + 0.25;
+        if (mine) {
+            std::vector<std::string> c = read_conversation();
+            std::string key;
+            for (const auto& l : c) key += l + "\n";
+            if (!c.empty() && (key != g.conv_last_sent || g.now - g.last_conv_full >= 1.0)) {
+                send_conversation(true, c);
+                g.conv_last_sent = key, g.last_conv_full = g.now, g.conv_sent_open = true;
+            }
+        } else if (g.conv_sent_open) g.conv_sent_open = false, g.conv_close_left = 5, g.conv_last_sent.clear();
+        if (!mine && g.conv_close_left > 0) send_conversation(false, {}), g.conv_close_left--;
+    }
+    if (mine && g.conv_pick) {  // the other player chose on its mirror: the game's own key for that response
+        int k = g.conv_pick;
+        g.conv_pick = 0;
+        if (ue::UObject* c = conv_screen()) {
+            std::string fn = "OnResponse" + std::to_string(k) + "InputAction";
+            call_quiet(ue::addr(c), fn.c_str(), json::object());
+            g.conv_picks_done++;
+        }
+    }
+    // A conversation pauses the other player's game while it shows it (owner: conversations pause, for both). The game
+    // itself doesn't pause for conversations and lifts a pause no menu asks for, so it is asked again each frame. The
+    // starter's game is left as in the base game: paused, its conversation never got past the first line (run 139).
+    bool want = g.peer_conv_open && !mine && g.now - g.peer_conv_at < 3.0 && !g.peer_conv.empty();
+    if (want) {
+        if (!g.mirror_shown) {
+            g.mirror_shown = true, g.mirrors_shown++;
+            watch_keys();
+            if (!game_paused()) set_paused(true), g.mirror_paused = true;
+            core_log("conversation: " + peer_name() + " talks to " + g.peer_conv[0] + ": its screen shown here, the game paused");
+        }
+        mirror_show(g.peer_conv);
+        if (g.opt_conv_pause && !game_paused()) set_paused(true), g.mirror_paused = true;
+        menu_own = -1;  // every digit is a choice
+        int k = menu_key.exchange(0);
+        if (k >= 1 && k <= 9 && k <= static_cast<int>(g.peer_conv.size()) - 2) {
+            uint8_t b = static_cast<uint8_t>(k);
+            send_typed(kConvPick, &b, 1);
+            g.conv_picks_sent++;
+        }
+    } else if (g.mirror_shown) {
+        g.mirror_shown = false;
+        mirror_clear();
+        menu_own = 0, menu_key = 0;
+        if (g.mirror_paused) set_paused(false), g.mirror_paused = false;
+        core_log("conversation: " + peer_name() + "'s conversation ended: the game runs again");
+    }
+}
+
+// A minimized game never finishes a save (it waits for a drawn frame for the save's picture: runs 34-36), so a join
+// or a resync failed while the host's window was minimized. While one of the mod's saves runs (the host's hand-over,
+// the friend's private save), a minimized window is shown again behind the other windows, not activated, then
+// minimized back.
+void keep_drawn_for_saves() {
+    static double next = 0;
+    static bool shown_by_us = false;
+    if (g.now < next) return;
+    next = g.now + 0.5;
+    bool waiting = join::status().get("state").asString() == "saving" || (!g.host && character::status().get("saving").asBool(false));
+    if (!game_hwnd) watch_keys();
+    if (!game_hwnd || !IsWindow(game_hwnd)) return;
+    if (waiting && !shown_by_us && IsIconic(game_hwnd)) {
+        window_input = false;
+        ShowWindow(game_hwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(game_hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        shown_by_us = true;
+        core_log("window: the game was minimized during a save: drawn again behind the other windows until it is done");
+    } else if (!waiting && shown_by_us) {
+        shown_by_us = false;
+        // (the game activates its window when it comes back: only the player's own click or key says they came back)
+        if (window_input) core_log("window: the save is done; the player came back to the game");
+        else ShowWindow(game_hwnd, SW_SHOWMINNOACTIVE), core_log("window: the save is done, the game minimized again");
+    }
+}
+
+bool in_conversation() {
+    static Fn f;
+    ue::UObject* cdo = conv_lib_cdo();
+    if (!cdo || !base_fn(f, "/Script/Arkansas.ConversationBlueprintLibrary", "GetActivePlayerConversation")) return false;
+    alignas(16) uint8_t b[16] = {};
+    ue::process_event(cdo, f.f, b);
+    void* inst = nullptr;
+    memcpy(&inst, b + f.off("ReturnValue"), 8);
+    return inst != nullptr;
+}
+}  // namespace
+
 void frame(float) {
     if (!g.on) return;
     g.now = clock_s();
@@ -3929,6 +4539,8 @@ void frame(float) {
         g.settle_until = g.now + 10.0;
         g.arrived_by_travel = false;
         g.puppet = nullptr;  // it belonged to the old world
+        mirror.rows.clear(), mirror.texts.clear(), g.mirror_shown = false, g.mirror_paused = false;  // the old world's widgets
+        g.party_tamed.clear(), g.party_in.clear();
         g.npcs.clear(), g.scanning.clear(), g.scan_cursor = 0;
         g.interactables.clear(), g.inter_scan.clear();  // old world's doors and containers
         g.box_pos.clear(), g.box_counts.clear();
@@ -3953,6 +4565,7 @@ void frame(float) {
     bool settled = gameplay && g.now >= g.settle_until;
     g.in_gameplay = settled;
     try { menu_frame(); } catch (const std::exception& e) { g.last_error = std::string("menu: ") + e.what(); }
+    try { steam_requests(); } catch (const std::exception& e) { g.last_error = std::string("steam requests: ") + e.what(); }
     if (!g.role_chosen) return;  // nothing goes out until the player picks host or join (the co-op menu)
     receive();  // after the world check: data for the old world's objects is ignored until the new one settles
     watch_travel();
@@ -4039,6 +4652,7 @@ void frame(float) {
         watch_boxes(pawn);
         if (g.opt_doors) poll_doors();
         apply_xp_inbox();
+        if (g.host) match_quest_xp();
         send_outgoing();
         if (g.have_peer && g.now >= g.next_look) {
             g.next_look = g.now + 2.0;
@@ -4048,6 +4662,14 @@ void frame(float) {
             g.next_face = g.now + 5.0;
             try { send_face(); } catch (const std::exception& e) { g.last_error = std::string("send face: ") + e.what(); }
         }
+        if (g.have_peer) {
+            try { conversation_frame(); } catch (const std::exception& e) { g.last_error = std::string("conversation: ") + e.what(); }
+        }
+        try { keep_drawn_for_saves(); } catch (const std::exception& e) { g.last_error = std::string("window: ") + e.what(); }
+        if (g.have_peer && g.opt_party && pawn) {
+            try { if (g.host) host_send_party(pawn); else client_drive_party(pawn); } catch (const std::exception& e) { g.last_error = std::string("party: ") + e.what(); }
+        }
+        if (g.have_peer && g.opt_no_pause) keep_running();
         drive_puppet();
         if (g.opt_scan) scan_step(pawn);
         if (g.opt_scan && g.opt_npcs) spawned_frame(pawn);
@@ -4182,8 +4804,11 @@ void observe(void* o, void* f, const void* p) {
 
 json set_options(const json& p) {
     for (auto& kv : {std::make_pair("story", &g.opt_story), std::make_pair("doors", &g.opt_doors), std::make_pair("npcs", &g.opt_npcs), std::make_pair("scan", &g.opt_scan),
-                     std::make_pair("follow", &g.opt_follow), std::make_pair("gifts", &g.opt_gifts), std::make_pair("giveHold", &g.opt_give_hold), std::make_pair("combat", &g.opt_combat), std::make_pair("fakeDead", &g.opt_fake_dead)})
+                     std::make_pair("follow", &g.opt_follow), std::make_pair("gifts", &g.opt_gifts), std::make_pair("giveHold", &g.opt_give_hold), std::make_pair("combat", &g.opt_combat), std::make_pair("fakeDead", &g.opt_fake_dead),
+                     std::make_pair("noPause", &g.opt_no_pause), std::make_pair("party", &g.opt_party),
+                     std::make_pair("convPause", &g.opt_conv_pause)})
         if (p.get(kv.first).isBool()) *kv.second = p.get(kv.first).asBool(true);
+    if (p.get("dropInteract").isNumber()) g.opt_drop_interact = std::clamp(p.get("dropInteract").asNumber(0), 0.0, 0.95);
     if (p.get("menu").isBool()) {  // test: the role picked in the main menu from now on (off: the set role again)
         if (p.get("menu").asBool()) { g.menu_mode = true; if (g.role_chosen) choose_off(); g.host = g.start_host; }
         else g.menu_mode = false, g.host = g.start_host, g.role_chosen = true;
@@ -4242,9 +4867,24 @@ json status() {
     s.set("story", story::status());
     if (!g.host) s.set("character", character::status());
     s.set("doorsSent", static_cast<double>(g.doors_sent)).set("doorsApplied", static_cast<double>(g.doors_applied));
+    s.set("pausesLifted", static_cast<double>(g.pauses_lifted)).set("noPause", g.opt_no_pause);
+    s.set("partyDriven", static_cast<double>(g.party_tamed.size())).set("partyTames", static_cast<double>(g.party_tames))
+        .set("partyReleases", static_cast<double>(g.party_releases)).set("partyCalm", g.party_calm_in);
+    s.set("mirrorShown", g.mirror_shown).set("mirrors", static_cast<double>(g.mirrors_shown)).set("convStatesSent", static_cast<double>(g.conv_states_sent))
+        .set("convPicksSent", static_cast<double>(g.conv_picks_sent)).set("convPicksDone", static_cast<double>(g.conv_picks_done))
+        .set("peerConvOpen", g.peer_conv_open);
+    {
+        json rows = json::array();
+        for (const auto& t : mirror.texts) rows.push(t);
+        s.set("mirrorRows", rows);
+    }
+    s.set("interactsPending", static_cast<double>(g.outgoing.size())).set("interactsResent", static_cast<double>(g.interacts_resent))
+        .set("interactsLost", static_cast<double>(g.interacts_lost)).set("interactAcks", static_cast<double>(g.interact_acks));
     s.set("itemsSent", static_cast<double>(g.items_sent)).set("itemsApplied", static_cast<double>(g.items_applied)).set("lastInteract", g.last_interact);
     if (ue::UObject* pic = player_info()) s.set("xp", static_cast<double>(*reinterpret_cast<const int32_t*>(reinterpret_cast<const uint8_t*>(pic) + kXpOffset)));
     s.set("xpHook", add_xp_original != nullptr).set("xpSent", static_cast<double>(g.xp_sent)).set("xpApplied", static_cast<double>(g.xp_applied));
+    s.set("questXpCredited", static_cast<double>(g.quest_xp_credited)).set("questXpHeld", static_cast<double>(g.quest_xp_held.size()))
+        .set("questCredits", static_cast<double>(g.quest_credits.size()));
     s.set("xpBlocked", static_cast<double>(g.xp_blocked)).set("xpPending", static_cast<double>(g.xp_inbox.size())).set("xpDetails", static_cast<double>(g.xp_details_filled)).set("lastXp", g.last_xp);
     s.set("resyncs", static_cast<double>(g.resyncs)).set("resyncRequests", static_cast<double>(g.resync_requests)).set("resyncFetches", static_cast<double>(g.resync_fetches)).set("resyncReason", g.resync_reason);
     s.set("travelsSent", static_cast<double>(g.travels_sent)).set("travelsFollowed", static_cast<double>(g.travels_followed)).set("travelsRefused", static_cast<double>(g.travels_refused));
@@ -4273,7 +4913,8 @@ json status() {
     s.set("weaponChanges", static_cast<double>(g.weapon_changes));
     s.set("dmgNotMine", static_cast<double>(g.dmg_not_mine));
     s.set("myCrouched", g.my_crouched).set("standinCrouched", g.standin_crouched).set("standinCrouches", static_cast<double>(g.standin_crouches))
-        .set("crouchMisses", static_cast<double>(g.crouch_misses)).set("crouchWindow", g.crouch_tick_until > 0);
+        .set("crouchMisses", static_cast<double>(g.crouch_misses)).set("crouchWindow", g.crouch_tick_until > 0)
+        .set("standinRespawns", static_cast<double>(g.standin_respawns));
     s.set("standinModsInstalled", static_cast<double>(g.standin_mods_installed)).set("lookWeaponMods", static_cast<double>(g.look_weapon_mods.size()));
     s.set("menuMode", g.menu_mode).set("roleChosen", g.role_chosen).set("menuPicks", static_cast<double>(g.menu_picks)).set("menu", menu_status());
     s.set("spawnedShared", static_cast<double>(g.spawned.size())).set("spawnCopies", static_cast<double>(g.spawn_copies));

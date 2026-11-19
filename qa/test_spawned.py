@@ -146,6 +146,8 @@ def revive_if_down():
 def main(parts):
     unpause_all()
     revive_if_down()
+    for i in (0, 1):  # a hand-over earlier makes a new pawn, without god mode (run 136: the bears killed the client)
+        safe(lambda: call("ue.call", {"ref": "pawn.HealthComponent", "fn": "SetGod", "args": {"bEnabled": True}}, inst=i))
     cls = bear_class()
     if not check(bool(cls), "the Ursopod class is loaded", str(cls)):
         return 1

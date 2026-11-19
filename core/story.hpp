@@ -8,6 +8,7 @@ constexpr uint16_t kStory = 6, kStoryAck = 7;  // co-op packet types
 using SendFn = std::function<void(uint16_t type, const void* body, int len)>;
 bool ensure_loaded();                                           // game thread
 void reset_peer();                                              // host: a client (re)joined
+uint64_t forced_completions();  // quests set Completed here by the other side's outcome (this quest graph not there)
 void host_frame(double now, const SendFn& send);                // host, game thread, settled gameplay only
 void on_story(const char* body, int len, const SendFn& send);   // either side, game thread: the other side's changes
 void on_ack(const char* body, int len);                         // either side: how far the other side applied ours

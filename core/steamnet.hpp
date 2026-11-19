@@ -26,4 +26,24 @@ int accept_friends();              // accept a pending session from any immediat
 int session_state(uint64_t peer);  // ESteamNetworkingConnectionState: 1 connecting, 2 finding route, 3 connected
 int relay_status();                // ESteamNetworkingAvailability: 100 current, 3 attempting, <0 failed
 void close(uint64_t peer);
+
+// Public games: Steam lobbies (type Invisible: listed by a search, not shown as joinable to friends, who use "Join game"
+// from rich presence "connect" instead). Calls complete asynchronously: lobby_poll() each frame.
+bool lobbies_on();                       // the matchmaking functions resolved
+void lobby_poll();                       // game thread: completes pending calls
+void lobby_host(const std::string& version, const std::string& host_name);  // create (once) and describe our lobby
+void lobby_leave();
+uint64_t lobby_id();                     // the lobby we host or joined (0: none)
+void lobby_set(const char* key, const char* value);
+void lobby_accept_members();             // host: accept the pending session of each member
+struct Lobby {
+    uint64_t id, owner;
+    std::string host;  // the host's name as the lobby says it
+};
+void lobby_search(const std::string& version);  // starts a search (at most every 3 s)
+std::vector<Lobby> lobby_results();     // the last search's lobbies (ours left out)
+void lobby_join(uint64_t lobby);        // async: lobby_joined() then gives the owner
+uint64_t lobby_joined();                // the owner of the lobby we just entered, once (0: not yet / none)
+// "Join game" from the Steam friends list (rich presence "connect") or an accepted lobby invite: the host to join.
+uint64_t take_join_request();           // 0: none; the request is consumed
 }  // namespace steamnet

@@ -9,7 +9,7 @@ namespace coop {
 // The game's UPlayerInfoComponent::AddXP(XP, EXPGainReason, TArray* details): hooked in main.cpp (party XP).
 using AddXpFn = bool (*)(void* self, int32_t xp, uint8_t reason, void* details);
 extern AddXpFn add_xp_original, add_xp_entry;  // the original (no hook) and the hooked entry (as the game calls it)
-bool xp_blocked(void* self, uint8_t reason);          // game thread, before an XP gain: drop it?
+bool xp_blocked(void* self, int32_t xp, uint8_t reason);  // game thread, before an XP gain: drop it?
 void on_xp(void* self, int32_t xp, uint8_t reason);   // game thread, after a gain: share it?
 coopbridge::json::Value xp_test(int xp, int reason);  // test bridge: an XP gain through the hooked AddXP
 // The game's UIndianaUI::OpenItemTransfer(AActor* other): its two-list transfer screen between the player's inventory
@@ -43,5 +43,6 @@ coopbridge::json::Value set_options(const coopbridge::json::Value& p);  // {stor
 coopbridge::json::Value fights();  // test bridge, game thread: NPCs fighting or pinned in this world
 coopbridge::json::Value spawned(const coopbridge::json::Value& p);  // test bridge, game thread: spawn one / the shared list
 coopbridge::json::Value steam_probe();
+coopbridge::json::Value lobby_probe();  // test: an invisible Steam lobby made, searched, left (off the game thread)
 coopbridge::json::Value face_debug();  // game thread: the look we send, the one we got, the last error (test bridge)  // any thread, blocks up to ~15 s: Steam link self-test without another player
 }  // namespace coop

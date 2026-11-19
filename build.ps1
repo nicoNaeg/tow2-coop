@@ -32,6 +32,16 @@ $bridgeInc = Join-Path $root '..\..\tools\bridge\include'
     "$root\core\main.cpp" "$root\core\ue.cpp" "$root\core\hook.cpp" "$root\core\coop.cpp" "$root\core\join.cpp" "$root\core\story.cpp" "$root\core\steamnet.cpp" "$root\core\savefile.cpp" "$root\core\character.cpp" -lws2_32 -lole32 -luuid
 if ($LASTEXITCODE) { throw "tow2coop.dll build failed" }
 Write-Host "built $coreOut\tow2coop.dll"
+# The players' installer: one exe with the two DLLs inside (installer\setup.cpp), its version from the mod's.
+$ver = [regex]::Match((Get-Content "$root\core\coop.cpp" -Raw), 'kVersion = "([^"]+)"').Groups[1].Value
+$num = (($ver -replace '[^0-9.].*$', '').Split('.') + @('0', '0', '0', '0'))[0..3] -join ','
+Set-Content -Encoding ascii "$out\version.h" "#define TOW2_VERSION `"$ver`"`r`n#define TOW2_VERSION_NUM $num"
+& (Join-Path $bin 'windres.exe') -I $root -I $out -O coff -o "$out\setup_res.o" "$root\installer\setup.rc"
+if ($LASTEXITCODE) { throw "installer resources failed" }
+& $cxx -std=c++17 -O2 -Wall -Wextra -Werror -municode -mwindows -static -I $out -o "$out\tow2coop-setup.exe" "$root\installer\setup.cpp" "$out\setup_res.o" `
+    -lcomctl32 -lshell32 -lole32 -luuid -ladvapi32
+if ($LASTEXITCODE) { throw "tow2coop-setup.exe build failed" }
+Write-Host "built $out\tow2coop-setup.exe ($ver)"
 if ($NoTest) { return }
 
 $fail = 0
@@ -82,6 +92,8 @@ if (-not $fail) {  # a player's package in the layout install.ps1 expects; no ga
     Copy-Item "$root\install.ps1", "$root\README.md", "$root\LICENSE" $stage
     Copy-Item "$out\dsound.dll" "$stage\bin\"
     Copy-Item "$coreOut\tow2coop.dll" "$stage\bin\core\"
+    Copy-Item "$out\tow2coop-setup.exe" $stage
+    Copy-Item "$out\tow2coop-setup.exe" "$root\dist\tow2coop-setup.exe"  # the release's own download too
     # forward-slash entry names: Compress-Archive and ZipFile on Windows PowerShell 5.1 write '\', which other unzip tools misread
     python -I -c "import sys, zipfile, pathlib; s = pathlib.Path(sys.argv[1]); z = zipfile.ZipFile(sys.argv[2], 'w', zipfile.ZIP_DEFLATED); [z.write(f, f.relative_to(s).as_posix()) for f in sorted(s.rglob('*')) if f.is_file()]; z.close()" $stage "$root\dist\tow2coop.zip"
     Write-Host "package: $root\dist\tow2coop.zip"

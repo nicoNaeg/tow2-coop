@@ -209,7 +209,7 @@ bool hk_apply_damage(void* causer, void* info, void* a3, void* a4, void* instiga
 
 coop::AddXpFn o_add_xp;
 bool hk_add_xp(void* self, int32_t xp, uint8_t reason, void* details) {
-    if (coop::xp_blocked(self, reason)) return false;  // the client's own quest XP: the host's comes instead
+    if (coop::xp_blocked(self, xp, reason)) return false;  // the client's own quest XP: the host's comes instead
     bool gained = o_add_xp(self, xp, reason, details);
     if (gained) coop::on_xp(self, xp, reason);
     return gained;
@@ -548,6 +548,7 @@ DWORD WINAPI init_thread(LPVOID) {
     reg("coop.spawned", [](const Value& p) { return coop::spawned(p); });  // test: spawn an NPC here, or list the shared ones  // test: whom the NPCs fight here, and the deciding word
     reg("coop.set", [](const Value& p) { return coop::set_options(p); });
     reg("coop.steamProbe", [](const Value&) { return coop::steam_probe(); }, false);  // waits: off the game thread
+    reg("coop.lobbyProbe", [](const Value&) { return coop::lobby_probe(); }, false);  // waits: off the game thread
     reg("coop.face", [](const Value&) { return coop::face_debug(); });  // test: look texts
     reg("coop.charSave", [](const Value&) { character::save_now(); return character::status(); });  // test: keep the character now
     reg("coop.steamAccept", [](const Value&) {  // test: the host's accept pass over the friends list, on any copy

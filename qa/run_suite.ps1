@@ -57,8 +57,13 @@ Step 'outfit follows' { python -I test_look.py }
 Step 'stand-in animation' { python -I test_anim.py $p[1] }
 Step 'party XP' { python -I test_xp.py }
 Step 'give items' { python -I test_give.py $p[0] $p[1] }
+Step 'menus do not pause' { python -I test_nopause.py }
+Step 'shared conversations' { python -I test_conversation.py }
+Step 'companions follow the host' { python -I test_party.py }
+Step 'minimized host saves' { python -I test_minimized.py }
+Step 'public game (one account)' { python -I test_lobby.py }
 Step 'co-op combat' { python -I test_combat.py ABCDE $p[0] }  # first (a calm start), before the reloads: they bring the NPCs back
-Step 'weapon and gestures' { python -I test_gestures.py ABCDEFGHI }
+Step 'weapon and gestures' { python -I test_gestures.py ABCDEFGHIJ }
 Step 'spawned enemies' { python -I test_spawned.py ABCD }
 Step 'death and reload' { python -I test_death.py ABCD $p[0] }
 Step 'world sync' { python -I test_world.py $p[0] }

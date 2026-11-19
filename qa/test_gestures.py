@@ -11,6 +11,7 @@ F. Reload: the host empties its rifle: it reloads, and so does its stand-in.
 G. Mods: a silencer installed on the host's rifle shows on its stand-in's rifle.
 H. Bash: the host's quick melee with its rifle: the stand-in plays the game's NPC one (a long gun's).
 I. Crouch: the host crouches: its stand-in crouches (its capsule at the crouched height); stands up again.
+J. Crouch while walking: the stand-in's walk animation keeps going through the change of stance.
 God mode again after. Usage: python -I test_gestures.py [ABCDEF]"""
 import math
 import sys
@@ -328,6 +329,34 @@ def main(parts):
         time.sleep(0.5)
         gap = feet_gap()
         check(abs(gap) < 8, "standing, its feet are on the host's", f"{gap:+.1f} cm")
+    if "J" in parts:  # the host crouches while walking: its stand-in keeps walking through the change
+        import subprocess
+        import threading
+        from gamewin import Game
+        cmd = r"(Get-Process -Name TheOuterWorlds2-Win64-Shipping | Where-Object { $_.Path -like 'C:\coop-anything\local\gamepool\instances\tow2\0\*' }).Id"
+        host = Game(int(subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, text=True).stdout.split()[0]))
+        h, c = loc(0, "pawn"), loc(0, puppet0)  # toward the client's stand-in: ground the client stands on
+        aim(0, math.degrees(math.atan2(c["Y"] - h["Y"], c["X"] - h["X"])), 0.0)
+        anim = ref_of(ev(1, puppet1 + ".Mesh.GetAnimInstance()"))
+        host.key("W", hold_s=0.05)  # wake the window's input
+        time.sleep(0.5)
+        walker = threading.Thread(target=lambda: host.key("W", hold_s=2.2))
+        walker.start()
+        t0, samples, crouched_at = time.time(), [], None
+        while time.time() - t0 < 2.2:
+            if crouched_at is None and time.time() - t0 > 0.6:
+                uc(0, "pawn", "Crouch", {"bClientSimulation": False})
+                crouched_at = time.time() - t0
+            samples.append((time.time() - t0, safe(lambda: call("ue.get", {"path": f"{anim}.SmoothedSpeed"}, inst=1), 0) or 0))
+            time.sleep(0.08)
+        walker.join()
+        during = [v for t, v in samples if crouched_at + 0.3 <= t <= crouched_at + 1.0]  # the change of stance (~1 s), not the walk's end
+        check(max(v for _, v in samples) > 100, "the host walked: its stand-in walked", f"anim speed max {max(v for _, v in samples):.0f}")
+        check(bool(during) and min(during) > 40, "and kept walking while it crouched",
+              f"anim speed min {min(during) if during else -1:.0f} in the second after the crouch; "
+              + " ".join(f"{v:.0f}" for _, v in samples))
+        uc(0, "pawn", "UnCrouch", {"bClientSimulation": False})
+        time.sleep(1.5)
     for i in (0, 1):
         safe(lambda: uc(i, "pawn.HealthComponent", "SetGod", {"bEnabled": True}))
     print(f"RESULT: {'PASS' if not FAILS else 'FAIL'} ({FAILS} failure(s))")
@@ -335,4 +364,4 @@ def main(parts):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "ABCDEFGHI"))
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "ABCDEFGHIJ"))
