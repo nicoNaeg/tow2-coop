@@ -77,6 +77,10 @@ def main(host_pid, att=0, pics=Path(r"C:\coop-anything\local\the-outer-worlds-2\
     print(f"{'PASS' if ok_hit else 'FAIL'} {who} player's attack damaged the NPC on the host (real input)")
     print(f"{'PASS' if ok_sync else 'FAIL'} client's copy has the host's health")
     g.shot(str(pics / f"melee-{who}-after.png"))
+    try:  # no fight left for the next steps
+        call("ue.call", {"ref": h_npc + ".HealthComponent", "fn": "Suicide", "args": {"bPreventRevival": True}}, inst=0)
+    except Exception:  # noqa: BLE001
+        pass
     fails = (not ok_hit) + (not ok_sync)
     print(f"RESULT: {'PASS' if not fails else 'FAIL'} ({fails} failure(s))")  # run_suite.ps1 reads this line
     return fails

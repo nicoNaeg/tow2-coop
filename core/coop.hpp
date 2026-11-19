@@ -33,11 +33,15 @@ bool close_screens();  // game thread: true while a screen the mod opened is sti
 extern std::atomic<int> watch_count;
 extern void* watch[8];
 void observe(void* object, void* function, const void* parms);  // any thread; only copies, frame() does the work
+// The game's damage function (hooked in main.cpp): true = drop it, it comes from the stand-in (its shots, its swings).
+bool standin_damage(void* causer, void* instigator);
+extern bool damage_hooked;
 bool start(std::string& why);  // reads TOW2_COOP_* from the environment; false = co-op stays off
 void frame(float dt);          // game thread, once per frame
 coopbridge::json::Value status();
 coopbridge::json::Value set_options(const coopbridge::json::Value& p);  // {story,doors,npcs,scan,combat...: bool}
 coopbridge::json::Value fights();  // test bridge, game thread: NPCs fighting or pinned in this world
+coopbridge::json::Value spawned(const coopbridge::json::Value& p);  // test bridge, game thread: spawn one / the shared list
 coopbridge::json::Value steam_probe();
 coopbridge::json::Value face_debug();  // game thread: the look we send, the one we got, the last error (test bridge)  // any thread, blocks up to ~15 s: Steam link self-test without another player
 }  // namespace coop

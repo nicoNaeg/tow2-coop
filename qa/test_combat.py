@@ -189,6 +189,7 @@ def main(parts):
             hp0, hp1 = health(0), health(1)
             st0 = call("coop.status", {}, inst=1)
             snaps0, fsnaps0 = st0.get("npcSnapped", 0), st0.get("npcFightSnapped", 0)
+            dmg0 = st0.get("dmgSent", 0)  # the client does not attack in B: what it reports is someone else's damage
             agree = total = 0
             others = []
             words, drift, misses = set(), [], []
@@ -235,6 +236,8 @@ def main(parts):
                 snaps, fsnaps = st.get("npcSnapped", 0) - snaps0, st.get("npcFightSnapped", 0) - fsnaps0
                 check(med < 3.0, "the two copies of each NPC stay close in the fight", f"median {med:.1f} m, max {max(drift):.1f} m over {len(drift)} samples")
                 check(fsnaps <= 4, "few visible snaps of fighting NPCs in 20 s (eased instead)", f"{fsnaps} snaps of fighting NPCs ({snaps} of all NPCs), eased {st.get('npcEased')}")
+                check(st.get("dmgSent", 0) - dmg0 <= 2, "the client reported no damage it did not deal (it does not attack in B)",
+                      f"{st.get('dmgSent', 0) - dmg0} reports; hits not its own seen {st.get('dmgNotMine', 0)} (run 118 before the fix: 106 reports)")
             if others:
                 print("info: other fights: " + "; ".join(others))
             s0, s1 = call("coop.status", {}, inst=0), call("coop.status", {}, inst=1)

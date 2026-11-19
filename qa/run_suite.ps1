@@ -14,7 +14,9 @@ function Step([string]$name, [scriptblock]$body) {
     $m = [regex]::Match($text, 'RESULT: (PASS|FAIL)')
     if ($m.Success) { $results[$name] = $m.Groups[1].Value }
 }
-function Pids { foreach ($i in 0, 1) { (Get-Content "$hub\local\gamepool\instances\tow2\$i\sandbox\sandbox.log" | Select-String 'sandbox on: pid (\d+)' | Select-Object -Last 1).Matches[0].Groups[1].Value } }
+function Pids {  # the running copy under each instance folder (the sandbox log's last pid can be an earlier copy's, run 114)
+    foreach ($i in 0, 1) { (Get-Process -Name 'TheOuterWorlds2-Win64-Shipping' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$hub\local\gamepool\instances\tow2\$i\*" } | Select-Object -First 1).Id }
+}
 function Up([switch]$KeepSaves) {
     Set-Location $hub
     foreach ($i in 0, 1) {
@@ -55,7 +57,9 @@ Step 'outfit follows' { python -I test_look.py }
 Step 'stand-in animation' { python -I test_anim.py $p[1] }
 Step 'party XP' { python -I test_xp.py }
 Step 'give items' { python -I test_give.py $p[0] $p[1] }
-Step 'co-op combat' { python -I test_combat.py ABCDE $p[0] }  # before the reloads: they bring the NPCs back
+Step 'co-op combat' { python -I test_combat.py ABCDE $p[0] }  # first (a calm start), before the reloads: they bring the NPCs back
+Step 'weapon and gestures' { python -I test_gestures.py ABCDEFGHI }
+Step 'spawned enemies' { python -I test_spawned.py ABCD }
 Step 'death and reload' { python -I test_death.py ABCD $p[0] }
 Step 'world sync' { python -I test_world.py $p[0] }
 Step 'story both ways' { python -I test_resync.py AS }

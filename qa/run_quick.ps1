@@ -1,20 +1,23 @@
 # Targeted regression on one pair for the two-PC fixes (stand-in look and animation, interactions incl. dead-NPC loot,
 # map-travel hand-over), plus the owner-state and caught-fault checks. The whole suite is run_suite.ps1.
-# Usage: run_quick.ps1 -Out <evidence folder> [-NoRamCheck] [-Only 'interact and loot','...'] (the join steps always run)
-param([Parameter(Mandatory)][string]$Out, [switch]$NoRamCheck, [string[]]$Only, [switch]$Warm)
+# Usage: run_quick.ps1 -Out <evidence folder> [-NoRamCheck] [-Only 'interact and loot','...'] [-Menu] (the join steps always run;
+# -Menu: the copies start in menu mode and the players host and join through the game's main menu instead)
+param([Parameter(Mandatory)][string]$Out, [switch]$NoRamCheck, [string[]]$Only, [switch]$Warm, [switch]$Menu)
 $ErrorActionPreference = 'Continue'
 $hub = 'C:\coop-anything'; $qa = "$hub\local\tow2-coop\qa"; $cfg = "$qa\tow2.gamepool.json"
 New-Item -ItemType Directory -Force $Out | Out-Null
 $log = "$Out\suite.log"; $results = [ordered]@{}
 function Step([string]$name, [scriptblock]$body) {
-    if ($Only -and $name -notin $Only -and $name -notin 'host load', 'auto-join', 'players invulnerable', 'no caught faults') { return }
+    if ($Only -and $name -notin $Only -and $name -notin 'host load', 'auto-join', 'co-op menu', 'players invulnerable', 'no caught faults') { return }
     "=== $name ($(Get-Date -Format HH:mm:ss))" | Tee-Object -FilePath $log -Append | Out-Host
     $text = & $body 2>&1 | Out-String
     $text | Tee-Object -FilePath $log -Append | Out-Host
     $m = [regex]::Match($text, 'RESULT: (PASS|FAIL)')
     if ($m.Success) { $results[$name] = $m.Groups[1].Value }
 }
-function Pids { foreach ($i in 0, 1) { (Get-Content "$hub\local\gamepool\instances\tow2\$i\sandbox\sandbox.log" | Select-String 'sandbox on: pid (\d+)' | Select-Object -Last 1).Matches[0].Groups[1].Value } }
+function Pids {  # the running copy under each instance folder (the sandbox log's last pid can be an earlier copy's, run 114)
+    foreach ($i in 0, 1) { (Get-Process -Name 'TheOuterWorlds2-Win64-Shipping' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$hub\local\gamepool\instances\tow2\$i\*" } | Select-Object -First 1).Id }
+}
 if ($Warm) { foreach ($w in 0, 1) { & "$qa\warmup.ps1" -Out "$Out\warmup$w" -Instance $w -Seconds 150 | Tee-Object -FilePath $log -Append | Out-Host } }  # refill the driver's shader cache (run 67: 6.5 GB at the menu)
 Set-Location $hub
 python -I local/tow2-coop/qa/owner_guard.py snapshot "$Out\owner-before.json" | Out-Host
@@ -29,11 +32,12 @@ foreach ($i in 0, 1) {
 }
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File passes 'a,b' as one string
 $extra = @(); if ($NoRamCheck) { $extra += '--no-ram-check' }
+if ($Menu) { $env:TOW2_COOP_MENU = '1' } else { Remove-Item Env:TOW2_COOP_MENU -ErrorAction SilentlyContinue }  # the copies inherit it
 python -I tools/gamepool/gamepool.py --config $cfg up --pairs 1 --stagger 60 @extra 2>&1 | Select-Object -Last 2 | Out-Host
 Get-Process -Name 'TheOuterWorlds2-Win64-Shipping' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$hub\local\gamepool\instances\*" } | ForEach-Object { & "$qa\unminimize.ps1" -ProcessId $_.Id | Out-Null }
 Set-Location $qa
-Step 'host load' { python -I session.py --instances 0 }
-Step 'auto-join' { python -I test_autojoin.py }
+if ($Menu) { $p = Pids; Step 'co-op menu' { python -I test_menu.py $p[0] $p[1] } }
+else { Step 'host load' { python -I session.py --instances 0 }; Step 'auto-join' { python -I test_autojoin.py } }
 Step 'players invulnerable' { python -I god.py }
 Start-Sleep 10
 $p = Pids
@@ -44,7 +48,9 @@ Step 'party XP' { python -I test_xp.py }
 Step 'story both ways' { python -I test_resync.py AS }
 Step 'give items' { python -I test_give.py $p[0] $p[1] }
 Step 'own character' { python -I test_character.py }
-Step 'co-op combat' { python -I test_combat.py ABCDE $p[0] }  # before the reloads: they bring the NPCs back
+Step 'co-op combat' { python -I test_combat.py ABCDE $p[0] }  # first (a calm start), before the reloads: they bring the NPCs back
+Step 'weapon and gestures' { python -I test_gestures.py ABCDEFGHI }
+Step 'spawned enemies' { python -I test_spawned.py ABCD }
 Step 'death and reload' { python -I test_death.py ABCD $p[0] }
 Step 'world sync' { python -I test_world.py $p[0] }
 Step 'resync map travel' { python -I test_resync.py B2C }  # host leads (followed), host leads (fallback), client leads

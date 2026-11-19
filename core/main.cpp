@@ -196,6 +196,17 @@ void hk_pe(ue::UObject* o, ue::UFunction* f, void* p) {
     o_pe(o, f, p);
 }
 
+// The game's apply-damage (called by weapons, melee and K2_ApplyDamage): bool(causer, info, ?, event, instigator,
+// bool, ?). Found from IndianaGameplayStatics::execK2_ApplyDamage (probe 92); the stand-in's damage is dropped there.
+constexpr uint32_t kApplyDamageRva = 0x10AB944;
+constexpr uint8_t kApplyDamageBytes[15] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x4C, 0x89, 0x48, 0x20, 0x4C, 0x89, 0x40, 0x18};
+using ApplyDamageFn = bool (*)(void*, void*, void*, void*, void*, bool, void*);
+ApplyDamageFn o_apply_damage;
+bool hk_apply_damage(void* causer, void* info, void* a3, void* a4, void* instigator, bool a6, void* a7) {
+    if (coop::standin_damage(causer, instigator)) return false;
+    return o_apply_damage(causer, info, a3, a4, instigator, a6, a7);
+}
+
 coop::AddXpFn o_add_xp;
 bool hk_add_xp(void* self, int32_t xp, uint8_t reason, void* details) {
     if (coop::xp_blocked(self, reason)) return false;  // the client's own quest XP: the host's comes instead
@@ -516,6 +527,9 @@ DWORD WINAPI init_thread(LPVOID) {
     if (!o_load_game) logmsg("faster reloads off: %s", err.c_str());
     o_quickload = reinterpret_cast<QuickloadFn>(hook::install(g_base + kQuickloadRva, kQuickloadBytes, sizeof kQuickloadBytes, reinterpret_cast<void*>(hk_quickload), err));
     if (!o_quickload) logmsg("faster quickloads off: %s", err.c_str());
+    o_apply_damage = reinterpret_cast<ApplyDamageFn>(hook::install(g_base + kApplyDamageRva, kApplyDamageBytes, sizeof kApplyDamageBytes, reinterpret_cast<void*>(hk_apply_damage), err));
+    coop::damage_hooked = o_apply_damage != nullptr;
+    if (!o_apply_damage) logmsg("the stand-in shows the other player's weapon but does not fire it: %s", err.c_str());
     reg("diag.vtable", [](const Value& p) {  // test: the function in an object's virtual table (read only)
         std::string err;
         ue::UObject* o = ue::resolve(p.get("ref").asString(), &err);
@@ -530,7 +544,8 @@ DWORD WINAPI init_thread(LPVOID) {
     reg("coop.xp", [](const Value& p) { return coop::xp_test(static_cast<int>(p.get("xp").asInt(10)), static_cast<int>(p.get("reason").asInt(0))); });  // test
     std::string coop_why;
     reg("coop.status", [](const Value&) { return coop::status(); });
-    reg("coop.fights", [](const Value&) { return coop::fights(); });  // test: whom the NPCs fight here, and the deciding word
+    reg("coop.fights", [](const Value&) { return coop::fights(); });
+    reg("coop.spawned", [](const Value& p) { return coop::spawned(p); });  // test: spawn an NPC here, or list the shared ones  // test: whom the NPCs fight here, and the deciding word
     reg("coop.set", [](const Value& p) { return coop::set_options(p); });
     reg("coop.steamProbe", [](const Value&) { return coop::steam_probe(); }, false);  // waits: off the game thread
     reg("coop.face", [](const Value&) { return coop::face_debug(); });  // test: look texts

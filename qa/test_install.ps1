@@ -11,6 +11,11 @@ function Check($ok, $what) { if ($ok) { "PASS $what" } else { "FAIL $what"; $scr
 & $inst -Role host -GameDir $root | Out-Null
 $ini = Get-Content "$win64\tow2coop.ini"
 Check ((Test-Path "$win64\dsound.dll") -and (Test-Path "$win64\tow2coop.dll") -and ($ini -contains 'role=host') -and ($ini -contains 'transport=steam')) 'host install places the loader, the mod, role=host over Steam'
+& $inst -GameDir $root | Out-Null
+$ini = Get-Content "$win64\tow2coop.ini"
+Check (($ini -contains 'role=auto') -and ($ini -contains 'transport=steam')) 'no role given: role=auto over Steam (host or join from the main menu)'
+$refused = $false; try { & $inst -Transport udp -GameDir $root | Out-Null } catch { $refused = $true }
+Check $refused 'direct IP without a role is refused (the menu choice is for Steam)'
 $name = "Zo$([char]0xEB) $([char]0xDC)nder"  # built from code points: Windows PowerShell reads this file as ANSI
 & $inst -Role client -Friend $name -GameDir $root | Out-Null
 $raw = [IO.File]::ReadAllBytes("$win64\tow2coop.ini")

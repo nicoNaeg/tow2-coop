@@ -535,6 +535,25 @@ static void write_one(const FProperty* p, const std::string& t, uint8_t* a, cons
         memcpy(a, &s, sizeof s);
         return;
     }
+    if (t == "TextProperty") {  // an FText the engine makes from the string (KismetTextLibrary.Conv_StringToText)
+        if (!param) throw std::runtime_error(field_name(p) + ": texts can only be passed as call arguments");
+        static UObject* lib = nullptr;
+        static UFunction* conv = nullptr;
+        if (!conv)
+            if (UClass* k = find_class("/Script/Engine.KismetTextLibrary")) lib = cdo(k), conv = find_func(k, "Conv_StringToText");
+        FProperty* in = conv ? find_prop(reinterpret_cast<const UStruct*>(conv), "InString") : nullptr;
+        FProperty* out = conv ? find_prop(reinterpret_cast<const UStruct*>(conv), "ReturnValue") : nullptr;
+        if (!in || !out || prop_size(out) != prop_size(p) || prop_offset(out) + prop_size(out) > 128) throw std::runtime_error(field_name(p) + ": no text conversion");
+        keep.strings.push_back(wide(v.asString()));
+        std::wstring& w = keep.strings.back();
+        FString s{&w[0], static_cast<int32_t>(w.size() + 1), static_cast<int32_t>(w.size() + 1)};
+        if (w.empty()) s = FString{};
+        alignas(16) uint8_t b[128] = {};
+        memcpy(b + prop_offset(in), &s, sizeof s);
+        process_event(lib, conv, b);
+        memcpy(a, b + prop_offset(out), prop_size(p));  // its reference is never released: a few bytes per call (labels)
+        return;
+    }
     if (t == "ObjectProperty" || t == "ClassProperty") {
         UObject* o = nullptr;
         if (!v.isNull() && !(v.isString() && (v.str().empty() || ieq(v.str(), "None") || ieq(v.str(), "null")))) {

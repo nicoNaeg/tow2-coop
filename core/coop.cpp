@@ -29,6 +29,21 @@ namespace coop {
 using json = coopbridge::json::Value;
 std::atomic<int> watch_count{0};
 void* watch[8];
+// The local player's weapon events, counted from the calls of its weapon's visuals (TriggerEventBP, probe 92).
+std::atomic<void*> my_weapon{nullptr};
+std::atomic<uint32_t> ev_frame{1};
+std::atomic<uint8_t> my_shots{0}, my_swings{0}, my_swing_kind{0}, my_reloads{0};
+std::atomic<bool> my_aiming{false};
+uint32_t trigger_event_name = 0;
+uint32_t ev_seen[128];
+uint32_t ev_log[32];            // test bridge: the last weapon events heard (frame << 8 | event), before de-duplication
+std::atomic<uint32_t> ev_log_n{0};
+// The co-op menu (main menu): its digit keys and clicks, from the window procedure.
+std::atomic<int> menu_key{0}, menu_own{0};  // a digit pressed; ours: that digit (level 0) or -1 (all: our choices shown)
+std::atomic<uint64_t> menu_click{0}, menu_client{0};  // a left click: client x << 32 | y; the client area's size
+std::atomic<bool> menu_clicked{false}, menu_listen{false};
+std::atomic<uint32_t> menu_held{0};      // digits whose key-down the menu took: their character and release too
+extern bool damage_hooked;  // the game's damage function is hooked (below): the stand-in may fire for real
 namespace {
 // ---------------------------------------------------------------- interactions (doors, containers): shared state
 // Rules: door state is shared (either player opens, closes or locks; the other world follows); container contents are
@@ -58,9 +73,9 @@ struct Outgoing {
     double at[3];
     int sent;
 };
-constexpr uint32_t kMagic = 0x33433254;  // "T2C3": the last character is the protocol version, bump it on any packet change
-constexpr const char* kVersion = "0.2.0-beta.6";
-constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13, kTravel = 14, kClock = 15, kCombat = 16;
+constexpr uint32_t kMagic = 0x34433254;  // "T2C4": the last character is the protocol version, bump it on any packet change
+constexpr const char* kVersion = "0.3.0";
+constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13, kTravel = 14, kClock = 15, kCombat = 16, kSpawns = 17, kSpawnOffers = 18, kWeaponMods = 19;
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";
 
@@ -75,7 +90,9 @@ struct State {
     double px, py, pz;
     float yaw, pitch, vx, vy, vz;
     uint32_t map_hash;
-    uint8_t flags;  // bit 0: this player is dying or dead (its stand-in leaves the fights)
+    uint8_t flags;  // bit 0: this player is dying or dead (its stand-in leaves the fights); 1: weapon drawn; 2: aiming; 3: crouched
+    uint8_t shots, swings, swing_kind, reloads;  // wrapping counts of the player's weapon events: its stand-in plays them
+    float ax, ay, az;                            // where the player's last shot ended: the stand-in's shot goes there
 };
 // Host -> client: authoritative NPC state. Ids are a 64-bit hash of the actor's path, which is the same in every
 // world for level-placed (World Partition, "_UAID_") actors.
@@ -124,6 +141,7 @@ struct Damage {
 struct Look {
     char item[2][256];
     uint8_t helmet_shown;
+    char weapon[256];  // the class of the weapon in hand ("" = none)
 };
 struct FacePart { uint32_t version; uint8_t part, parts; uint16_t len; char text[1100]; };  // one piece of a player's look
 struct TravelMsg {
@@ -160,6 +178,17 @@ struct Snapshot {
     float yaw;
 };
 
+struct Spawned {  // an NPC the game spawned during play, shared by its class and place
+    std::string cls;
+    float p[3] = {}, yaw = 0;
+    double first = 0, seen = 0;               // first heard of / last announced (the other world's grace, its end)
+    ue::UObject* actor = nullptr;             // this world's actor (identity: its class)
+    ue::UClass* actor_cls = nullptr;
+    bool copy = false;                        // spawned by the mod (a client's copy goes when the host's is gone)
+    uint64_t offer = 0;                       // host: the client's offer it answers
+};
+struct SpawnOffer { std::string cls; float p[3] = {}, yaw = 0; double first = 0, seen = 0; };
+
 struct Ctx {
     bool on = false, host = false;
     SOCKET s = INVALID_SOCKET;
@@ -185,7 +214,7 @@ struct Ctx {
     ue::UClass* character_class = nullptr;
     double next_npc_send = 0;
     uint64_t npc_eased = 0, npc_fight_snapped = 0;
-    uint64_t npc_sent = 0, npc_applied = 0, npc_killed = 0, npc_snapped = 0, dmg_sent = 0, dmg_applied = 0, drops = 0, map_changes = 0;
+    uint64_t npc_sent = 0, npc_applied = 0, npc_killed = 0, npc_snapped = 0, dmg_sent = 0, dmg_applied = 0, dmg_not_mine = 0, drops = 0, map_changes = 0;
     double settle_until = 0, next_tame = 0;
     bool arrived_by_travel = false;  // this world came with a travel (the TravelManager still had a destination)
     // resync: the host hands its campaign over again (save + TCP) when the client cannot follow (map, quest outcome)
@@ -197,6 +226,33 @@ struct Ctx {
     std::vector<std::pair<ue::UClass*, double>> my_removals;  // items that just left the local player's inventory  // push_ready_at: gameplay seen + 2 s
     uintptr_t snapped_world = 0;  // client: the world where it was put next to the host after a hand-over
     bool puppet_in_air = false;
+    // The other player's weapon on the stand-in: what arrived, what the stand-in did with it (gestures)
+    std::string look_weapon, standin_weapon_path, my_weapon_path;
+    ue::UObject* standin_weapon = nullptr;  // the weapon given to the stand-in (identity: its class path)
+    bool standin_drawn = true, standin_aiming = false, trigger_down = false, gestures_synced = false, my_drawn = false;
+    uint8_t peer_flags = 0, peer_shots = 0, peer_swings = 0, peer_swing_kind = 0, peer_reloads = 0;
+    uint8_t done_shots = 0, done_swings = 0, done_reloads = 0, sent_shots = 0;
+    float peer_pitch = 0, peer_aim[3] = {}, my_aim[3] = {};
+    double peer_shot_at = -10, next_orient = 0, next_weapon_try = 0, shot_wait_since = -1, aimed_at = -10;
+    uint64_t standin_shots = 0, standin_swings = 0, standin_reloads = 0, standin_dmg_blocked = 0, weapon_changes = 0;
+    std::string look_mods_for, standin_mods_applied;  // the other player's weapon (path) its mods below belong to; applied
+    std::vector<std::string> look_weapon_mods;
+    bool standin_crouched = false, my_crouched = false;
+    double crouch_tick_until = 0;                     // the stand-in's movement component ticks until then (its crouch)
+    double crouch_since = 0, next_crouch_ask = 0, next_crouch_retry = 0;
+    float standin_half = 0, standin_half_crouched = 0;  // its capsule's half height standing (read at spawn), crouched
+    uint64_t standin_mods_installed = 0, standin_crouches = 0, crouch_misses = 0;
+    // Enemies the game spawned during play, shared (see "enemies the game spawns during play")
+    std::unordered_map<uint64_t, Spawned> spawned;        // by shared id (the host's)
+    std::unordered_map<ue::UObject*, uint64_t> spawn_ids; // client: this world's actor -> shared id (the scan registers it)
+    std::unordered_map<ue::UObject*, double> native_first; // client: when this world's own spawned one was first seen
+    std::vector<ue::UObject*> natives, natives_scan;      // this world's spawned NPCs (not placed, not companions or the stand-in)
+    std::unordered_map<uint64_t, SpawnOffer> offers;      // host: the client's own ones, by its key
+    double next_spawn_send = 0;
+    // The co-op menu: the player picks host or join in the main menu (role "auto")
+    bool menu_mode = false, role_chosen = true, start_host = false;
+    uint64_t join_target = 0, menu_picks = 0;  // join_target: the Steam friend picked in the menu
+    uint64_t spawn_copies = 0, spawn_matched = 0, spawn_removed = 0;
     int resync_sends = 0;
     uint64_t resyncs = 0, resync_requests = 0, resync_fetches = 0;
     bool watches_set = false;
@@ -428,14 +484,20 @@ void scan_step(ue::UObject* pawn) {
         }
         if (!ue::is_a(o, g.character_class) || !ue::alive(o)) continue;
         std::string path = ue::path_of(o);
+        static ue::UClass* ai_class = ue::find_class("/Script/Arkansas.IndianaAiCharacter");
+        uint64_t id = 0;
         if (path.find("_UAID_") == std::string::npos) {  // only level-placed actors have the same name everywhere
-            if (o != g.puppet && is_companion(o)) g.party_scan[fnv64("party:" + ue::class_name(o))] = o;  // and companions, by class
-            continue;
+            if (is_companion(o)) { g.party_scan[fnv64("party:" + ue::class_name(o))] = o; continue; }  // companions, by class
+            if (!ai_class || !ue::is_a(o, ai_class)) continue;
+            g.natives_scan.push_back(o);  // spawned during play: shared by class and place, under the host's id
+            if (g.host) id = fnv64("spawn:" + path);
+            else if (auto s = g.spawn_ids.find(o); s != g.spawn_ids.end()) id = s->second;
+            if (!id) continue;
+        } else {
+            id = fnv64(path);
         }
         ue::UObject* hc = ue::resolve(ue::addr(o) + ".HealthComponent");
         if (!hc) continue;
-        uint64_t id = fnv64(path);
-        static ue::UClass* ai_class = ue::find_class("/Script/Arkansas.IndianaAiCharacter");
         Npc n;  // its live state (health, damage, fight, pin) joins it when the registries swap
         n.actor = o, n.health = hc;
         n.cls = ue::class_of(o), n.health_cls = ue::class_of(hc);
@@ -459,6 +521,8 @@ void scan_step(ue::UObject* pawn) {
         g.scanning.clear();
         g.party.swap(g.party_scan);
         g.party_scan.clear();
+        g.natives.swap(g.natives_scan);
+        g.natives_scan.clear();
         g.interactables.swap(g.inter_scan);
         g.inter_scan.clear();
         g.scan_cursor = 0;
@@ -888,6 +952,23 @@ void host_apply_combat(const CombatMsg& m) {
     }
 }
 
+bool hit_by(Npc& n, ue::UObject* pawn) {  // the NPC's last hit came from that pawn (HealthComponent's last instigator)
+    static Fn last;
+    if (!pawn || !base_fn(last, "/Script/Arkansas.HealthComponent", "GetLastHitInstigator")) return true;  // unknown: as before
+    alignas(16) uint8_t b[32] = {};
+    ue::process_event(n.health, last.f, b);
+    ue::UObject* who = nullptr;
+    memcpy(&who, b + last.off("ReturnValue"), 8);
+    if (!who || who == pawn) return true;  // none recorded: counted, as before
+    std::string err;
+    if (who == ue::resolve(ue::addr(pawn) + ".Controller", &err)) return true;
+    static ue::UClass* actor_k = ue::find_class("/Script/Engine.Actor");
+    if (!actor_k || !ue::alive(who) || !ue::is_a(who, actor_k)) return false;
+    for (const char* f : {".Owner", ".Instigator"})  // a projectile or a thrown thing of ours
+        if (ue::resolve(ue::addr(who) + f, &err) == pawn) return true;
+    return false;
+}
+
 void apply_npcs(const Enemies& e) {
     if (e.map_hash != g.my_map) return;
     g.peer_fight = e.fight != 0, g.peer_fight_at = g.now;
@@ -898,8 +979,12 @@ void apply_npcs(const Enemies& e) {
         if (it == g.npcs.end() || !npc_live(it->second)) continue;
         Npc& n = it->second;
         float local = npc_health(n);
-        if (n.host_health >= 0 && local < n.host_health - 0.5f && local < r.health - 0.5f)
-            n.pending_damage += n.host_health - local;  // our player hit it since the last update: tell the host
+        if (n.host_health >= 0 && local < n.host_health - 0.5f && local < r.health - 0.5f) {
+            // Our player hit it since the last update: tell the host. A companion's or another NPC's hit is not ours:
+            // the host's world has its own (run 118: 106 such reports in 20 s of a fight the client stayed out of).
+            if (hit_by(n, pawn)) n.pending_damage += n.host_health - local;
+            else g.dmg_not_mine++;
+        }
         if (r.dead && local > 0) { npc_kill(n); g.npc_killed++; }
         else if (!r.dead && std::fabs(local - r.health) > 0.5f) npc_set_health(n, r.health);
         n.host_health = r.health;
@@ -1031,11 +1116,14 @@ void setup_watches() {
     uint32_t b = ue::make_name("HandleItemRemoved", false).index;  // door state changes go through a native delegate: polled
     uint32_t c = ue::make_name("ItemRemoved", false).index;          // IndianaCharacter.ItemRemoved: a dead NPC looted
     uint32_t d = ue::make_name("OnItemCountChangedInInventory", false).index;  // part of the player's stack left (run 70)
+    uint32_t t = ue::make_name("TriggerEventBP", false).index;  // a weapon's visuals hear its events: fire, swing, reload
     if (!b || !c || !d) return;
     watch[0] = reinterpret_cast<void*>(static_cast<uintptr_t>(b));
     watch[1] = reinterpret_cast<void*>(static_cast<uintptr_t>(c));
     watch[2] = reinterpret_cast<void*>(static_cast<uintptr_t>(d));
-    watch_count.store(3, std::memory_order_release);
+    watch[3] = reinterpret_cast<void*>(static_cast<uintptr_t>(t));
+    trigger_event_name = t;
+    watch_count.store(t ? 4 : 3, std::memory_order_release);
     g.watches_set = true;
 }
 
@@ -1543,6 +1631,31 @@ HWND game_hwnd = nullptr;
 
 LRESULT CALLBACK key_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if (msg == WM_KEYDOWN && w == 'E' && !(l & (1 << 30))) give_key = true;  // a new press (bit 30: a repeat)
+    if (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_CHAR) {  // the co-op menu's digits (main menu)
+        int d = msg == WM_CHAR ? (w >= '1' && w <= '9' ? static_cast<int>(w - '0') : 0)
+              : w >= '1' && w <= '9' ? static_cast<int>(w - '0') : w >= VK_NUMPAD1 && w <= VK_NUMPAD9 ? static_cast<int>(w - VK_NUMPAD0) : 0;
+        int own = menu_own.load(std::memory_order_relaxed);
+        uint32_t bit = d ? 1u << d : 0;
+        if (d && msg == WM_KEYDOWN && menu_listen.load(std::memory_order_relaxed) && (own < 0 || d == own)) {
+            if (!(l & (1 << 30))) menu_key = d;
+            menu_held |= bit;
+            return 0;  // ours: the game's (hidden) choices never see it
+        }
+        if (d && (menu_held.load() & bit)) {  // its character and its release too (the game picks a choice on release)
+            if (msg == WM_KEYUP) menu_held &= ~bit;
+            return 0;
+        }
+    }
+    if (menu_listen.load(std::memory_order_relaxed)) {  // the co-op menu is shown: a click is checked against its choices
+        if (msg == WM_LBUTTONUP) {
+            int x = static_cast<short>(LOWORD(l)), y = static_cast<short>(HIWORD(l));  // client pixels (physical)
+            RECT rc{};
+            GetClientRect(h, &rc);  // the viewport renders at its own size into it (150 % display: 960 x 540 into 1440 x 810)
+            menu_click = static_cast<uint64_t>(static_cast<uint32_t>(x)) << 32 | static_cast<uint32_t>(y);
+            menu_client = static_cast<uint64_t>(static_cast<uint32_t>(rc.right)) << 32 | static_cast<uint32_t>(rc.bottom);
+            menu_clicked = true;
+        }
+    }
     return game_proc ? CallWindowProcW(game_proc, h, msg, w, l) : DefWindowProcW(h, msg, w, l);
 }
 
@@ -2043,6 +2156,9 @@ void on_load_started(const std::wstring& name, uint8_t result) {
 
 namespace {
 // One datagram from the other player: UDP gives its address (from), Steam its SteamID (from_id).
+void on_spawns(const char* b, int n);  // enemies the game spawns during play, below
+void on_offers(const char* b, int n);
+
 void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t from_id) {
     if (n < static_cast<int>(sizeof(Header))) { g.bad++; return; }
     Header h;
@@ -2140,6 +2256,21 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
         return;
     }
     if (h.type == kAppearance) { on_face(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }
+    if (h.type == kSpawns) { if (!g.host) on_spawns(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }
+    if (h.type == kWeaponMods) {  // the other player's weapon, then its mods, one class path per line
+        std::string body(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)));
+        std::vector<std::string> lines;
+        for (size_t at = 0; at <= body.size() && lines.size() < 16;) {
+            size_t e = body.find('\n', at);
+            if (e == std::string::npos) e = body.size();
+            lines.push_back(body.substr(at, e - at));
+            at = e + 1;
+        }
+        g.look_mods_for = lines.empty() ? std::string() : lines[0];
+        g.look_weapon_mods.assign(lines.size() > 1 ? lines.begin() + 1 : lines.end(), lines.end());
+        return;
+    }
+    if (h.type == kSpawnOffers) { if (g.host) on_offers(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }
     if (h.type == kClock && !g.host) {
         float hour;
         if (n != static_cast<int>(sizeof(Header)) + 4) { g.bad++; return; }
@@ -2152,6 +2283,7 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
         Look l;
         memcpy(&l, buf + sizeof(Header), sizeof l);
         for (int i = 0; i < 2; i++) g.look[i].assign(l.item[i], strnlen(l.item[i], sizeof l.item[i]));
+        g.look_weapon.assign(l.weapon, strnlen(l.weapon, sizeof l.weapon));
         g.look_helmet_shown = l.helmet_shown != 0;
         g.have_look = true;
         g.recv++;
@@ -2173,6 +2305,13 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
     g.snaps.push_back({g.now, st.px, st.py, st.pz, st.vx, st.vy, st.vz, st.yaw});
     g.puppet_map = st.map_hash;
     g.peer_dead = (st.flags & 1) != 0;
+    g.peer_flags = st.flags, g.peer_pitch = st.pitch;
+    if (!g.gestures_synced) g.done_shots = st.shots, g.done_swings = st.swings, g.done_reloads = st.reloads, g.gestures_synced = true;
+    if (st.shots != g.peer_shots) {  // a new shot: aim there now
+        g.peer_shot_at = g.now, g.next_orient = 0;
+        g.peer_aim[0] = st.ax, g.peer_aim[1] = st.ay, g.peer_aim[2] = st.az;
+    }
+    g.peer_shots = st.shots, g.peer_swings = st.swings, g.peer_swing_kind = st.swing_kind, g.peer_reloads = st.reloads;
     while (g.snaps.size() > 64) g.snaps.pop_front();
 }
 
@@ -2408,7 +2547,17 @@ void send_look() {
         if (p.size() < sizeof l.item[i]) memcpy(l.item[i], p.data(), p.size());  // never cut: a cut path names no class
     }
     l.helmet_shown = helmet_shown(eq) ? 1 : 0;
+    if (g.my_weapon_path.size() < sizeof l.weapon) memcpy(l.weapon, g.my_weapon_path.data(), g.my_weapon_path.size());
     send_typed(kLook, &l, sizeof l);
+    // The weapon's mods (a silencer, a scope: they change its look): their class paths, after the weapon's own.
+    std::string mods = g.my_weapon_path;
+    if (ue::UObject* w = static_cast<ue::UObject*>(my_weapon.load()))
+        if (ue::alive(w))
+            for (ue::UClass* m : mods_of(w)) {
+                std::string p = ue::path_of(m);
+                if (mods.size() + p.size() + 1 < 1300) mods += "\n" + p;
+            }
+    send_typed(kWeaponMods, mods.data(), static_cast<int>(mods.size()));
 }
 
 // The joined client plays a copy of the host's character, so the stand-in takes the local player's look: the
@@ -2451,7 +2600,7 @@ void tame_puppet(bool full) {
     // slid in a frozen pose in the two-PC test. Off, the written velocity drives the walk (probe 56: speed 0 -> 400).
     json no = json::object();
     no.set("bEnabled", false);
-    call_quiet(p + ".CharacterMovement", "SetComponentTickEnabled", no);
+    if (g.now >= g.crouch_tick_until) call_quiet(p + ".CharacterMovement", "SetComponentTickEnabled", no);  // (a crouch: on a moment)
     if (!full) return;
     try { dress_puppet(); } catch (const std::exception& e) { g.last_error = std::string("dress: ") + e.what(); }
     call_quiet(p + ".Controller", "StopMovement", json::object());
@@ -2472,6 +2621,35 @@ void destroy_puppet() {
         try { ue::call(g.puppet, ue::find_func(ue::class_of(g.puppet), "K2_DestroyActor"), json::object()); } catch (...) {}
     }
     g.puppet = nullptr;
+    g.standin_weapon = nullptr, g.standin_weapon_path.clear(), g.standin_drawn = true, g.standin_aiming = false, g.trigger_down = false;
+    g.standin_mods_applied.clear(), g.standin_crouched = false, g.crouch_tick_until = 0, g.next_crouch_retry = 0;
+    g.standin_half = 0, g.standin_half_crouched = 0;
+}
+
+// A deferred spawn of `cls`, kept out of the saves: the flag only counts before the actor finishes spawning (run 32:
+// set afterwards, the save still kept the stand-in).
+ue::UObject* spawn_actor(ue::UClass* cls, const double p[3], double yaw_deg, const char* collision) {
+    std::string err;
+    ue::UObject* world_ctx = ue::resolve("pc", &err);
+    ue::UObject* gs = ue::cdo(ue::find_class("/Script/Engine.GameplayStatics"));
+    json xf = json::object(), tr = json::array(), rot = json::object(), sc = json::array();
+    tr.push(p[0]).push(p[1]).push(p[2]);
+    double yaw = yaw_deg * 3.14159265358979 / 180.0;
+    rot.set("X", 0.0).set("Y", 0.0).set("Z", std::sin(yaw / 2)).set("W", std::cos(yaw / 2));
+    sc.push(1.0).push(1.0).push(1.0);
+    xf.set("Rotation", rot).set("Translation", tr).set("Scale3D", sc);
+    json a = json::object();
+    a.set("WorldContextObject", ue::addr(world_ctx)).set("ActorClass", ue::addr(cls)).set("SpawnTransform", xf);
+    a.set("CollisionHandlingOverride", collision);
+    json r = ue::call(gs, ue::find_func(ue::class_of(gs), "BeginDeferredActorSpawnFromClass"), a);
+    std::string ref = r.get("ReturnValue").asString();
+    ue::UObject* actor = ref.rfind("0x", 0) == 0 ? reinterpret_cast<ue::UObject*>(static_cast<uintptr_t>(strtoull(ref.c_str(), nullptr, 16))) : nullptr;
+    if (!actor || !ue::alive(actor)) { g.last_error = "deferred spawn returned " + ref; return nullptr; }
+    ue::set_path(ue::addr(actor) + ".bShouldSaveGameState", json(false));
+    json f = json::object();
+    f.set("Actor", ue::addr(actor)).set("SpawnTransform", xf);
+    ue::call(gs, ue::find_func(ue::class_of(gs), "FinishSpawningActor"), f);
+    return actor;
 }
 
 bool spawn_puppet(const Snapshot& s) {
@@ -2482,36 +2660,571 @@ bool spawn_puppet(const Snapshot& s) {
     const char* klass = gender.asString().find("Female") != std::string::npos ? kPuppetClassFemale : kPuppetClass;
     ue::UClass* cls = load_class(klass);
     if (!cls) { g.last_error = "puppet class not loaded"; return false; }
-    std::string err;
-    ue::UObject* world_ctx = ue::resolve("pc", &err);
-    ue::UObject* gs = ue::cdo(ue::find_class("/Script/Engine.GameplayStatics"));
-    json xf = json::object(), tr = json::array(), rot = json::object(), sc = json::array();
-    tr.push(s.px).push(s.py).push(s.pz);
-    double yaw = s.yaw * 3.14159265358979 / 180.0;
-    rot.set("X", 0.0).set("Y", 0.0).set("Z", std::sin(yaw / 2)).set("W", std::cos(yaw / 2));
-    sc.push(1.0).push(1.0).push(1.0);
-    xf.set("Rotation", rot).set("Translation", tr).set("Scale3D", sc);
-    json a = json::object();
-    a.set("WorldContextObject", ue::addr(world_ctx)).set("ActorClass", ue::addr(cls)).set("SpawnTransform", xf);
-    a.set("CollisionHandlingOverride", "AlwaysSpawn");
-    json r = ue::call(gs, ue::find_func(ue::class_of(gs), "BeginDeferredActorSpawnFromClass"), a);
-    std::string ref = r.get("ReturnValue").asString();
-    ue::UObject* actor = ref.rfind("0x", 0) == 0 ? reinterpret_cast<ue::UObject*>(static_cast<uintptr_t>(strtoull(ref.c_str(), nullptr, 16))) : nullptr;
-    if (!actor || !ue::alive(actor)) { g.last_error = "deferred spawn returned " + ref; return false; }
-    // Keep the stand-in out of the host's saves (else every save made during co-op holds an extra dock worker). The
-    // flag only counts before the actor finishes spawning (run 32: off afterwards, the save still kept it).
-    ue::set_path(ue::addr(actor) + ".bShouldSaveGameState", json(false));
-    json f = json::object();
-    f.set("Actor", ue::addr(actor)).set("SpawnTransform", xf);
-    ue::call(gs, ue::find_func(ue::class_of(gs), "FinishSpawningActor"), f);
+    double at[3] = {s.px, s.py, s.pz};
+    ue::UObject* actor = spawn_actor(cls, at, s.yaw, "AlwaysSpawn");  // out of the host's saves: no extra dock worker in them
+    if (!actor) return false;
     // The NPC keeps its own AI controller (game systems expect NPCs to have one; a controller-less puppet is a null
     // dereference waiting to happen), but its behaviour is stopped and it can't be talked to, targeted or killed.
     ue::set_path(ue::addr(actor) + ".CharacterMovement.MovementMode", "MOVE_Walking");
     g.puppet = actor;
     g.puppet_cls = ue::class_of(actor);
     g.puppet_in_air = false;
+    g.standin_weapon = nullptr, g.standin_weapon_path.clear(), g.standin_drawn = true, g.standin_aiming = false, g.trigger_down = false;
+    g.standin_mods_applied.clear(), g.standin_crouched = false, g.crouch_tick_until = 0, g.next_crouch_retry = 0;
+    g.standin_half = 0, g.standin_half_crouched = 0;
     tame_puppet(true);
     return true;
+}
+
+// ---------------------------------------------------------------- enemies the game spawns during play
+// A level-placed NPC has the same name in both worlds; one the game spawns during play (a hive, a hatch, a door, a
+// summon) does not. Each world tells the other about its own hostile ones (class, place); the host gives the shared
+// id. The other world takes one of its own of that class within 15 m (both worlds spawned it), else spawns a copy
+// after 1.5 s. Then it is in the NPC registry like a placed one: health and death from the host, fights shared.
+constexpr float kSpawnMatch = 1500;
+constexpr double kSpawnGrace = 1.5, kSpawnGone = 5.0;
+
+struct SpawnRec { uint64_t id; std::string cls; float p[3]; float yaw; };
+
+bool hostile_to(ue::UObject* npc, ue::UObject* pawn) {
+    static Fn att;
+    static ue::UObject* lib = nullptr;
+    if (!lib)
+        if (ue::UClass* k = ue::find_class("/Script/Arkansas.CharacterBlueprintFunctionLibrary")) lib = ue::cdo(k);
+    if (!pawn || !lib || !base_fn(att, "/Script/Arkansas.CharacterBlueprintFunctionLibrary", "GetTeamAttitudeTowards")) return false;
+    alignas(16) uint8_t b[64] = {};
+    memcpy(b + att.off("Character"), &npc, 8);
+    memcpy(b + att.off("Other"), &pawn, 8);
+    ue::process_event(lib, att.f, b);
+    return b[att.off("ReturnValue")] == 2;  // ETeamAttitude::Hostile
+}
+
+bool actor_place(ue::UObject* a, float p[3], float& yaw) {
+    double pos[3], v[3];
+    float pitch = 0;
+    if (!read_transform(a, pos, yaw, pitch, v)) return false;
+    for (int i = 0; i < 3; i++) p[i] = static_cast<float>(pos[i]);
+    return true;
+}
+
+float dist_f(const float a[3], const float b[3]) {
+    return std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
+}
+
+void send_spawn_recs(uint16_t type, const std::vector<SpawnRec>& recs) {  // [count] {id, place, yaw, len, class}...
+    char body[1400];
+    int n = 1, count = 0;
+    auto flush = [&]() {
+        if (count) body[0] = static_cast<char>(count), send_typed(type, body, n);
+        n = 1, count = 0;
+    };
+    for (const SpawnRec& r : recs) {
+        if (r.cls.size() > 200) continue;
+        int need = 25 + static_cast<int>(r.cls.size());
+        if (n + need > static_cast<int>(sizeof body) || count == 255) flush();
+        memcpy(body + n, &r.id, 8);
+        memcpy(body + n + 8, r.p, 12);
+        memcpy(body + n + 20, &r.yaw, 4);
+        body[n + 24] = static_cast<char>(r.cls.size());
+        memcpy(body + n + 25, r.cls.data(), r.cls.size());
+        n += need, count++;
+    }
+    flush();
+}
+
+std::vector<SpawnRec> parse_spawn_recs(const char* b, int n) {  // from the other player (trust boundary): bounds-checked
+    std::vector<SpawnRec> out;
+    int count = n >= 1 ? static_cast<uint8_t>(b[0]) : 0, at = 1;
+    for (int i = 0; i < count && at + 25 <= n; i++) {
+        SpawnRec r;
+        memcpy(&r.id, b + at, 8);
+        memcpy(r.p, b + at + 8, 12);
+        memcpy(&r.yaw, b + at + 20, 4);
+        int len = static_cast<uint8_t>(b[at + 24]);
+        if (at + 25 + len > n) break;
+        r.cls.assign(b + at + 25, len);
+        at += 25 + len;
+        if (std::isfinite(r.p[0]) && std::isfinite(r.p[1]) && std::isfinite(r.p[2]) && std::isfinite(r.yaw)) out.push_back(r);
+    }
+    return out;
+}
+
+// A copy of an NPC the other world spawned. Its class comes from the other player (trust boundary): a /Game/ NPC class.
+ue::UObject* spawn_copy(const std::string& cls_path, const float p[3], float yaw) {
+    if (cls_path.rfind("/Game/", 0) != 0 || cls_path.find(' ') != std::string::npos) return nullptr;
+    static ue::UClass* ai_k = ue::find_class("/Script/Arkansas.IndianaAiCharacter");
+    ue::UClass* cls = load_class(cls_path);
+    if (!cls || !ai_k || !ue::cdo(cls) || !ue::is_a(ue::cdo(cls), ai_k)) return nullptr;
+    double at[3] = {p[0], p[1], p[2]};
+    ue::UObject* a = spawn_actor(cls, at, yaw, "AdjustIfPossibleButAlwaysSpawn");
+    if (!a) return nullptr;
+    std::string err;
+    if (!ue::resolve(ue::addr(a) + ".Controller", &err)) call_quiet(ue::addr(a), "SpawnDefaultController", json::object());  // its AI
+    return a;
+}
+
+void destroy_actor(ue::UObject* a) {
+    try { ue::call(a, ue::find_func(ue::class_of(a), "K2_DestroyActor"), json::object()); } catch (...) {}
+}
+
+bool spawned_live(const Spawned& s) { return s.actor && ue::alive(s.actor) && ue::class_of(s.actor) == s.actor_cls; }
+
+void on_spawns(const char* b, int n) {  // client: the host's list
+    for (const SpawnRec& r : parse_spawn_recs(b, n)) {
+        Spawned& s = g.spawned[r.id];
+        if (s.cls.empty()) s.first = g.now;
+        if (s.cls != r.cls && s.actor) g.spawn_ids.erase(s.actor), s.actor = nullptr;
+        s.cls = r.cls, s.yaw = r.yaw, s.seen = g.now;
+        memcpy(s.p, r.p, 12);
+    }
+}
+
+void on_offers(const char* b, int n) {  // host: the client's own spawned enemies it has no shared id for yet
+    for (const SpawnRec& r : parse_spawn_recs(b, n)) {
+        SpawnOffer& o = g.offers[r.id];
+        if (o.cls.empty()) o.first = g.now;
+        o.cls = r.cls, o.yaw = r.yaw, o.seen = g.now;
+        memcpy(o.p, r.p, 12);
+    }
+}
+
+void host_spawned(ue::UObject* pawn) {
+    for (ue::UObject* o : g.natives) {  // ours: the hostile ones get a shared id (a quest's friend comes with the story)
+        if (!ue::alive(o)) continue;
+        uint64_t id = fnv64("spawn:" + ue::path_of(o));
+        auto it = g.spawned.find(id);
+        if (it == g.spawned.end()) {
+            if (!hostile_to(o, pawn)) continue;
+            Spawned s;
+            s.first = g.now, s.cls = ue::path_of(ue::class_of(o)), s.actor = o, s.actor_cls = ue::class_of(o);
+            it = g.spawned.emplace(id, s).first;
+            core_log("spawned: the game spawned a " + s.cls.substr(s.cls.rfind('.') + 1) + ", shared with the other player");
+        }
+        if (it->second.actor != o) continue;
+        it->second.seen = g.now;
+        actor_place(o, it->second.p, it->second.yaw);
+    }
+    for (auto it = g.offers.begin(); it != g.offers.end();) {  // the client's: one of ours of that class nearby, else a copy
+        SpawnOffer& off = it->second;
+        if (g.now - off.seen > kSpawnGone) { it = g.offers.erase(it); continue; }
+        bool answered = false;
+        for (auto& kv : g.spawned) answered = answered || kv.second.offer == it->first;
+        if (!answered) {
+            Spawned* mine = nullptr;
+            for (auto& kv : g.spawned)
+                if (!kv.second.offer && kv.second.cls == off.cls && dist_f(kv.second.p, off.p) < kSpawnMatch) { mine = &kv.second; break; }
+            if (mine) {
+                mine->offer = it->first, g.spawn_matched++;
+            } else if (g.now - off.first >= kSpawnGrace) {
+                if (ue::UObject* a = spawn_copy(off.cls, off.p, off.yaw)) {
+                    Spawned s;
+                    s.first = s.seen = g.now, s.cls = off.cls, s.yaw = off.yaw, s.actor = a, s.actor_cls = ue::class_of(a), s.copy = true, s.offer = it->first;
+                    memcpy(s.p, off.p, 12);
+                    g.spawned[fnv64("spawn:" + ue::path_of(a))] = s;
+                    g.spawn_copies++;
+                    core_log("spawned: a copy of the other player's " + off.cls.substr(off.cls.rfind('.') + 1));
+                } else {
+                    off.first = g.now + 30;  // not an NPC class here: not tried again for a while
+                }
+            }
+        }
+        ++it;
+    }
+    std::vector<SpawnRec> recs;
+    for (auto it = g.spawned.begin(); it != g.spawned.end();) {
+        if (!spawned_live(it->second)) { it = g.spawned.erase(it); g.spawn_removed++; continue; }  // the game removed it
+        double p[3] = {it->second.p[0], it->second.p[1], it->second.p[2]};
+        if (near_players(p, pawn)) recs.push_back({it->first, it->second.cls, {it->second.p[0], it->second.p[1], it->second.p[2]}, it->second.yaw});
+        ++it;
+    }
+    send_spawn_recs(kSpawns, recs);
+}
+
+void client_spawned(ue::UObject* pawn) {
+    for (auto it = g.spawned.begin(); it != g.spawned.end();) {
+        Spawned& s = it->second;
+        bool live = spawned_live(s);
+        if (g.now - s.seen > kSpawnGone) {  // the host's is gone: our copy goes too (one of our own stays the game's)
+            if (live && s.copy) destroy_actor(s.actor);
+            if (s.actor) g.spawn_ids.erase(s.actor);
+            it = g.spawned.erase(it), g.spawn_removed++;
+            continue;
+        }
+        if (!live) {
+            if (s.actor) g.spawn_ids.erase(s.actor);
+            s.actor = nullptr;
+            for (ue::UObject* o : g.natives) {  // one of ours of that class nearby: both worlds spawned it
+                float p[3], y = 0;
+                if (g.spawn_ids.count(o) || !ue::alive(o) || ue::path_of(ue::class_of(o)) != s.cls || !actor_place(o, p, y) || dist_f(p, s.p) >= kSpawnMatch) continue;
+                s.actor = o, s.actor_cls = ue::class_of(o), s.copy = false;
+                g.spawn_ids[o] = it->first, g.spawn_matched++;
+                break;
+            }
+            if (!s.actor && g.now - s.first >= kSpawnGrace)
+                if (ue::UObject* a = spawn_copy(s.cls, s.p, s.yaw)) {
+                    s.actor = a, s.actor_cls = ue::class_of(a), s.copy = true;
+                    g.spawn_ids[a] = it->first, g.spawn_copies++;
+                    core_log("spawned: a copy of the host's " + s.cls.substr(s.cls.rfind('.') + 1));
+                }
+        }
+        ++it;
+    }
+    std::vector<SpawnRec> offers;  // ours the host has no id for, after the grace
+    std::unordered_map<ue::UObject*, double> first;
+    for (ue::UObject* o : g.natives) {
+        if (g.spawn_ids.count(o) || !ue::alive(o)) continue;
+        auto f = g.native_first.find(o);
+        double t = f != g.native_first.end() ? f->second : g.now;
+        first[o] = t;
+        SpawnRec r;
+        r.id = fnv64(ue::path_of(o)), r.cls = ue::path_of(ue::class_of(o));
+        double p[3];
+        if (g.now - t < kSpawnGrace || !actor_place(o, r.p, r.yaw)) continue;
+        p[0] = r.p[0], p[1] = r.p[1], p[2] = r.p[2];
+        if (near_players(p, pawn) && hostile_to(o, pawn)) offers.push_back(r);
+    }
+    g.native_first.swap(first);
+    send_spawn_recs(kSpawnOffers, offers);
+}
+
+void spawned_frame(ue::UObject* pawn) {
+    if (!g.have_peer || !pawn || g.now < g.next_spawn_send) return;
+    g.next_spawn_send = g.now + 1.0;
+    if (g.host) host_spawned(pawn);
+    else client_spawned(pawn);
+}
+
+json spawn_test(const json& p) {  // test bridge, game thread: an NPC of a class spawned here, as the game would
+    std::string path = p.get("class").asString();
+    ue::UClass* cls = path.rfind("/Game/", 0) == 0 ? load_class(path) : nullptr;
+    if (!cls) throw std::runtime_error("no class " + path);
+    double at[3] = {p.get("x").asNumber(0), p.get("y").asNumber(0), p.get("z").asNumber(0)};
+    ue::UObject* a = spawn_actor(cls, at, p.get("yaw").asNumber(0), "AdjustIfPossibleButAlwaysSpawn");
+    if (!a) throw std::runtime_error(g.last_error);
+    std::string err;
+    if (!ue::resolve(ue::addr(a) + ".Controller", &err)) call_quiet(ue::addr(a), "SpawnDefaultController", json::object());
+    return json(ue::addr(a) + " " + ue::path_of(a));
+}
+
+json spawned_list() {  // test bridge, game thread: the shared spawned NPCs, by shared id
+    json out = json::array();
+    for (auto& kv : g.spawned) {
+        json r = json::object();
+        r.set("id", std::to_string(kv.first)).set("cls", kv.second.cls.substr(kv.second.cls.rfind('.') + 1)).set("copy", kv.second.copy);
+        r.set("actor", spawned_live(kv.second) ? ue::addr(kv.second.actor) : std::string("none")).set("offer", kv.second.offer != 0);
+        out.push(r);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- gestures (probe 92)
+// The local player's weapon in hand and its events go out with each state; the other world's stand-in plays them.
+void gestures_out(ue::UObject* pawn, State& st) {
+    static Fn cur, holstered, mode, end, crot;
+    ue::UObject* w = nullptr;
+    if (base_fn(cur, "/Script/Arkansas.OwBaseCharacter", "GetCurrentWeapon")) {
+        alignas(16) uint8_t b[64] = {};
+        ue::process_event(pawn, cur.f, b);
+        memcpy(&w, b + cur.off("ReturnValue"), 8);
+        if (w && !ue::alive(w)) w = nullptr;
+    }
+    my_weapon.store(w, std::memory_order_relaxed);
+    std::string path = w ? ue::path_of(ue::class_of(w)) : std::string();
+    if (path != g.my_weapon_path) g.my_weapon_path = path, g.next_look = 0;  // the other world's stand-in swaps at once
+    bool drawn = false;
+    if (w && base_fn(holstered, "/Script/Arkansas.Weapon", "IsHolstered")) {
+        alignas(16) uint8_t b[16] = {};
+        ue::process_event(w, holstered.f, b);
+        drawn = !b[holstered.off("ReturnValue")];
+    }
+    if (base_fn(crot, "/Script/Engine.Pawn", "GetControlRotation")) {  // the view's pitch (the body's is always 0)
+        alignas(16) uint8_t b[64] = {};
+        ue::process_event(pawn, crot.f, b);
+        double r[3];
+        memcpy(r, b + crot.off("ReturnValue"), 24);
+        st.pitch = static_cast<float>(std::remainder(r[0], 360.0));
+    }
+    g.my_drawn = drawn;
+    try { g.my_crouched = ue::eval_path(ue::addr(pawn) + ".bIsCrouched").asBool(false); } catch (const std::exception&) {}
+    st.flags |= (drawn ? 2 : 0) | (my_aiming.load() ? 4 : 0) | (g.my_crouched ? 8 : 0);
+    st.shots = my_shots.load(), st.swings = my_swings.load(), st.swing_kind = my_swing_kind.load(), st.reloads = my_reloads.load();
+    if (st.shots != g.sent_shots && w) {  // where that shot ended (the weapon's fire mode): the stand-in's goes there
+        g.sent_shots = st.shots;
+        static ue::UClass* fire_k = ue::find_class("/Script/Arkansas.FireMode");
+        ue::UObject* m = nullptr;
+        if (base_fn(mode, "/Script/Arkansas.Weapon", "GetCurrentMode")) {
+            alignas(16) uint8_t b[16] = {};
+            ue::process_event(w, mode.f, b);
+            memcpy(&m, b + mode.off("ReturnValue"), 8);
+        }
+        if (m && fire_k && ue::alive(m) && ue::is_a(m, fire_k) && base_fn(end, "/Script/Arkansas.FireMode", "GetLastShotEndLocation")) {
+            alignas(16) uint8_t b[32] = {};
+            ue::process_event(m, end.f, b);
+            double e[3];
+            memcpy(e, b + end.off("ReturnValue"), 24);
+            for (int i = 0; i < 3; i++) g.my_aim[i] = static_cast<float>(e[i]);
+        }
+    }
+    st.ax = g.my_aim[0], st.ay = g.my_aim[1], st.az = g.my_aim[2];
+}
+
+// The stand-in's weapon: the other player's class, given by its equipment component (the NPC then has that weapon's
+// NPC visuals and animations), with endless ammo. Identity: its class path (a freed object's slot is reused, run 106).
+ue::UObject* standin_weapon_now() {
+    if (g.standin_weapon && ue::alive(g.standin_weapon) && ue::path_of(ue::class_of(g.standin_weapon)) == g.standin_weapon_path) return g.standin_weapon;
+    g.standin_weapon = nullptr;
+    static Fn cur;
+    if (g.standin_weapon_path.empty() || !base_fn(cur, "/Script/Arkansas.OwBaseCharacter", "GetCurrentWeapon")) return nullptr;
+    alignas(16) uint8_t b[64] = {};
+    ue::process_event(g.puppet, cur.f, b);
+    ue::UObject* w = nullptr;
+    memcpy(&w, b + cur.off("ReturnValue"), 8);
+    if (!w || !ue::alive(w) || ue::path_of(ue::class_of(w)) != g.standin_weapon_path) return nullptr;
+    try { ue::set_path(ue::addr(w) + ".bIgnoresAmmoConsumption", json(true)); } catch (const std::exception&) {}
+    return g.standin_weapon = w;
+}
+
+ue::UObject* sequencer_lib() {  // the game's cinematic controls for an NPC (AISequencerBehaviors)
+    static ue::UObject* cdo = nullptr;
+    if (!cdo)
+        if (ue::UClass* k = ue::find_class("/Script/Arkansas.AISequencerBehaviors")) cdo = ue::cdo(k);
+    return cdo;
+}
+
+// The game's NPC attack animation for a swing (EWeaponEvent) of the stand-in's weapon kind: light or heavy melee,
+// unarmed. A gun's quick melee has none (no NPC animation found for it).
+ue::UObject* swing_montage(uint8_t kind) {
+    static Fn anims;
+    if (!base_fn(anims, "/Script/Arkansas.IndianaAiCharacter", "K2_GetCurrentWeaponAnimations")) return nullptr;
+    alignas(16) uint8_t b[16] = {};
+    ue::process_event(g.puppet, anims.f, b);
+    ue::UObject* a = nullptr;
+    memcpy(&a, b + anims.off("ReturnValue"), 8);
+    if (!a || !ue::alive(a)) return nullptr;
+    std::string set = ue::class_name(a);  // ARK_MeleeLt_NPC_WeaponAnimations_C, ...
+    struct Swings { const char *key, *dir, *right, *left, *power, *sweep; };
+    static const Swings kSets[] = {
+        {"MeleeLt", "MeleeLt", "AS_NPC_MeleeLt_ATK_R2L_100", "AS_NPC_MeleeLt_ATK_L2R_100", "AS_NPC_MeleeLt_ATK_Lunge_L2R_500", "AS_NPC_MeleeLt_ATK_SWP_250"},
+        {"MeleeHv", "MeleeHvy", "AS_NPC_MeleeHvy_ATK_R2L_100", "AS_NPC_MeleeHvy_ATK_L2R_100", "AS_NPC_MeleeHvy_ATK_Lunge_500", "AS_NPC_MeleeHvy_ATK_R2L"},
+        {"Unarmed", "Unarmed", "AS_NPC_Una_ATK_R2L", "AS_NPC_Una_ATK_L2R", "AS_NPC_Una_ATK_PWR", "AS_NPC_Una_ATK_SWP"},
+    };
+    const Swings* s = nullptr;
+    for (const Swings& c : kSets)
+        if (set.find(c.key) != std::string::npos) { s = &c; break; }
+    if (!s && (set.find("ME2H") != std::string::npos || set.find("MeleeHvy") != std::string::npos)) s = &kSets[1];  // two-handed melee
+    if (!s && set.find("ME1H") != std::string::npos) s = &kSets[0];
+    const char* dir = nullptr;
+    const char* name = nullptr;
+    if (s) {
+        dir = s->dir;
+        name = kind == 24 || kind == 73 ? s->left
+             : kind == 26 || kind == 29 || kind == 54 || kind == 75 || kind == 82 ? s->power
+             : kind == 28 || kind == 76 ? s->sweep : s->right;
+    } else if (kind == 35 || kind == 78) {  // a gun's quick melee: the bash of its family (NPC_Weapon_Animations_<code>)
+        auto has = [&](const char* k) { return set.find(k) != std::string::npos; };
+        if (has("PI2h") || has("2h_Pi") || has("Hndgn2h")) dir = "Hndgn2h", name = "AS_NPC_Hndgn2h_QuickMelee_GunButt01";
+        else if (has("PI_") || has("Pistol") || has("Revolver")) dir = "Hndgn1h", name = "AS_NPC_Hndgn1h_QuickMelee01";
+        else if (has("LMG") || has("LNCH") || has("HvyArmor")) dir = "HvyWpn", name = "AS_NPC_HvyWpn_QuickMelee";
+        else dir = "LngGn", name = "AS_NPC_LngGn_QuickMelee_Cross";  // rifles, shotguns, the rest
+    }
+    if (!dir || !name) return nullptr;
+    std::string object = std::string(name) + "_Montage";
+    static std::unordered_map<std::string, ue::UObject*> cache;
+    ue::UObject*& m = cache[object];
+    if (m && ue::alive(m) && ue::class_name(m) == "AnimMontage" && ue::name_of(m) == object) return m;
+    m = nullptr;
+    ue::UClass* k = ue::find_class("/Script/Engine.KismetSystemLibrary");
+    json req = json::object();
+    req.set("Asset", std::string("/Game/Art/ANIM/Character/NPC/") + dir + "/" + object + "." + object);
+    try {
+        std::string r = ue::call(ue::cdo(k), ue::find_func(k, "LoadAsset_Blocking"), req).get("ReturnValue").asString();
+        std::string err;
+        m = r.rfind("0x", 0) == 0 ? ue::resolve(r.substr(0, r.find(' ')), &err) : nullptr;
+    } catch (const std::exception&) {}
+    if (m && (ue::class_name(m) != "AnimMontage" || ue::name_of(m) != object)) m = nullptr;
+    return m;
+}
+
+// The other player's weapon and its use, on the stand-in: the same weapon class in hand, drawn or holstered; shots
+// fired for real by the stand-in's weapon (animation, flash, sound, tracer) where the player's shot ended, their damage
+// dropped (standin_damage); melee swings as the game's NPC attack animations; reloads. Probe 92.
+void drive_gestures() {
+    ue::UObject* lib = sequencer_lib();
+    std::string err;
+    // Crouch: an NPC crouches when its AI controller asks for it and its movement component, ticking on the ground, runs
+    // the game's crouch (probe 103: its crouched flag, bWantsToCrouch, the animation's fields did not; in Falling, the
+    // mode its placement leaves it in, the game refuses). It ticks a moment per change: a ticking component zeroes the
+    // velocity the walk animation reads (8a), so its mode goes back after.
+    bool want_crouch = (g.peer_flags & 8) != 0;
+    std::string pz = ue::addr(g.puppet);
+    auto crouched_now = [&]() {
+        try { return ue::eval_path(pz + ".bIsCrouched").asBool(want_crouch); } catch (const std::exception&) { return want_crouch; }
+    };
+    bool retry = g.next_crouch_retry > 0 && g.now >= g.next_crouch_retry && g.crouch_tick_until == 0;
+    if (retry) g.next_crouch_retry = 0;
+    if (want_crouch != g.standin_crouched || (retry && crouched_now() != want_crouch)) {
+        if (want_crouch != g.standin_crouched) g.standin_crouches++;
+        g.standin_crouched = want_crouch;
+        g.crouch_since = g.now, g.crouch_tick_until = g.now + 3.0, g.next_crouch_ask = 0;  // until it matches, 3 s at most
+    }
+    if (g.crouch_tick_until > 0) {
+        if (g.now >= g.next_crouch_ask) {  // asked again while it differs: its mode may have changed under it
+            g.next_crouch_ask = g.now + 0.25;
+            json req = json::object();
+            req.set("bCrouch", want_crouch);
+            call_quiet(pz + ".Controller", "K2_SetWantCrouch", req);
+            try { ue::set_path(pz + ".CharacterMovement.MovementMode", "MOVE_NavWalking"); } catch (const std::exception&) {}
+            json on = json::object();
+            on.set("bEnabled", true);
+            call_quiet(pz + ".CharacterMovement", "SetComponentTickEnabled", on);
+        }
+        bool is = crouched_now();
+        // its crouch took ~0.7 s, standing up 0.3 s (probe 103); standing up fails while its standing capsule wouldn't fit
+        if ((is == want_crouch && g.now >= g.crouch_since + 1.0) || g.now >= g.crouch_tick_until) {
+            g.crouch_tick_until = 0;
+            if (is != want_crouch) g.crouch_misses++, g.next_crouch_retry = g.now + 5.0;
+            json off = json::object();
+            off.set("bEnabled", false);
+            call_quiet(pz + ".CharacterMovement", "SetComponentTickEnabled", off);
+            try { ue::set_path(pz + ".CharacterMovement.MovementMode", g.puppet_in_air ? "MOVE_Falling" : "MOVE_Walking"); } catch (const std::exception&) {}
+        }
+    }
+    if (g.look_weapon != g.standin_weapon_path && g.now >= g.next_weapon_try) {
+        g.next_weapon_try = g.now + 1.0;
+        ue::UObject* eq = ue::resolve(ue::addr(g.puppet) + ".EquipmentComponent", &err);
+        if (!eq) return;
+        if (ue::UObject* old = standin_weapon_now()) {
+            json a = json::object();
+            a.set("WeaponClass", ue::addr(ue::class_of(old)));
+            call_quiet(ue::addr(eq), "RemoveWeapon_BP", a);
+        }
+        g.standin_weapon = nullptr;
+        const std::string want = g.look_weapon;
+        static ue::UClass* weapon_k = ue::find_class("/Script/Arkansas.Weapon");
+        // A path from the other player (trust boundary): only a /Game/ class that is a weapon is given.
+        ue::UClass* cls = want.rfind("/Game/", 0) == 0 && want.find(' ') == std::string::npos ? load_class(want) : nullptr;
+        if (cls && weapon_k && ue::cdo(cls) && ue::is_a(ue::cdo(cls), weapon_k)) {
+            json a = json::object();
+            a.set("Weapon", ue::addr(cls));
+            call_quiet(ue::addr(eq), "EquipWeaponBP", a);
+        }
+        g.standin_weapon_path = want, g.standin_drawn = true, g.weapon_changes++;
+        core_log("gestures: the stand-in holds " + (want.empty() ? std::string("no weapon") : want.substr(want.rfind('.') + 1)));
+    }
+    ue::UObject* w = standin_weapon_now();
+    if (!w || !lib) {  // nothing to play with: what arrived meanwhile is not replayed later
+        g.done_shots = g.peer_shots, g.done_swings = g.peer_swings, g.done_reloads = g.peer_reloads;
+        return;
+    }
+    if (g.look_mods_for == g.standin_weapon_path) {  // its mods, with the game's own install (as for given weapons)
+        std::string key = g.look_mods_for;
+        for (const std::string& m : g.look_weapon_mods) key += "|" + m;
+        if (key != g.standin_mods_applied) {
+            g.standin_mods_applied = key;
+            std::vector<ue::UClass*> want, have = mods_of(w);
+            for (const std::string& m : g.look_weapon_mods)  // from the other player (trust boundary): /Game/ classes;
+                if (m.rfind("/Game/", 0) == 0 && m.find(' ') == std::string::npos)  // install_mod takes weapon mods only
+                    if (ue::UClass* c = load_class(m)) want.push_back(c);
+            bool extra = false;
+            for (ue::UClass* c : have) extra = extra || std::find(want.begin(), want.end(), c) == want.end();
+            if (extra) {  // a mod the player took off: a fresh weapon, then its mods
+                g.standin_weapon_path.clear(), g.standin_mods_applied.clear(), g.next_weapon_try = 0;
+                return;
+            }
+            for (ue::UClass* c : want)
+                if (std::find(have.begin(), have.end(), c) == have.end() && install_mod(w, c)) g.standin_mods_installed++;
+        }
+    }
+    bool want_drawn = (g.peer_flags & 2) != 0;
+    if (want_drawn && g.standin_drawn && g.now >= g.next_weapon_try) {  // its own AI may have put it away (a fight's end)
+        static Fn cur;
+        ue::UObject* held = nullptr;
+        if (base_fn(cur, "/Script/Arkansas.OwBaseCharacter", "GetCurrentWeapon")) {
+            alignas(16) uint8_t b[64] = {};
+            ue::process_event(g.puppet, cur.f, b);
+            memcpy(&held, b + cur.off("ReturnValue"), 8);
+        }
+        if (!held) g.standin_drawn = false, g.next_weapon_try = g.now + 1.0;  // drawn again just below
+    }
+    if (want_drawn != g.standin_drawn) {
+        json a = json::object();
+        a.set("Character", ue::addr(g.puppet)).set("bInstant", false);
+        if (want_drawn) a.set("Weapon", ue::addr(w));
+        call_quiet(ue::addr(lib), want_drawn ? "EquipWeaponByInstance" : "HolsterWeapon", a);
+        g.standin_drawn = want_drawn;
+    }
+    // Aim: at the player's last shot, else along the player's view, while they fire or aim down the sights.
+    bool aim = g.standin_drawn && (g.now - g.peer_shot_at < 2.0 || (g.peer_flags & 4));
+    if (aim && g.now >= g.next_orient) {
+        g.next_orient = g.now + 0.1;
+        double face[3], pos[3], v[3];
+        float yaw = 0, pitch = 0;
+        if (g.now - g.peer_shot_at < 0.5) {
+            for (int i = 0; i < 3; i++) face[i] = g.peer_aim[i];
+        } else if (read_transform(g.puppet, pos, yaw, pitch, v)) {
+            double cy = yaw * 3.14159265 / 180, cp = g.peer_pitch * 3.14159265 / 180;
+            face[0] = pos[0] + std::cos(cp) * std::cos(cy) * 3000;
+            face[1] = pos[1] + std::cos(cp) * std::sin(cy) * 3000;
+            face[2] = pos[2] + 60 + std::sin(cp) * 3000;
+        } else {
+            return;
+        }
+        json at = json::object();
+        at.set("X", face[0]).set("Y", face[1]).set("Z", face[2]);
+        json c = json::object();
+        c.set("FaceTarget", "None").set("FaceTargetSubLocation", "Default").set("FaceLocation", at).set("FaceActor", "None");
+        json a = json::object();
+        a.set("Character", ue::addr(g.puppet)).set("TrackingRegion", "TR_WeaponAim").set("AIOrientationControl", c);
+        call_quiet(ue::addr(lib), "SetOrientation", a);
+        g.standin_aiming = true;
+    } else if (!aim && g.standin_aiming) {
+        json a = json::object();
+        a.set("Character", ue::addr(g.puppet)).set("TrackingRegion", "TR_WeaponAim");
+        call_quiet(ue::addr(lib), "ClearOrientation", a);
+        g.standin_aiming = false;
+    }
+    // Shots: one trigger pull per shot, released the next frame; a pull the weapon refuses (busy) is tried again.
+    uint8_t pending = static_cast<uint8_t>(g.peer_shots - g.done_shots);
+    if (pending > 16) g.done_shots = g.peer_shots, pending = 0;  // a restarted player: skipped
+    else if (pending > 4) g.done_shots = static_cast<uint8_t>(g.peer_shots - 4), pending = 4;  // far behind: the last 4
+    if (g.trigger_down) {
+        json a = json::object();
+        a.set("bForceEnd", false);
+        call_quiet(ue::addr(w), "EndPrimaryTrigger", a);
+        g.trigger_down = false;
+    } else if (pending && (!g.standin_drawn || !damage_hooked)) {
+        g.done_shots = g.peer_shots;  // holstered, or its shots could hurt (no damage hook in this build): none fired
+    } else if (pending && g.now - g.peer_shot_at >= 0.05) {  // the aim had a moment to turn
+        bool fired = false;
+        try { fired = ue::call(w, ue::find_func(ue::class_of(w), "BeginPrimaryTrigger"), json::object()).get("ReturnValue").asBool(false); } catch (const std::exception&) {}
+        if (fired) {
+            g.trigger_down = true, g.done_shots++, g.standin_shots++, g.shot_wait_since = -1;
+        } else if (g.shot_wait_since < 0) {
+            g.shot_wait_since = g.now;
+        } else if (g.now - g.shot_wait_since > 1.2) {  // still refused (an NPC's rate of fire may be lower): skipped
+            g.done_shots++, g.shot_wait_since = -1;
+        }
+    }
+    uint8_t sp = static_cast<uint8_t>(g.peer_swings - g.done_swings);  // the newest swing only
+    if (sp) {
+        g.done_swings = g.peer_swings;
+        if (sp <= 16 && g.standin_drawn)
+            if (ue::UObject* m = swing_montage(g.peer_swing_kind)) {
+                json a = json::object();
+                a.set("AnimMontage", ue::addr(m)).set("InPlayRate", 1.0).set("StartSectionName", "None");
+                call_quiet(ue::addr(g.puppet), "PlayAnimMontage", a);
+                g.standin_swings++;
+            }
+    }
+    uint8_t rp = static_cast<uint8_t>(g.peer_reloads - g.done_reloads);
+    if (rp) {
+        g.done_reloads = g.peer_reloads;
+        if (rp <= 16 && g.standin_drawn)
+            if (ue::UObject* c = ue::resolve(ue::addr(g.puppet) + ".Controller", &err)) {
+                call_quiet(ue::addr(c), "K2_ReloadWeapon", json::object());
+                g.standin_reloads++;
+            }
+    }
 }
 
 void drive_puppet() {
@@ -2552,6 +3265,19 @@ void drive_puppet() {
     }
     static Fn set;
     if (!base_fn(set, "/Script/Engine.Actor", "K2_SetActorLocationAndRotation")) return;
+    // Its feet on the other player's: their capsule's center comes, and a stand-in in the middle of a change of stance
+    // (or whose standing up failed) has the other height: it would sink or float 41 cm, and floating, not stand up.
+    if (ue::UObject* cap = ue::resolve(ue::addr(g.puppet) + ".CapsuleComponent"))
+        if (ue::FProperty* hp = ue::find_prop(ue::class_of(cap), "CapsuleHalfHeight")) {
+            float half = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(cap) + ue::prop_offset(hp));
+            if (g.standin_half <= 0 && !g.standin_crouched && g.crouch_tick_until == 0) g.standin_half = half;  // as spawned
+            if (g.standin_half_crouched <= 0)
+                try { g.standin_half_crouched = static_cast<float>(ue::eval_path(ue::addr(g.puppet) + ".CharacterMovement.CrouchedHalfHeight").asNumber(0)); }
+                catch (const std::exception&) {}
+            // shortcut: the other player's capsule taken as the stand-in's (96 / 55 both, probe 102); send it if one differs
+            float peer_half = (g.peer_flags & 8) && g.standin_half_crouched > 0 ? g.standin_half_crouched : g.standin_half;
+            if (g.standin_half > 0 && peer_half > 0) pos[2] += half - peer_half;
+        }
     alignas(16) uint8_t buf[512] = {};
     double rot[3] = {0, yaw, 0};
     memcpy(buf + set.off("NewLocation"), pos, 24);
@@ -2569,6 +3295,7 @@ void drive_puppet() {
         if (ue::FProperty* p = ue::find_prop(ue::class_of(cmc), "Velocity")) memcpy(reinterpret_cast<uint8_t*>(cmc) + ue::prop_offset(p), v, 24);
         if (ue::FProperty* p = ue::find_prop(ue::class_of(cmc), "ComponentVelocity")) memcpy(reinterpret_cast<uint8_t*>(cmc) + ue::prop_offset(p), v, 24);
     }
+    try { drive_gestures(); } catch (const std::exception& e) { g.last_error = std::string("gestures: ") + e.what(); }
 }
 }  // namespace
 
@@ -2610,7 +3337,7 @@ void steam_discovery() {
     std::string want = g.host ? "join:" + std::to_string(steamnet::me()) : std::string("host");
     std::string pick = g.host ? std::string() : env("TOW2_COOP_HOST");
     // A named host is contacted directly, presence or not (its game details may be private); the host accepts friends.
-    uint64_t named = pick.empty() ? 0 : steamnet::find_friend(pick);
+    uint64_t named = !g.host && g.join_target ? g.join_target : pick.empty() ? 0 : steamnet::find_friend(pick);
     std::vector<uint64_t> candidates = named ? std::vector<uint64_t>{named} : steamnet::friends_in_game();
     if (g.host) {  // a client with private game details never shows its presence: take its pending session (two-PC test)
         steamnet::accept_friends();
@@ -2627,6 +3354,7 @@ void steam_discovery() {
         steamnet::request_presence(f);
         if (!named && steamnet::presence(f, "tow2coop") != want) continue;
         if (!named && !pick.empty()) continue;  // a name was given but no such friend: wait for it to show up
+        if (named && !g.host && steamnet::presence(f, "tow2coop") != "host") continue;  // the chosen host: once it hosts
         g.peer_id = f, g.have_peer = true, g.session = -1;
         if (!g.host) character::set_host("steam-" + std::to_string(f));  // the joined player's character for this host
         if (!g.host) steamnet::set_presence("tow2coop", ("join:" + std::to_string(f)).c_str());
@@ -2799,8 +3527,12 @@ bool start(std::string& why) {
     // TOW2_COOP_* wins; else the hub's gamepool pair variables (up --pairs N) give role and port.
     std::string role = env("TOW2_COOP_ROLE");
     if (role.empty()) role = env("GAMEPOOL_ROLE");
+    bool menu = role == "auto" || env("TOW2_COOP_MENU") == "1";  // picked in the game's main menu (the co-op entry)
+    if (role == "auto") role = env("GAMEPOOL_ROLE");                 // tests: the copy's set role keeps its direct-IP setup
+    if (role.empty() && menu) role = "host";
     if (role != "host" && role != "client") { why = "no role (TOW2_COOP_ROLE or GAMEPOOL_ROLE): co-op off"; return false; }
     g.host = role == "host";
+    g.start_host = g.host, g.menu_mode = menu, g.role_chosen = !menu;
     std::string key = env("TOW2_COOP_KEY");  // optional shared secret; both players set the same
     g.magic = key.empty() ? kMagic : kMagic ^ fnv(key) ^ 0x9E3779B9u;
     int port = atoi(env("TOW2_COOP_PORT").c_str());
@@ -2816,13 +3548,373 @@ bool start(std::string& why) {
     g.start_time = clock_s();
     if (g.steam) why = g.host ? "Steam; host: Steam friends running the mod as client join" : "Steam; client: joins a Steam friend hosting";
     else why = std::string(g.host ? "host on port " : "client, host port ") + std::to_string(g.host ? port : ntohs(g.peer.sin_port));
+    if (menu) why = g.steam ? "Steam; the player picks host or join in the main menu (co-op)" : why + "; picked in the main menu (co-op)";
     why = std::string("tow2coop ") + kVersion + ", " + why;
     return true;
+}
+
+// ---------------------------------------------------------------- the co-op menu (main menu)
+// TOW2's main menu is a conversation with the Moon Man: its choices are response widgets in the conversation widget.
+// The mod adds one ("Let's play together (co-op)."); chosen, the game's choices are hidden and the mod's take their
+// place: host for Steam friends, join a friend who hosts, back. They are picked by their number key or a click, through
+// the mod's window procedure (the game binds its own responses natively; the mod's are bound to nothing, so the game
+// never acts on them). Probe 94.
+namespace {
+struct MenuState {
+    ue::UObject* conv = nullptr;     // the conversation widget (the game instance's)
+    int level = 0;                   // 0 the game's choices + ours; 1 co-op; 2 friends who host
+    std::vector<ue::UObject*> mine;  // our response widgets, in order
+    std::vector<std::string> texts;  // what each shows
+    std::vector<int> actions;
+    std::vector<std::pair<ue::UObject*, uint8_t>> hidden;  // the game's responses we collapsed, and their visibility
+    std::vector<uint64_t> hosts;     // level 2: Steam friends who host
+    double search_from = 0, next_refresh = 0;
+    int lang = -1;                   // 0 English, 1 French (the game's language)
+} menu;
+
+double menu_last[2] = {};  // the last click, in viewport pixels (test bridge)
+
+enum MenuAction { kOpen = 1, kHost, kStopHosting, kJoinList, kStopJoining, kBack, kSearch, kJoinDirect, kJoinFriend = 100 };
+
+const char* tr(const char* en, const char* fr) {
+    if (menu.lang < 0) {
+        menu.lang = 0;
+        if (ue::UClass* k = ue::find_class("/Script/Engine.KismetInternationalizationLibrary")) {
+            try {
+                std::string c = ue::call(ue::cdo(k), ue::find_func(k, "GetCurrentLanguage"), json::object()).get("ReturnValue").asString();
+                menu.lang = c.rfind("fr", 0) == 0 ? 1 : 0;
+            } catch (const std::exception&) {}
+        }
+    }
+    return menu.lang == 1 ? fr : en;
+}
+
+std::string fill(std::string s, const std::string& name) {
+    size_t at = s.find("{}");
+    return at == std::string::npos ? s : s.replace(at, 2, name);
+}
+
+std::vector<ue::UObject*> game_responses() {  // ConversationBaseWidget::SelectableResponseWidgets
+    std::vector<ue::UObject*> out;
+    static ue::FProperty* arr = nullptr;
+    if (!arr) arr = ue::find_prop(ue::class_of(menu.conv), "SelectableResponseWidgets");
+    if (!arr) return out;
+    struct TArr { ue::UObject** data; int32_t num, max; };
+    TArr a;
+    memcpy(&a, reinterpret_cast<uint8_t*>(menu.conv) + ue::prop_offset(arr), sizeof a);
+    for (int i = 0; i < a.num && i < 16 && a.data; i++)
+        if (a.data[i] && ue::alive(a.data[i])) out.push_back(a.data[i]);
+    return out;
+}
+
+uint8_t widget_visibility(ue::UObject* w) {
+    static Fn get;
+    if (!base_fn(get, "/Script/UMG.Widget", "GetVisibility")) return 0;
+    alignas(16) uint8_t b[16] = {};
+    ue::process_event(w, get.f, b);
+    return b[get.off("ReturnValue")];
+}
+
+void set_visibility(ue::UObject* w, uint8_t v) {  // ESlateVisibility: 0 Visible, 1 Collapsed, 4 SelfHitTestInvisible
+    static Fn set;
+    if (!base_fn(set, "/Script/UMG.Widget", "SetVisibility")) return;
+    alignas(16) uint8_t b[16] = {};
+    b[set.off("InVisibility")] = v;
+    ue::process_event(w, set.f, b);
+}
+
+bool widget_rect(ue::UObject* w, double r[4]) {  // where a widget is, in the game viewport's pixels (= client pixels)
+    static Fn geo, size, vp;
+    static ue::UObject* lib = nullptr;
+    if (!lib)
+        if (ue::UClass* k = ue::find_class("/Script/UMG.SlateBlueprintLibrary")) lib = ue::cdo(k);
+    std::string err;
+    ue::UObject* pc = ue::resolve("pc", &err);
+    if (!lib || !pc || !base_fn(geo, "/Script/UMG.Widget", "GetCachedGeometry") || !base_fn(size, "/Script/UMG.SlateBlueprintLibrary", "GetLocalSize") ||
+        !base_fn(vp, "/Script/UMG.SlateBlueprintLibrary", "LocalToViewport") || geo.size > 200 || vp.size > 256 || size.size > 256) return false;
+    alignas(16) uint8_t b[256] = {}, c[256] = {};
+    ue::process_event(w, geo.f, b);
+    int gsz = geo.size - geo.off("ReturnValue");
+    memcpy(c + size.off("Geometry"), b + geo.off("ReturnValue"), gsz);
+    ue::process_event(lib, size.f, c);
+    double wh[2];
+    memcpy(wh, c + size.off("ReturnValue"), 16);
+    for (int corner = 0; corner < 2; corner++) {
+        alignas(16) uint8_t d[256] = {};
+        memcpy(d + vp.off("WorldContextObject"), &pc, 8);
+        memcpy(d + vp.off("Geometry"), b + geo.off("ReturnValue"), gsz);
+        double at[2] = {corner ? wh[0] : 0.0, corner ? wh[1] : 0.0};
+        memcpy(d + vp.off("LocalCoordinate"), at, 16);
+        ue::process_event(lib, vp.f, d);
+        memcpy(r + corner * 2, d + vp.off("PixelPosition"), 16);
+    }
+    return true;
+}
+
+bool widget_under(ue::UObject* w, double x, double y) {  // a click at client (viewport) pixels
+    double r[4];
+    return widget_rect(w, r) && x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3];
+}
+
+bool mine_ok(ue::UObject* w) { return w && ue::alive(w) && ue::class_name(w) == "ConversationResponse_BP_C"; }
+
+void entry_text(ue::UObject* w, int number, const std::string& text) {
+    std::string err;
+    if (ue::UObject* n = ue::resolve(ue::addr(w) + ".ResponseNumberTextBlock", &err)) {
+        json a = json::object();
+        a.set("InString", "[" + std::to_string(number) + "]");
+        call_quiet(ue::addr(n), "SetText", a);
+        set_visibility(n, 4);
+    }
+    if (ue::UObject* m = ue::resolve(ue::addr(w) + ".MessageTextBlock", &err)) {
+        json a = json::object();
+        a.set("InText", text);
+        call_quiet(ue::addr(m), "SetText", a);
+    }
+}
+
+ue::UObject* new_entry(ue::UObject* box) {  // a response widget of the conversation's own class, in its container
+    std::string err;
+    ue::UObject* pc = ue::resolve("pc", &err);
+    ue::UObject* cls = ue::resolve(ue::addr(menu.conv) + ".ResponseWidgetClass", &err);
+    ue::UClass* lib = ue::find_class("/Script/UMG.WidgetBlueprintLibrary");
+    if (!pc || !cls || !lib) return nullptr;
+    json a = json::object();
+    a.set("WorldContextObject", ue::addr(pc)).set("WidgetType", ue::addr(cls)).set("OwningPlayer", ue::addr(pc));
+    std::string r;
+    try { r = ue::call(ue::cdo(lib), ue::find_func(lib, "Create"), a).get("ReturnValue").asString(); } catch (const std::exception& e) { g.last_error = std::string("menu: ") + e.what(); }
+    ue::UObject* w = r.rfind("0x", 0) == 0 ? ue::resolve(r.substr(0, r.find(' ')), &err) : nullptr;
+    if (!w) return nullptr;
+    json c = json::object();
+    c.set("Content", ue::addr(w));
+    call_quiet(ue::addr(box), "AddChildToVerticalBox", c);
+    return w;
+}
+
+void clear_mine() {
+    for (ue::UObject* w : menu.mine)
+        if (mine_ok(w)) call_quiet(ue::addr(w), "RemoveFromParent", json::object());
+    menu.mine.clear(), menu.texts.clear(), menu.actions.clear();
+}
+
+void show_game(bool show) {
+    if (show) {
+        for (auto& h : menu.hidden)
+            if (h.first && ue::alive(h.first)) set_visibility(h.first, h.second);
+        menu.hidden.clear();
+        return;
+    }
+    for (ue::UObject* w : game_responses()) {
+        bool done = false;
+        for (auto& h : menu.hidden) done = done || h.first == w;
+        if (done) continue;
+        menu.hidden.push_back({w, widget_visibility(w)});
+        set_visibility(w, 1);
+    }
+}
+
+// Our entries as wanted (text, action), numbered from `first`: widgets reused, made or removed; texts set on change.
+void show_entries(const std::vector<std::pair<std::string, int>>& want, int first) {
+    std::string err;
+    ue::UObject* box = ue::resolve(ue::addr(menu.conv) + ".ResponsesContainer", &err);
+    if (!box) return;
+    for (size_t i = 0; i < menu.mine.size(); i++)
+        if (!mine_ok(menu.mine[i])) { clear_mine(); break; }
+    while (menu.mine.size() > want.size()) {
+        call_quiet(ue::addr(menu.mine.back()), "RemoveFromParent", json::object());
+        menu.mine.pop_back(), menu.texts.pop_back(), menu.actions.pop_back();
+    }
+    for (size_t i = 0; i < want.size(); i++) {
+        if (i == menu.mine.size()) {
+            ue::UObject* w = new_entry(box);
+            if (!w) return;
+            menu.mine.push_back(w), menu.texts.push_back(""), menu.actions.push_back(0);
+        }
+        std::string label = want[i].first + "#" + std::to_string(first + static_cast<int>(i));
+        if (menu.texts[i] != label) entry_text(menu.mine[i], first + static_cast<int>(i), want[i].first), menu.texts[i] = label;
+        menu.actions[i] = want[i].second;
+    }
+}
+
+std::string peer_name() {
+    if (g.steam && steamnet::on() && (g.have_peer || g.join_target)) return steamnet::name(g.have_peer ? g.peer_id : g.join_target);
+    return tr("your friend", "ton ami");
+}
+
+bool steam_up() {  // the Steam link is only started by the co-op loop, which waits for a role: the menu starts it itself
+    if (!g.steam) return false;
+    if (!steamnet::on()) {
+        std::string why;
+        if (steamnet::start(why)) core_log("co-op menu: " + why);
+    }
+    return steamnet::on();
+}
+
+std::vector<uint64_t> hosting_friends() {
+    std::vector<uint64_t> out;
+    if (!steam_up()) return out;
+    for (uint64_t f : steamnet::friends_in_game())
+        if (steamnet::presence(f, "tow2coop") == "host") out.push_back(f);
+    return out;
+}
+
+void choose_off() {
+    if (g.steam && steamnet::on()) {
+        steamnet::set_presence("tow2coop", "");
+        if (g.have_peer) steamnet::close(g.peer_id);
+        g.have_peer = false;
+    }
+    g.role_chosen = false, g.join_target = 0, g.snaps.clear(), g.remote_id = 0, g.remote_last_seq = 0, g.gestures_synced = false;
+    destroy_puppet();
+    core_log("co-op menu: co-op off");
+}
+
+void choose_role(bool host, uint64_t target) {
+    if (g.role_chosen) choose_off();
+    g.host = host, g.join_target = target, g.role_chosen = true;
+    if (g.steam) g.have_peer = false;  // found again: a host takes the friend who joins, a client the chosen host
+    core_log(host ? std::string("co-op menu: you host") : "co-op menu: you join " + (target ? steamnet::name(target) : std::string("the host at the configured address")));
+}
+
+void menu_act(int action) {
+    if (action == kOpen) menu.level = 1;
+    else if (action == kBack) menu.level = menu.level == 2 ? 1 : 0;
+    else if (action == kHost) choose_role(true, 0), menu.level = 0;
+    else if (action == kStopHosting || action == kStopJoining) choose_off(), menu.level = 0;
+    else if (action == kJoinList || action == kSearch) {
+        menu.level = 2, menu.search_from = g.now, menu.next_refresh = 0, menu.hosts.clear();
+        if (steam_up())
+            for (uint64_t f : steamnet::friends_in_game()) steamnet::request_presence(f);
+    } else if (action == kJoinDirect) choose_role(false, 0), menu.level = 0;
+    else if (action >= kJoinFriend && action - kJoinFriend < static_cast<int>(menu.hosts.size())) choose_role(false, menu.hosts[action - kJoinFriend]), menu.level = 0;
+    g.menu_picks++;
+}
+
+void menu_reset() {
+    clear_mine();
+    show_game(true);
+    menu.level = 0;
+    menu_own = 0;
+}
+
+// What is shown at each level, from the co-op state.
+std::vector<std::pair<std::string, int>> menu_wanted() {
+    std::vector<std::pair<std::string, int>> v;
+    bool hosting = g.role_chosen && g.host, joining = g.role_chosen && !g.host;
+    bool playing = g.role_chosen && g.have_peer && !g.snaps.empty() && g.now - g.snaps.back().t < 5.0;
+    if (menu.level == 0) {
+        std::string s = playing ? fill(tr("Co-op: playing with {}.", "Co-op : tu joues avec {}."), peer_name())
+                      : hosting ? tr("Co-op: my game is open to my Steam friends.", "Co-op : ma partie est ouverte à mes amis Steam.")
+                      : joining ? fill(tr("Co-op: joining {}...", "Co-op : je rejoins {}..."), peer_name())
+                      : tr("Let's play together (co-op).", "Jouons ensemble (co-op).");
+        v.push_back({s, kOpen});
+    } else if (menu.level == 1) {
+        bool can_host = g.steam || g.start_host, can_join = g.steam || !g.start_host;  // a direct-IP copy keeps its set role
+        if (hosting) v.push_back({tr("I'll stop hosting.", "Je n'héberge plus."), kStopHosting});
+        else if (can_host) v.push_back({tr("I'll host: my Steam friends can join my game.", "J'héberge : mes amis Steam pourront me rejoindre."), kHost});
+        if (joining) v.push_back({tr("I'll stop joining.", "J'arrête de rejoindre."), kStopJoining});
+        else if (can_join) v.push_back({tr("I'll join a friend's game.", "Je rejoins la partie d'un ami."), kJoinList});
+        v.push_back({tr("Never mind.", "Laisse tomber."), kBack});
+    } else {
+        if (!g.steam) {
+            v.push_back({tr("Join the host at the configured address.", "Rejoindre l'hôte à l'adresse configurée."), kJoinDirect});
+        } else {
+            for (size_t i = 0; i < menu.hosts.size() && i < 7; i++)
+                v.push_back({fill(tr("Join {}.", "Rejoindre {}."), steamnet::name(menu.hosts[i])), kJoinFriend + static_cast<int>(i)});
+            if (menu.hosts.empty())
+                v.push_back({g.now - menu.search_from < 2.5 ? tr("Looking for friends who host...", "Je cherche des amis qui hébergent...")
+                                                              : tr("Nobody is hosting right now. Look again.", "Personne n'héberge pour l'instant. Cherche encore."), kSearch});
+            else
+                v.push_back({tr("Look again.", "Cherche encore."), kSearch});
+        }
+        v.push_back({tr("Never mind.", "Laisse tomber."), kBack});
+    }
+    return v;
+}
+
+void menu_frame() {
+    bool shown = false;
+    if (g.menu_mode && g.at_menu) {
+        if (!menu.conv || !ue::alive(menu.conv) || ue::class_name(menu.conv) != "ConversationWidget_BP_C") {
+            menu.conv = nullptr;
+            static ue::UClass* k = ue::find_class("/Script/Arkansas.ConversationWidget");
+            if (k)
+                for (ue::UObject* o : ue::instances(k, false, 2)) menu.conv = o;
+        }
+        static Fn vis;
+        if (menu.conv && base_fn(vis, "/Script/UMG.Widget", "IsVisible")) {
+            alignas(16) uint8_t b[16] = {};
+            ue::process_event(menu.conv, vis.f, b);
+            shown = b[vis.off("ReturnValue")] && (menu.level > 0 || game_responses().size() >= 2);
+        }
+    }
+    menu_listen.store(shown);
+    if (!shown) {
+        if (menu.level || !menu.mine.empty() || !menu.hidden.empty()) menu_reset();
+        return;
+    }
+    watch_keys();
+    int key = menu_key.exchange(0), pick = -1;
+    int first = menu.level == 0 ? static_cast<int>(game_responses().size()) + 1 : 1;
+    if (key && key >= first && key - first < static_cast<int>(menu.mine.size())) pick = key - first;
+    if (menu_clicked.exchange(false)) {
+        uint64_t c = menu_click.load(), wh = menu_client.load();
+        double x = static_cast<int32_t>(c >> 32), y = static_cast<int32_t>(c & 0xffffffffu);
+        double cw = static_cast<int32_t>(wh >> 32), ch = static_cast<int32_t>(wh & 0xffffffffu), vp[2] = {};
+        // Client pixels -> the UI's (the viewport's pixels, where LocalToViewport puts the choices): the same at 1:1; a
+        // viewport drawn into a client area of another size scales (probe 98: both 960 x 540 in the test copies).
+        static Fn size;
+        static ue::UObject* lib = nullptr;
+        if (!lib)
+            if (ue::UClass* k = ue::find_class("/Script/UMG.WidgetLayoutLibrary")) lib = ue::cdo(k);
+        std::string err;
+        ue::UObject* pc = ue::resolve("pc", &err);
+        if (lib && pc && base_fn(size, "/Script/UMG.WidgetLayoutLibrary", "GetViewportSize")) {
+            alignas(16) uint8_t b[64] = {};
+            memcpy(b + size.off("WorldContextObject"), &pc, 8);
+            ue::process_event(lib, size.f, b);
+            memcpy(vp, b + size.off("ReturnValue"), 16);
+        }
+        if (cw > 0 && ch > 0 && vp[0] > 0 && vp[1] > 0) x = x * vp[0] / cw, y = y * vp[1] / ch;
+        menu_last[0] = x, menu_last[1] = y;
+        for (size_t i = 0; i < menu.mine.size() && pick < 0; i++)
+            if (mine_ok(menu.mine[i]) && widget_under(menu.mine[i], x, y)) pick = static_cast<int>(i);
+    }
+    if (pick >= 0 && pick < static_cast<int>(menu.actions.size())) {
+        int before = menu.level;
+        menu_act(menu.actions[pick]);
+        if (menu.level != before) clear_mine();  // other entries now
+    }
+    if (menu.level == 2 && g.now >= menu.next_refresh) menu.next_refresh = g.now + 1.0, menu.hosts = hosting_friends();
+    show_game(menu.level == 0);
+    first = menu.level == 0 ? static_cast<int>(game_responses().size()) + 1 : 1;
+    show_entries(menu_wanted(), first);
+    menu_own = menu.level == 0 ? first : -1;  // the window procedure: the digit that is ours (-1: all of them)
+}
+}  // namespace
+
+json menu_status() {
+    json m = json::array(), rects = json::array();
+    for (const std::string& t : menu.texts) m.push(t.substr(0, t.rfind('#')));
+    for (ue::UObject* w : menu.mine) {
+        double r[4] = {};
+        json a = json::array();
+        if (mine_ok(w) && widget_rect(w, r))
+            for (double v : r) a.push(v);
+        rects.push(a);
+    }
+    json click = json::array();
+    click.push(menu_last[0]).push(menu_last[1]);
+    json s = json::object();
+    s.set("rects", rects).set("lastClick", click);
+    s.set("level", static_cast<double>(menu.level)).set("entries", m).set("shown", menu_listen.load()).set("own", static_cast<double>(menu_own.load()));
+    return s;
 }
 
 void frame(float) {
     if (!g.on) return;
     g.now = clock_s();
+    ev_frame.fetch_add(1, std::memory_order_relaxed);
     // A hand-over load tears the old world down over the next frames: touching its objects then faulted every frame
     // (runs 42, 44, 50) and an aborted game call mid-load may leave it half done. Stay away until the new world exists.
     if (join::loading()) return;
@@ -2860,6 +3952,8 @@ void frame(float) {
     }
     bool settled = gameplay && g.now >= g.settle_until;
     g.in_gameplay = settled;
+    try { menu_frame(); } catch (const std::exception& e) { g.last_error = std::string("menu: ") + e.what(); }
+    if (!g.role_chosen) return;  // nothing goes out until the player picks host or join (the co-op menu)
     receive();  // after the world check: data for the old world's objects is ignored until the new one settles
     watch_travel();
     if (gameplay) follow_travel(pawn);
@@ -2895,6 +3989,7 @@ void frame(float) {
                 g.me_dead = character::dead();
             }
             st.flags = g.me_dead || g.opt_fake_dead ? 1 : 0;
+            gestures_out(pawn, st);
             send_raw(&st, sizeof st);
         }
     }
@@ -2903,6 +3998,7 @@ void frame(float) {
         destroy_puppet();
         g.last_recv_t = -1;
         g.remote_id = 0, g.remote_last_seq = 0;  // a restarted peer has a new id and starts its sequence again
+        g.gestures_synced = false;               // and its own weapon event counts
         if (g.host) g.have_peer = false;         // the next client to send becomes the peer (Steam: to show up again)
         if (g.steam) core_log("steam: no data from " + steamnet::name(g.peer_id) + " for 5 s" + (g.host ? ", looking for a client again" : ""));
         g.drops++;
@@ -2954,6 +4050,7 @@ void frame(float) {
         }
         drive_puppet();
         if (g.opt_scan) scan_step(pawn);
+        if (g.opt_scan && g.opt_npcs) spawned_frame(pawn);
         if (g.host && g.opt_story) story::host_frame(g.now, send_typed);  // polls even without a peer: the log covers the whole session
         if (g.host && g.have_peer && g.now >= g.next_clock) {
             g.next_clock = g.now + 2.0;
@@ -3005,8 +4102,76 @@ void frame(float) {
     }
 }
 
+// The game's damage function (hooked in main.cpp, game thread): the stand-in's shots and swings hurt nobody. Its
+// weapon fires for real for the look and sound; the other player's real hits arrive as damage messages, and a kill by
+// the stand-in would give nobody its XP. A projectile counts by its owner or instigator, a weapon by its outer chain.
+bool damage_hooked = false;
+bool standin_damage(void* causer_, void* instigator_) {
+    ue::UObject* p = g.puppet;
+    if (!p) return false;
+    auto* causer = static_cast<ue::UObject*>(causer_);
+    auto* inst = static_cast<ue::UObject*>(instigator_);
+    bool from = causer == p || inst == p;
+    static ue::UClass* actor_k = ue::find_class("/Script/Engine.Actor");
+    static int owner_off = -2, inst_off = -2;
+    if (owner_off == -2) {
+        ue::FProperty* o = actor_k ? ue::find_prop(actor_k, "Owner") : nullptr;
+        ue::FProperty* i = actor_k ? ue::find_prop(actor_k, "Instigator") : nullptr;
+        owner_off = o ? ue::prop_offset(o) : -1, inst_off = i ? ue::prop_offset(i) : -1;
+    }
+    for (ue::UObject* a : {causer, inst}) {
+        if (from || !a) continue;
+        if (actor_k && ue::is_a(a, actor_k)) {
+            auto* b = reinterpret_cast<uint8_t*>(a);
+            if (owner_off >= 0 && *reinterpret_cast<ue::UObject**>(b + owner_off) == p) from = true;
+            if (inst_off >= 0 && *reinterpret_cast<ue::UObject**>(b + inst_off) == p) from = true;
+        } else {
+            const uint8_t* at = reinterpret_cast<const uint8_t*>(a);
+            for (int up = 0; at && up < 4 && !from; up++) {
+                at = *reinterpret_cast<const uint8_t* const*>(at + 0x20);  // UObject::OuterPrivate
+                from = at == reinterpret_cast<const uint8_t*>(p);
+            }
+        }
+    }
+    if (from) g.standin_dmg_blocked++;
+    return from;
+}
+
+// One of the local player's weapon events (EWeaponEvent), heard by every visuals object of the weapon in one call.
+void note_weapon_event(uint8_t ev) {
+    if (ev >= 128) return;
+    uint32_t fr = ev_frame.load(std::memory_order_relaxed);
+    ev_log[ev_log_n.fetch_add(1) % 32] = fr << 8 | ev;
+    int cat = 0;  // 1 shot, 2 swing, 3 reload, 4 aim on, 5 aim off
+    switch (ev) {
+    case 7: case 8: case 9: case 10: case 11: case 17: case 37: case 70: case 79: cat = 1; break;  // Fire, hip, scoped, charged...
+    case 23: case 24: case 26: case 28: case 29: case 35: case 54: case 66: case 73: case 74: case 75: case 76: case 78: case 82:
+        cat = 2; break;  // melee: right, left, power, sweep, counter, quick, stealth (and their slow-time kin)
+    case 19: case 67: cat = 3; break;  // reload, dry-fire reload
+    case 42: case 44: cat = 4; break;  // fine aim start / fully aimed
+    case 43: case 45: cat = 5; break;
+    default: return;
+    }
+    // One shot sends Fire and FireHipfire, and every visuals object of the weapon (4-7) hears each, in one frame.
+    if (ev_seen[cat] == fr) return;
+    ev_seen[cat] = fr;
+    if (cat == 1) my_shots.fetch_add(1);
+    else if (cat == 2) my_swing_kind.store(ev), my_swings.fetch_add(1);
+    else if (cat == 3) my_reloads.fetch_add(1);
+    else my_aiming.store(cat == 4);
+}
+
 void observe(void* o, void* f, const void* p) {
     if (applying_remote || !p) return;  // our own apply (game thread): no echo
+    if (trigger_event_name && *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(f) + 0x18) == trigger_event_name) {
+        void* w = my_weapon.load(std::memory_order_relaxed);  // only the local player's weapon: its visuals' outer chain
+        const uint8_t* at = static_cast<const uint8_t*>(o);
+        for (int up = 0; w && at && up < 3; up++) {
+            at = *reinterpret_cast<const uint8_t* const*>(at + 0x20);  // UObject::OuterPrivate
+            if (at == w) { note_weapon_event(*static_cast<const uint8_t*>(p)); break; }
+        }
+        return;
+    }
     Observed e{};
     e.obj = o, e.fn = f;
     uint16_t size = *reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(f) + 0xB6);  // UFunction::ParmsSize
@@ -3019,10 +4184,17 @@ json set_options(const json& p) {
     for (auto& kv : {std::make_pair("story", &g.opt_story), std::make_pair("doors", &g.opt_doors), std::make_pair("npcs", &g.opt_npcs), std::make_pair("scan", &g.opt_scan),
                      std::make_pair("follow", &g.opt_follow), std::make_pair("gifts", &g.opt_gifts), std::make_pair("giveHold", &g.opt_give_hold), std::make_pair("combat", &g.opt_combat), std::make_pair("fakeDead", &g.opt_fake_dead)})
         if (p.get(kv.first).isBool()) *kv.second = p.get(kv.first).asBool(true);
+    if (p.get("menu").isBool()) {  // test: the role picked in the main menu from now on (off: the set role again)
+        if (p.get("menu").asBool()) { g.menu_mode = true; if (g.role_chosen) choose_off(); g.host = g.start_host; }
+        else g.menu_mode = false, g.host = g.start_host, g.role_chosen = true;
+    }
     json s = json::object();
     s.set("story", g.opt_story).set("doors", g.opt_doors).set("npcs", g.opt_npcs).set("scan", g.opt_scan).set("follow", g.opt_follow).set("gifts", g.opt_gifts).set("combat", g.opt_combat);
     return s;
 }
+
+// Test bridge, game thread: {class, x, y, z, yaw} spawns an NPC as the game would; {} lists the shared spawned NPCs.
+json spawned(const json& p) { return p.get("class").isString() ? spawn_test(p) : spawned_list(); }
 
 // Test bridge, game thread: the NPCs fighting in this world, or pinned, with the deciding world's word.
 json fights() {
@@ -3092,6 +4264,25 @@ json status() {
     s.set("combatFights", static_cast<double>(g.combat_fights)).set("combatOwned", static_cast<double>(g.combat_owned));
     s.set("partyFight", g.now < g.party_fight_until).set("standinFighting", g.standin_fighting).set("standinTeamChanges", static_cast<double>(g.standin_team_changes));
     s.set("meDead", g.me_dead).set("peerDead", g.peer_dead).set("standinSpell", g.standin_spell);
+    s.set("myWeapon", g.my_weapon_path).set("myShots", static_cast<double>(my_shots.load())).set("mySwings", static_cast<double>(my_swings.load()));
+    s.set("myReloads", static_cast<double>(my_reloads.load())).set("myAiming", my_aiming.load()).set("myDrawn", g.my_drawn).set("lookWeapon", g.look_weapon);
+    s.set("standinWeapon", g.standin_weapon && ue::alive(g.standin_weapon) ? ue::path_of(ue::class_of(g.standin_weapon)) : std::string());
+    s.set("standinDrawn", g.standin_drawn).set("standinAiming", g.standin_aiming).set("peerShots", static_cast<double>(g.peer_shots));
+    s.set("standinShots", static_cast<double>(g.standin_shots)).set("standinSwings", static_cast<double>(g.standin_swings));
+    s.set("standinReloads", static_cast<double>(g.standin_reloads)).set("standinDamageBlocked", static_cast<double>(g.standin_dmg_blocked));
+    s.set("weaponChanges", static_cast<double>(g.weapon_changes));
+    s.set("dmgNotMine", static_cast<double>(g.dmg_not_mine));
+    s.set("myCrouched", g.my_crouched).set("standinCrouched", g.standin_crouched).set("standinCrouches", static_cast<double>(g.standin_crouches))
+        .set("crouchMisses", static_cast<double>(g.crouch_misses)).set("crouchWindow", g.crouch_tick_until > 0);
+    s.set("standinModsInstalled", static_cast<double>(g.standin_mods_installed)).set("lookWeaponMods", static_cast<double>(g.look_weapon_mods.size()));
+    s.set("menuMode", g.menu_mode).set("roleChosen", g.role_chosen).set("menuPicks", static_cast<double>(g.menu_picks)).set("menu", menu_status());
+    s.set("spawnedShared", static_cast<double>(g.spawned.size())).set("spawnCopies", static_cast<double>(g.spawn_copies));
+    s.set("spawnMatched", static_cast<double>(g.spawn_matched)).set("spawnRemoved", static_cast<double>(g.spawn_removed));
+    s.set("spawnNatives", static_cast<double>(g.natives.size())).set("spawnOffers", static_cast<double>(g.offers.size()));
+    json evs = json::array();
+    for (uint32_t i = ev_log_n.load() > 32 ? ev_log_n.load() - 32 : 0; i < ev_log_n.load(); i++)
+        evs.push(std::to_string(ev_log[i % 32] >> 8) + ":" + std::to_string(ev_log[i % 32] & 255));
+    s.set("myEvents", evs);
     if (g.host) s.set("npcsSentAgo", g.now - g.npcs_sent_at);
     if (g.puppet && standin_ok()) {  // the stand-in's untargetable effect, as the game sees it
         static ue::UClass* effect = ue::find_class("/Script/Arkansas.UntargetableByAIStatusEffect");

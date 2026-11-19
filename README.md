@@ -1,13 +1,15 @@
 # tow2-coop: two-player co-op for The Outer Worlds 2 (work in progress)
 
-Status: **v0.2.0-beta.6, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.**
-beta.6 gives each player their own character: the friend joins with nothing and keeps what they pick up, their own
+Status: **v0.3.0, a test build: co-op through Steam (friends find each other, no IP or port), or direct IP.**
+0.3.0: host and join from the game's own main menu (no command, no role at install); the other player's stand-in holds
+their weapon with its mods and uses it (shots, swings, a gun's bash, reloads, holstering) and crouches with them;
+enemies the game spawns during play are shared. The 0.2.0 betas gave each player their own character: the friend joins with nothing and keeps what they pick up, their own
 look, level and XP (XP earned together is shared), and players give each other items through the other's stand-in. A
 map change no longer waits for a save: when one player travels, the other starts the same travel at once and both
 arrive together. Fights are shared: an enemy that spots either player starts the fight in both games, and the enemies
 spread over both players. Tested on one PC with two copies (runs 70-111); the first real session across two PCs
-(2026-11-17, beta.4) ran the earlier features.
-Use beta.6 on both PCs (an older version on the other PC does not connect; the log says so). Two independent copies of
+(2026-11-17, beta.4) ran the earlier features. 0.3.0 was tested on one PC too (runs 112-134).
+Use 0.3.0 on both PCs (an older version on the other PC does not connect; the log says so). Two independent copies of
 the game share one campaign owned by the host: the client joins by receiving the host's save, each player controls their
 own character, sees the other (position, rotation, walk/idle animation, the player's look, armor and helmet changes),
 and the host owns NPC health and deaths, quest progress, door states and container contents; either player can lead a
@@ -23,8 +25,12 @@ Entertainment or Xbox; it ships no game files. MIT license.
 - **Saves:** only the host saves the campaign. In a joined game the friend's saving is switched off (its autosave and
   quicksave slots are the friend's own campaign's); the friend's own games, loaded from the main menu, save normally.
   The mod keeps the friend's character itself (see Characters).
-- **Join:** the client starts at the main menu and joins; the host saves its current campaign ("CoopHost") and hands it
-  over; the client loads it into its own save folder `CoopHost_<host id>` (never over the client's own saves).
+- **Host and join:** in the main menu, the Moon Man's choices have one more: *Let's play together (co-op).* Pick it
+  (its number key or a click), then *I'll host* (your Steam friends can join your game) or *I'll join a friend's
+  game* (the Steam friends who host are listed: pick one). The host then loads or continues their campaign as usual;
+  the friend's game joins it: the host saves its current campaign ("CoopHost") and hands it over, and the friend's game
+  loads it into its own save folder `CoopHost_<host id>` (never over the friend's own saves). The same choice shows
+  who you play with, and stops hosting or joining.
 - **Characters:** each player has their own. On the first join, the friend's character is the one of their own newest
   save (their look, level, skills, perks), with nothing in their pockets: no items, no money. From then on the friend
   keeps their own items (with ammo in the magazine, mods, durability), money, XP and level across every hand-over: before
@@ -42,16 +48,23 @@ Entertainment or Xbox; it ships no game files. MIT license.
   doesn't confirm it within 20 s (gone, loading), the item comes back to you. (The game only lets
   players take from world containers, not put items in them, so the stand-in is the way to give.)
 - **Players:** each player moves, fights and loots in their own world; the other player appears as a stand-in NPC body
-  that wears the other player's own look, armor and helmet.
+  that wears the other player's own look, armor and helmet, and holds the same weapon with its mods (a silencer, a
+  scope), drawn or holstered as they do, and crouches when they crouch.
+  When they fire, the stand-in's weapon fires too (its animation, flash, sound and tracer), toward where their shot
+  went; when they swing a melee weapon or bash with a gun, it plays the game's own attack animation; when they reload,
+  it reloads. The
+  stand-in's own shots and swings never hurt anyone: the other player's real hits arrive from their game.
 - **Combat:** fights are shared. An enemy that sees either player starts the fight in both games, and in both it
   fights the same one: the host, the friend or a companion, as the game's own AI picks (it switches as it would), so
   the enemies spread over both players. Each player takes the hits of the enemies fighting them in their own game;
   the other player's stand-in takes the rest, unharmed. The host's game decides whom each enemy fights; for an enemy
   much nearer the friend than the host (the host more than 50 m away), the friend's game decides (far from a player,
-  an enemy's AI sleeps in that player's game). Enemy health and deaths follow the host; damage the friend deals is sent
-  to the host. Out of a fight each player is only seen in their own game, with their own stealth: the other player's
+  an enemy's AI sleeps in that player's game). Enemy health and deaths follow the host; the hits the friend deals are sent to
+  the host (only theirs: their companions' hits are the host's game's own). Out of a fight each player is only seen in their own game, with their own stealth: the other player's
   stand-in is untargetable by the AI until a fight starts. A dead player's stand-in leaves the other game until they
-  live again, and its enemies turn to the living player.
+  live again, and its enemies turn to the living player. Enemies the game spawns during play (a hive, a hatch, a door,
+  a summon) are shared too: each game tells the other about its own; the other takes one of its own of the same kind
+  nearby (both spawned it), or spawns a copy, and from then on it is shared like the others.
 - **Quests and story:** shared both ways. Quest starts, objective updates (addendums), the global variables quest
   objectives test, and quest outcomes (completed, failed) made in either player's game reach the other's live, without
   a reload: a conversation or an objective of the friend's counts for the host's campaign too.
@@ -97,11 +110,13 @@ Needs llvm-mingw (portable, no install) and the coop-anything hub next to this f
 
 Test copies are hard-linked, isolated installs made by the hub's `tools/gamepool` (config `qa/tow2.gamepool.json`).
 One command runs the whole regression on a pair: `powershell -NoProfile -File qa/run_suite.ps1 -Out <folder>`
-(`qa/soak_run.ps1 -Minutes 30` for the soak, `qa/run_key.ps1` for the shared key). Add `-Warm` when other games ran
+(`qa/soak_run.ps1 -Minutes 30` for the soak, `qa/run_key.ps1` for the shared key); `qa/run_quick.ps1 -Out <folder>` is the
+shorter one, and `-Menu` makes the players host and join through the main menu's co-op choice instead of by themselves. Add `-Warm` when other games ran
 since the last session: a start with an emptied graphics-driver shader cache takes 7-17 GB instead of ~4.5 GB, and one
 copy started alone and closed normally (`qa/warmup.ps1`) refills it. The tests load a save copied from
 your own game into each copy's sandbox (`qa/prep_instance.py --saves`); nothing is written to the real save folder.
-Co-op settings come from the environment (else from `tow2coop.ini`, see below): `TOW2_COOP_ROLE=host|client` (or gamepool's `GAMEPOOL_ROLE`),
+Co-op settings come from the environment (else from `tow2coop.ini`, see below): `TOW2_COOP_ROLE=host|client|auto` (or gamepool's
+`GAMEPOOL_ROLE`; `auto`: picked in the main menu; `TOW2_COOP_MENU=1` keeps the copy's set side for direct IP and asks in the menu),
 `TOW2_COOP_PORT` (UDP, default 27960; the save hand-over uses TCP port + 1), `TOW2_COOP_PEER=ip:port` for a client on
 another PC, `TOW2_COOP_BIND` for the host (test copies: 127.0.0.1). Two copies on one 8 GB GPU need the VRAM budget
 that `qa/prep_instance.py` writes (`Engine.ini`) and 960x540.
@@ -111,14 +126,17 @@ that `qa/prep_instance.py` writes (`Engine.ini`) and 960x540.
 Each player runs the installer on their own PC, with the game closed (it finds the game through Steam; `-GameDir`
 overrides, `-Find` only shows the folder). The two players must be **Steam friends**, each with their own copy:
 
-    powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Role host
-    powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Role client [-Friend "<host's Steam name>"]
+    powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
+
+Both players run the same: who hosts and who joins is picked in the game's main menu. (`-Role host` or
+`-Role client [-Friend "<host's Steam name>"]` instead set it for good: the host always hosts, the friend always joins.)
 
 To update, run the new version's installer the same way, with the game closed: it replaces the old files (no need to
 uninstall first).
 
-The host starts the game and loads their campaign; the friend starts the game and waits at the main menu: about a
-minute later the friend receives the host's campaign and loads it. **Over Steam** (the default) there is no address, no
+In the main menu, the host picks the co-op choice and *I'll host*, then loads their campaign; the friend picks the
+co-op choice, *I'll join a friend's game* and the host: about a minute later the friend receives the host's campaign and
+loads it (with `-Role` set at install, no menu choice: the friend's game joins by itself). **Over Steam** (the default) there is no address, no
 open port and no firewall prompt: the game's own Steam session carries everything through Valve's relay, encrypted.
 The players find each other through Steam rich presence (the host shows `tow2coop=host`, the friend shows
 `tow2coop=join:<host>`); `-Friend` names the host when several friends host, or when the host's game details are
@@ -154,11 +172,18 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
 - Loading a save within the first ~15 s after start crashes the game (engine `LoadMap`); the client waits 60 s of
   frames before loading a received campaign. Players loading from the menu by hand are not affected.
 - The remote player is a stand-in NPC that wears the other player's own look (face, hair, body) and armor and helmet;
-  changes follow within a few seconds (a piece you don't wear yourself shows without its mods). It doesn't show the
-  other player's weapon or attacks: you see them move, not shoot.
+  changes follow within a few seconds (a piece you don't wear yourself shows without its mods). When the other
+  player crouches or stands up, the stand-in's walk animation can stop for a second or so while it changes stance.
 - Enemies run the game's own AI in both games, on the same target: their two copies can be 1-2 m apart (eased back
-  together, snapped past 6 m). The stand-in never crouches: in a fight, enemies see it standing.
-- Enemies that the game spawns during play (not placed in the map) are not shared: each game has its own.
+  together, snapped past 6 m).
+- The friend's hits are told to the host by the game's "last hitter" of the enemy: a hit of the friend's in the same tenth
+  of a second as a companion's on the same enemy is not counted.
+- Spawned enemies were tested with Ursopods spawned the way a spawner does (by the test), not yet with the game's own
+  hives, hatches or doors. When both games spawn one of the same kind more than 15 m apart, each gets a copy of the
+  other's (one more enemy).
+- The co-op choice is in the main menu only (not in the pause menu: to start hosting, go back to the main menu). It is
+  picked with the mouse or its number key, not yet with a gamepad. Public games (strangers) and Steam's own
+  "Join game" are not there yet: the list shows Steam friends who host.
 - While the host's game is paused in a fight (a menu, or one of the game's own screens such as a flaw offer), the
   host's enemies wait; the friend's keep fighting the way the host's game last said.
 - Co-op combat was tested against Ursopods (melee creatures) and an Order soldier fighting nearby; a large fight with
