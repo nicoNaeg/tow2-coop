@@ -138,8 +138,35 @@ bool readable(const void* p, size_t n) {
     return true;
 }
 
+// Memory known readable this frame: committed regions from VirtualQuery. The engine frees and decommits memory in its
+// own tick (garbage collection, streaming), never while co-op code runs, so a region stays good until the next epoch.
+namespace {
+struct Region { uintptr_t lo = 0, hi = 0; uint32_t epoch = 0; };
+Region g_regions[32];
+uint32_t g_epoch = 1;
+int g_next_region = 0;
+}  // namespace
+
+void new_epoch() { g_epoch++; }
+
+static bool held_readable(const void* p, size_t n) {
+    uintptr_t a = reinterpret_cast<uintptr_t>(p), e = a + n;
+    for (const Region& r : g_regions)
+        if (r.epoch == g_epoch && a >= r.lo && e <= r.hi) return true;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(p, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) || !(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return false;
+    uintptr_t lo = reinterpret_cast<uintptr_t>(mbi.BaseAddress), hi = lo + mbi.RegionSize;
+    if (e > hi) return readable(p, n);  // across two regions
+    g_regions[g_next_region] = {lo, hi, g_epoch};
+    g_next_region = (g_next_region + 1) % 32;
+    return true;
+}
+
 bool alive(const UObject* o) {
     if (!o) return false;
+    if (!held_readable(o, 0x28)) return false;  // a held pointer whose memory went (run 99: an NPC streamed out)
     uint8_t* it = item(at<int32_t>(o, off::obj_index));
     if (!it || *reinterpret_cast<UObject**>(it) != o) return false;
     if (at<int32_t>(it, 8) & (1 << 21)) return false;                     // EInternalObjectFlags::Garbage
@@ -227,6 +254,7 @@ FField* next_prop(const FField* f) { return at<FField*>(f, lay::ff_next); }
 std::string field_name(const FField* f) { return name(at<FName>(f, lay::ff_name)); }
 std::string field_type(const FField* f) { return name(*reinterpret_cast<const FName*>(at<const uint8_t*>(f, off::ff_class))); }
 int prop_offset(const FProperty* p) { return at<int32_t>(p, lay::prop_offset); }
+int prop_dim(const FProperty* p) { return at<int32_t>(p, lay::prop_dim); }
 int prop_size(const FProperty* p) { return at<int32_t>(p, lay::prop_size); }
 uint64_t prop_flags(const FProperty* p) { return at<uint64_t>(p, lay::prop_flags); }
 int struct_size(const UStruct* s) { return at<int32_t>(s, off::struct_size); }

@@ -52,7 +52,8 @@ FName make_name(const std::string& s, bool add);  // FName{0,0} when not found a
 // Objects
 int num_objects();
 UObject* object_at(int i);
-bool alive(const UObject* o);           // in the object array, not being destroyed
+bool alive(const UObject* o);           // in the object array, not being destroyed (a held pointer whose memory went: false)
+void new_epoch();                       // game thread, once per frame before any co-op code: memory checks start over
 bool readable(const void* p, size_t n);  // committed, readable memory (for addresses that come from outside)
 UClass* class_of(const UObject* o);
 UObject* outer_of(const UObject* o);
@@ -73,6 +74,7 @@ std::string field_name(const FField* f);
 std::string field_type(const FField* f);
 int prop_offset(const FProperty* p);
 int prop_size(const FProperty* p);
+int prop_dim(const FProperty* p);   // static array size (1 for most properties)
 uint64_t prop_flags(const FProperty* p);
 FProperty* find_prop(const UStruct* s, const std::string& name);  // walks the super chain, case-insensitive
 UFunction* find_func(const UStruct* s, const std::string& name);

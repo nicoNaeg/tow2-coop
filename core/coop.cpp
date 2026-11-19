@@ -44,11 +44,12 @@ volatile bool applying_remote = false;  // set while we apply a remote change: i
 #pragma pack(push, 1)
 struct InteractMsg {
     uint32_t eid;   // sender-unique event id (dedupe of the 3 copies)
-    uint8_t kind;   // 1 door state, 2 item taken, 3 item stored, 4 XP earned
-    uint64_t id;    // fnv64 of the actor path (level-placed actors have the same path in both worlds); XP: EXPGainReason
+    uint8_t kind;   // 1 door state, 2 item taken, 3 item stored, 4 XP earned, 5 item given, 6 gift received (id: its eid)
+    uint64_t id;    // fnv64 of the actor path (level-placed actors have the same path in both worlds); XP: EXPGainReason;
+                    // gift: item level | rarity << 32
     int32_t a;      // door: EOCLState; items: count; XP: amount before the receiver's own multipliers
-    uint16_t len;   // item class path length (kinds 2, 3)
-    char path[256];
+    uint16_t len;   // item class path length (kinds 2, 3, 5; a gift: "<item class>|<mod class>|...")
+    char path[1024];
 };
 #pragma pack(pop)
 struct Outgoing {
@@ -57,9 +58,9 @@ struct Outgoing {
     double at[3];
     int sent;
 };
-constexpr uint32_t kMagic = 0x32433254;  // "T2C2": the last character is the protocol version, bump it on any packet change
+constexpr uint32_t kMagic = 0x33433254;  // "T2C3": the last character is the protocol version, bump it on any packet change
 constexpr const char* kVersion = "0.2.0-beta.6";
-constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13;
+constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13, kTravel = 14, kClock = 15, kCombat = 16;
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";
 
@@ -74,6 +75,7 @@ struct State {
     double px, py, pz;
     float yaw, pitch, vx, vy, vz;
     uint32_t map_hash;
+    uint8_t flags;  // bit 0: this player is dying or dead (its stand-in leaves the fights)
 };
 // Host -> client: authoritative NPC state. Ids are a 64-bit hash of the actor's path, which is the same in every
 // world for level-placed (World Partition, "_UAID_") actors.
@@ -81,13 +83,34 @@ struct EnemyRec {
     uint64_t id;
     float px, py, pz, yaw, health;
     uint8_t dead;
+    uint8_t target;  // whom it fights in the world that decides its fight: a Fight value
+    uint8_t flags;   // bit 0: the client's world decides its fight (the client is much nearer than the host)
+    uint64_t other;  // kSomeoneElse: that NPC's registry id, or a companion's ("party:" + its class)
 };
-constexpr int kMaxEnemyRecs = 48;
+constexpr int kMaxEnemyRecs = 32;  // 26 + 32 * 43 bytes: one packet fits the 1500-byte receive buffer (48 did not)
 struct Enemies {
     Header h;
     uint32_t map_hash;
     uint16_t count;
+    uint8_t fight;  // the party fights (either player): the stand-ins are on the players' team
     EnemyRec rec[kMaxEnemyRecs];
+};
+// Client -> host: the fights the client's world decides (kind 1: NPCs much nearer the client than the host) and hints
+// (kind 2: the client's copy of an NPC fights the client while the host's copy fights nobody: the client was seen first).
+struct CombatRec {
+    uint64_t id;
+    float px, py, pz;
+    uint8_t target;  // a Fight value, as seen in the client's world
+    uint8_t kind;
+    uint64_t other;  // as EnemyRec.other
+};
+constexpr int kMaxCombatRecs = 40;
+struct CombatMsg {
+    Header h;
+    uint32_t map_hash;
+    uint16_t count;
+    uint8_t fight;  // the client's player is in combat in its world
+    CombatRec rec[kMaxCombatRecs];
 };
 // Client -> host: damage the client's player dealt to an NPC in the client's world.
 struct Damage {
@@ -103,12 +126,32 @@ struct Look {
     uint8_t helmet_shown;
 };
 struct FacePart { uint32_t version; uint8_t part, parts; uint16_t len; char text[1100]; };  // one piece of a player's look
+struct TravelMsg {
+    uint32_t id;     // the travel's sender-unique id
+    uint8_t ack;     // 0 a travel starts (path: the destination data asset), 1 the receiver follows it, 2 it does not (path: why)
+    uint16_t len;
+    char path[256];
+};
 #pragma pack(pop)
+
+// Whom an NPC fights, in both players' terms (the same value in both worlds).
+enum Fight : uint8_t { kNobody = 0, kHostPlayer = 1, kClientPlayer = 2, kSomeoneElse = 3 };
 
 struct Npc {
     ue::UObject *actor = nullptr, *health = nullptr;
     float host_health = -1;  // client: last value applied from the host; -1 = none yet
     float pending_damage = 0;
+    // co-op combat
+    bool ai = false;                 // an IndianaAiCharacter (it can fight)
+    ue::UClass *cls = nullptr, *health_cls = nullptr, *ctrl_cls = nullptr;  // what actor, health and controller were
+    ue::UObject* ctrl = nullptr;     // its AI controller
+    bool client_owned = false;       // the client's world decides its fight
+    uint8_t target = kNobody;        // the deciding world's last word on whom it fights
+    uint64_t other = 0;              // and who, when it is neither player (EnemyRec.other)
+    ue::UObject* forced = nullptr;   // the player (or stand-in) our copy is pinned on, in the world that follows
+    uint8_t handle[0x18] = {};       // that pin: the PriorityNodeHandle of ForceOverridePrimaryTarget
+    bool has_handle = false;
+    double next_force = 0, next_hint = 0, rec_at = -100, owner_at = -100;
 };
 
 struct Snapshot {
@@ -141,8 +184,10 @@ struct Ctx {
     int scan_cursor = 0;
     ue::UClass* character_class = nullptr;
     double next_npc_send = 0;
+    uint64_t npc_eased = 0, npc_fight_snapped = 0;
     uint64_t npc_sent = 0, npc_applied = 0, npc_killed = 0, npc_snapped = 0, dmg_sent = 0, dmg_applied = 0, drops = 0, map_changes = 0;
     double settle_until = 0, next_tame = 0;
+    bool arrived_by_travel = false;  // this world came with a travel (the TravelManager still had a destination)
     // resync: the host hands its campaign over again (save + TCP) when the client cannot follow (map, quest outcome)
     uintptr_t world_ptr = 0, saves_blocked_world = 0;
     int port = 27960;
@@ -161,7 +206,7 @@ struct Ctx {
     uint32_t next_dmg_eid = 1;
     double start_time = 0, next_join_request = 0, map_since = 0;
     bool at_menu = false;
-    bool opt_story = true, opt_doors = true, opt_npcs = true, opt_scan = true;  // coop.set
+    bool opt_story = true, opt_doors = true, opt_npcs = true, opt_scan = true, opt_follow = true;  // coop.set
     uint64_t dmg_resent = 0, join_requests = 0;
     uint32_t next_eid = 1;
     std::vector<Outgoing> outgoing;
@@ -187,6 +232,46 @@ struct Ctx {
     std::vector<std::pair<int32_t, uint8_t>> xp_inbox;  // XP the other player earned, until there is a player to give it to
     uint64_t xp_sent = 0, xp_applied = 0, xp_blocked = 0, xp_details_filled = 0;
     std::string last_xp;
+    ue::UObject *travel_seen = nullptr, *travel_following = nullptr;  // our travel destination last frame; the one we follow
+    uint32_t travel_id = 0, travel_acked = 0, travel_in_id = 0;       // our last travel, its answer; the other player's
+    uint64_t travel_in_key = 0;
+    std::string travel_in, last_travel;                              // the other player's destination, until we follow
+    double travel_in_at = 0, follow_until = 0;                       // host: the client comes by itself until then
+    std::vector<std::pair<TravelMsg, double>> travel_out;            // copies to send, and when
+    uint64_t travels_sent = 0, travels_followed = 0, travels_refused = 0;
+    struct Gift { InteractMsg m; int size; double next, until; ue::UClass* item; int32_t count, level, rarity; std::vector<ue::UClass*> mods; };
+    std::vector<Gift> gifts_out;                   // given to the other player, until they confirm
+    std::vector<InteractMsg> gift_inbox;           // given to us, until there is a player to give them to
+    ue::UObject *transfer_widget = nullptr, *give_box = nullptr;  // the transfer screen we opened, on its hidden chest
+    double next_give_check = 0, next_close = 0;
+    uint64_t gifts_sent = 0, gifts_received = 0, gifts_returned = 0;
+    std::string last_gift;
+    bool opt_gifts = true;  // test switch: false = take no gift and answer none (the giver gets it back)
+    bool opt_give_hold = false;  // test switch: the chest is not emptied (a test puts a modded item in it first)
+    double reload_handed_at = -1e9;   // host: when it sent the save its game is loading (no hand-over once loaded)
+    bool died = false, campaign_wanted = false;  // client: dead now; the host's current game is asked for
+    double next_life_check = 0, next_campaign_ask = 0;
+    uint64_t deaths = 0, loads_redirected = 0, reloads_handed = 0;
+    double next_clock = 0, host_hour = -1, host_hour_at = 0;  // the host's calendar hour, when it came
+    bool clock_held = false;                                  // client: its calendar paused, the host's is behind
+    uint32_t resync_kind = 0;                                 // host: 1 = the hand-over is a save its game loads
+    uint64_t clock_jumps = 0, clock_holds = 0;
+    bool host_paused = false;
+    bool opt_combat = true;  // coop.set combat: false = each world fights on its own (as before)
+    double next_combat_send = 0;
+    uint64_t combat_pins = 0, combat_detections = 0, combat_hints_sent = 0, combat_hints_in = 0, combat_recs_in = 0, combat_handoffs = 0;
+    int combat_fights = 0, combat_owned = 0;  // host: NPCs fighting a player now; those the client's world decides
+    std::unordered_map<uint64_t, ue::UObject*> party, party_scan;  // this world's companions, by "party:" + class
+    ue::UObject* standin_team_for = nullptr;  // the stand-in whose team was last set, and to what
+    ue::UClass* puppet_cls = nullptr;         // the stand-in's class (identity check, see standin_ok)
+    bool standin_fighting = false, peer_fight = false;
+    double party_fight_until = 0, hint_fight_until = 0, peer_fight_at = -100;
+    uint64_t standin_team_changes = 0;
+    std::string standin_spell;  // the last CastSpell answer for the stand-in (ESpellCastResult), or "removed"
+    bool me_dead = false, peer_dead = false, opt_fake_dead = false;  // opt_fake_dead: test switch, we say we are dead
+    bool party_fighting = false;
+    double npcs_sent_at = -100;
+    double next_dead_check = 0;
 } g;
 
 uint64_t fnv64(const std::string& s) {
@@ -252,6 +337,8 @@ struct Fn {
     }
 };
 
+bool base_fn(Fn& f, const char* cls, const char* name);  // co-op combat, below
+
 ue::UObject* local_pawn() {
     std::string err;
     return ue::resolve("pawn", &err);
@@ -259,7 +346,7 @@ ue::UObject* local_pawn() {
 
 bool read_transform(ue::UObject* pawn, double pos[3], float& yaw, float& pitch, double vel[3]) {
     static Fn loc, rot, vel_fn;
-    if (!loc.init(pawn, "K2_GetActorLocation") || !rot.init(pawn, "K2_GetActorRotation") || !vel_fn.init(pawn, "GetVelocity")) return false;
+    if (!base_fn(loc, "/Script/Engine.Actor", "K2_GetActorLocation") || !base_fn(rot, "/Script/Engine.Actor", "K2_GetActorRotation") || !base_fn(vel_fn, "/Script/Engine.Actor", "GetVelocity")) return false;
     alignas(16) uint8_t b[256] = {};
     ue::process_event(pawn, loc.f, b);
     memcpy(pos, b + loc.off("ReturnValue"), 24);
@@ -291,7 +378,7 @@ void fill_header(Header& h, uint16_t type, uint16_t size) {
 // ---------------------------------------------------------------- NPCs (host authority over health and death)
 float npc_health(Npc& n) {
     static Fn get;
-    if (!get.init(n.health, "GetHealth")) return -1;
+    if (!base_fn(get, "/Script/Arkansas.HealthComponent", "GetHealth")) return -1;
     alignas(16) uint8_t b[32] = {};
     ue::process_event(n.health, get.f, b);
     float v;
@@ -301,7 +388,7 @@ float npc_health(Npc& n) {
 
 void npc_set_health(Npc& n, float hp) {
     static Fn set;
-    if (!set.init(n.health, "SetHealth")) return;
+    if (!base_fn(set, "/Script/Arkansas.HealthComponent", "SetHealth")) return;
     alignas(16) uint8_t b[64] = {};
     memcpy(b + set.off("Health"), &hp, 4);
     ue::process_event(n.health, set.f, b);
@@ -309,7 +396,7 @@ void npc_set_health(Npc& n, float hp) {
 
 void npc_kill(Npc& n) {
     static Fn die;
-    if (!die.init(n.health, "Suicide")) return;
+    if (!base_fn(die, "/Script/Arkansas.HealthComponent", "Suicide")) return;
     alignas(16) uint8_t b[64] = {};
     b[die.off("bPreventRevival")] = 1;
     // A death applied from the other world: its own inventory changes happen there too, they are not loot to mirror.
@@ -320,6 +407,8 @@ void npc_kill(Npc& n) {
     } guard;
     ue::process_event(n.health, die.f, b);
 }
+
+bool is_companion(ue::UObject* o);  // co-op combat, below
 
 // One slice of the object array per frame; a full pass replaces the registry.
 void scan_step(ue::UObject* pawn) {
@@ -339,20 +428,37 @@ void scan_step(ue::UObject* pawn) {
         }
         if (!ue::is_a(o, g.character_class) || !ue::alive(o)) continue;
         std::string path = ue::path_of(o);
-        if (path.find("_UAID_") == std::string::npos) continue;  // only level-placed actors have the same name everywhere
+        if (path.find("_UAID_") == std::string::npos) {  // only level-placed actors have the same name everywhere
+            if (o != g.puppet && is_companion(o)) g.party_scan[fnv64("party:" + ue::class_name(o))] = o;  // and companions, by class
+            continue;
+        }
         ue::UObject* hc = ue::resolve(ue::addr(o) + ".HealthComponent");
         if (!hc) continue;
         uint64_t id = fnv64(path);
-        Npc n;
+        static ue::UClass* ai_class = ue::find_class("/Script/Arkansas.IndianaAiCharacter");
+        Npc n;  // its live state (health, damage, fight, pin) joins it when the registries swap
         n.actor = o, n.health = hc;
-        auto old = g.npcs.find(id);
-        if (old != g.npcs.end() && old->second.actor == o) n.host_health = old->second.host_health, n.pending_damage = old->second.pending_damage;
+        n.cls = ue::class_of(o), n.health_cls = ue::class_of(hc);
+        n.ai = ai_class && ue::is_a(o, ai_class);
         g.scanning[id] = n;
     }
     g.scan_cursor = end;
     if (end >= total) {
+        // The live state goes over now, not when the scan reached the NPC: a pin taken or released since then came
+        // back stale and was released twice (run 99, the client's game crashed). A pin moves, never two copies.
+        for (auto& kv : g.scanning) {
+            auto old = g.npcs.find(kv.first);
+            if (old == g.npcs.end() || old->second.actor != kv.second.actor) continue;
+            Npc fresh = kv.second;
+            kv.second = old->second;
+            kv.second.health = fresh.health, kv.second.ai = fresh.ai, kv.second.cls = fresh.cls, kv.second.health_cls = fresh.health_cls;
+            old->second.has_handle = false;
+        }
+        // An NPC that did not come back went away (streamed out, destroyed): its pin went with its controller.
         g.npcs.swap(g.scanning);
         g.scanning.clear();
+        g.party.swap(g.party_scan);
+        g.party_scan.clear();
         g.interactables.swap(g.inter_scan);
         g.inter_scan.clear();
         g.scan_cursor = 0;
@@ -370,13 +476,324 @@ bool near_players(const double p[3], ue::UObject* pawn) {
     return !g.snaps.empty() && d2(g.snaps.back().px, g.snaps.back().py, g.snaps.back().pz) < r2;
 }
 
+// ---------------------------------------------------------------- Co-op combat
+// Both worlds run the game's own AI. One world decides each NPC's fight: the host's, or the client's when the client is
+// much nearer (an NPC far from a world's player has its AI asleep there: probe 90, no detection 200 m from the host).
+// That world says whom the NPC fights; in the other world our copy of the NPC is made to detect that player
+// (ForceFullDetection) and is pinned on them (ForceOverridePrimaryTarget, activated). Each player takes the hits of
+// the copies that fight them in their own world; the stand-ins take the others (god mode).
+
+// A held pointer can be alive and be another object: an unloaded object's memory and slot get reused (run 106: the
+// spell class pointer led to a StaticMeshActor). Identity is checked with the class too.
+bool npc_live(const Npc& n) {
+    return ue::alive(n.actor) && ue::class_of(n.actor) == n.cls && ue::alive(n.health) && ue::class_of(n.health) == n.health_cls;
+}
+
+bool standin_ok() { ue::UObject* p = g.puppet; return p && ue::alive(p) && ue::class_of(p) == g.puppet_cls; }
+
+// A function declared on a base class, found once: callable on any object of that class.
+bool base_fn(Fn& f, const char* cls, const char* name) {
+    if (f.f) return true;
+    ue::UClass* c = ue::find_class(cls);
+    return c && f.init(ue::cdo(c), name);
+}
+
+ue::UObject* npc_ctrl(Npc& n) {
+    if (n.ctrl && ue::alive(n.ctrl) && ue::class_of(n.ctrl) == n.ctrl_cls) return n.ctrl;
+    static ue::UClass* ai_ctrl = ue::find_class("/Script/Arkansas.IndianaAiController");
+    std::string err;
+    n.ctrl = ue::resolve(ue::addr(n.actor) + ".Controller", &err);
+    if (n.ctrl && (!ai_ctrl || !ue::is_a(n.ctrl, ai_ctrl))) n.ctrl = nullptr;
+    n.ctrl_cls = n.ctrl ? ue::class_of(n.ctrl) : nullptr;
+    return n.ctrl;
+}
+
+// The actor this NPC fights in this world now (none when it is not in combat).
+ue::UObject* fighting(Npc& n) {
+    static Fn combat, tgt;
+    ue::UObject* c = npc_ctrl(n);
+    if (!c || !base_fn(combat, "/Script/Arkansas.OwBaseCharacter", "IsInCombat") || !base_fn(tgt, "/Script/Arkansas.IndianaAiController", "K2_GetCurrentTarget")) return nullptr;
+    alignas(16) uint8_t b[64] = {};
+    ue::process_event(n.actor, combat.f, b);
+    if (!b[combat.off("ReturnValue")]) return nullptr;
+    memset(b, 0, sizeof b);
+    ue::process_event(c, tgt.f, b);
+    ue::UObject* t = nullptr;
+    memcpy(&t, b + tgt.off("ReturnValue"), sizeof t);
+    return t && ue::alive(t) ? t : nullptr;
+}
+
+uint8_t fight_of(ue::UObject* t, ue::UObject* pawn) {  // an actor of this world as a Fight value
+    if (!t) return kNobody;
+    if (t == pawn) return g.host ? kHostPlayer : kClientPlayer;
+    if (t == g.puppet) return g.host ? kClientPlayer : kHostPlayer;
+    return kSomeoneElse;
+}
+
+ue::UClass* load_class(const std::string& path);                          // below
+void call_quiet(const std::string& ref, const char* fn, const json& args);  // below
+
+bool pawn_in_combat(ue::UObject* pawn) {
+    static Fn f;
+    if (!pawn || !base_fn(f, "/Script/Arkansas.OwBaseCharacter", "IsInCombat")) return false;
+    alignas(16) uint8_t b[32] = {};
+    ue::process_event(pawn, f.f, b);
+    return b[f.off("ReturnValue")] != 0;
+}
+
+void unpin(Npc& n);  // below
+
+// A Blueprint class kept between frames: loaded again when the game unloaded it (nothing roots it; run 102: the
+// spell class was gone a minute later).
+ue::UClass* kept_class(ue::UClass*& cache, const char* path) {
+    if (!cache || !ue::alive(cache) || ue::path_of(cache) != path) cache = load_class(path);
+    return cache;
+}
+
+// The stand-in is on its player's team while the party fights (enemies may pick it, the fight splits), neutral to all
+// otherwise: out of a fight each player is only seen in their own world, with their own stealth (the stand-in never
+// crouches; creatures attacked the client's stand-in in the host's world on their own, probe 90).
+void standin_team(bool fight) {
+    if (!g.puppet || !standin_ok()) return;
+    if (g.standin_team_for == g.puppet && g.standin_fighting == fight) return;
+    ue::UObject* team = nullptr;
+    std::string err;
+    if (fight) team = ue::resolve("pawn.TeamComponent.CurrentTeamData", &err);
+    else {
+        static ue::UClass* rest = nullptr;
+        team = kept_class(rest, "/Game/Blueprints/AI/Teams/Teams/T_Generic_NeutralToAll.T_Generic_NeutralToAll_C");
+    }
+    if (!team) return;
+    json t = json::object();
+    t.set("InTeamData", ue::addr(team));
+    call_quiet(ue::addr(g.puppet) + ".TeamComponent", "SetTeam", t);
+    // A team alone is not enough: creatures went for a stand-in on T_Generic_NeutralToAll too (run 100). Out of a
+    // fight it is untargetable by AI, with the game's own spell for that.
+    static ue::UClass* spell_cache = nullptr;
+    ue::UClass* spell = kept_class(spell_cache, "/Game/Blueprints/Spells/AI/Spell_MakeNpcUntargetable.Spell_MakeNpcUntargetable_C");
+    ue::UFunction* f = spell ? ue::find_func(ue::class_of(g.puppet), fight ? "RemoveSpell" : "CastSpell") : nullptr;
+    if (f) {
+        json a = json::object();
+        a.set("SpellType", ue::addr(spell));
+        try {
+            json r = ue::call(g.puppet, f, a);
+            g.standin_spell = fight ? std::string("removed") : r.get("ReturnValue").asString();
+        } catch (const std::exception& e) { g.standin_spell = std::string("error: ") + e.what(); }
+    } else {
+        g.standin_spell = "no spell";
+    }
+    g.standin_team_for = g.puppet, g.standin_fighting = fight;
+    g.standin_team_changes++;
+    core_log(std::string("combat: the stand-in ") + (fight ? "is in the fight" : "is out of the fight, untargetable: " + g.standin_spell));
+}
+
+// Either player fights (lasts 5 s after the last sign): the party's fight.
+bool party_fight(ue::UObject* pawn) {
+    bool sign = pawn_in_combat(pawn) || (g.peer_fight && g.now - g.peer_fight_at < 1.0);
+    if (g.host) sign = sign || g.combat_fights > 0 || g.now < g.hint_fight_until;
+    if (sign) g.party_fight_until = g.now + 5.0;
+    bool on = g.now < g.party_fight_until;
+    if (on != g.party_fighting) g.party_fighting = on, core_log(on ? "combat: the party fights" : "combat: the party's fight is over");
+    return on;
+}
+
+bool is_companion(ue::UObject* o) {
+    static ue::UClass* ai_class = ue::find_class("/Script/Arkansas.IndianaAiCharacter");
+    static ue::UClass* ai_ctrl = ue::find_class("/Script/Arkansas.IndianaAiController");
+    static Fn f;
+    if (!ai_class || !ai_ctrl || !ue::is_a(o, ai_class) || !base_fn(f, "/Script/Arkansas.IndianaAiController", "K2_IsCompanion")) return false;
+    std::string err;
+    ue::UObject* c = ue::resolve(ue::addr(o) + ".Controller", &err);
+    if (!c || !ue::is_a(c, ai_ctrl)) return false;
+    alignas(16) uint8_t b[32] = {};
+    ue::process_event(c, f.f, b);
+    return b[f.off("ReturnValue")] != 0;
+}
+
+uint64_t other_id(ue::UObject* t) {  // the other side of a fight that is neither player, as the other world finds it
+    if (!t) return 0;
+    std::string path = ue::path_of(t);
+    if (path.find("_UAID_") != std::string::npos) return fnv64(path);
+    return fnv64("party:" + ue::class_name(t));
+}
+
+ue::UObject* other_actor(uint64_t id) {
+    auto it = g.npcs.find(id);
+    if (it != g.npcs.end() && npc_live(it->second)) return it->second.actor;
+    auto p = g.party.find(id);  // a companion: its class is in its key
+    return p != g.party.end() && ue::alive(p->second) && fnv64("party:" + ue::class_name(p->second)) == id ? p->second : nullptr;
+}
+
+void force_detect(Npc& n, ue::UObject* who) {
+    static Fn f, loc;
+    ue::UObject* c = npc_ctrl(n);
+    std::string err;
+    ue::UObject* det = c ? ue::resolve(ue::addr(c) + ".AIDetectionComponent", &err) : nullptr;
+    if (!det || !base_fn(f, "/Script/Arkansas.AIDetectionComponent", "ForceFullDetection") || !base_fn(loc, "/Script/Engine.Actor", "K2_GetActorLocation")) return;
+    alignas(16) uint8_t b[128] = {};
+    if (f.size > static_cast<int>(sizeof b)) return;
+    ue::process_event(who, loc.f, b);
+    double p[3];
+    memcpy(p, b + loc.off("ReturnValue"), 24);
+    memset(b, 0, sizeof b);
+    memcpy(b + f.off("DetectedActor"), &who, sizeof who);
+    memcpy(b + f.off("ExternalStimulusLocation"), p, 24);
+    b[f.off("bPermitArkansasAI")] = 1;
+    ue::process_event(det, f.f, b);
+    g.combat_detections++;
+}
+
+const wchar_t kPinFrom[] = L"tow2coop";
+ue::UObject* priority_lib(const char* cls) {
+    ue::UClass* c = ue::find_class(cls);
+    return c ? ue::cdo(c) : nullptr;
+}
+
+bool pin_target(Npc& n, ue::UObject* who) {
+    static Fn over, act;
+    static ue::UObject* lib = priority_lib("/Script/Arkansas.AITargetInfoPriorityFunctionLibrary");
+    static ue::UObject* nodes = priority_lib("/Script/Arkansas.PriorityNodeFunctionLibrary");
+    ue::UObject* c = npc_ctrl(n);
+    if (!c || !lib || !nodes || !over.init(lib, "ForceOverridePrimaryTarget") || !act.init(nodes, "Activate")) return false;
+    alignas(16) uint8_t b[128] = {};
+    if (over.size > static_cast<int>(sizeof b) || act.size > static_cast<int>(sizeof b)) return false;
+    memcpy(b + over.off("Controller"), &c, sizeof c);
+    b[over.off("Priority")] = 175;  // EPriorityNodeValue::High
+    memcpy(b + over.off("ForcedTargetActor"), &who, sizeof who);
+    ue::process_event(lib, over.f, b);
+    uint8_t h[sizeof n.handle];
+    memcpy(h, b + over.off("ReturnValue"), sizeof h);
+    memset(b, 0, sizeof b);  // Activate(PriorityNodeHandle&, Owner, FromWhere): without it the pin does nothing (probe 90)
+    memcpy(b + act.off("PriorityNodeHandle"), h, sizeof h);
+    memcpy(b + act.off("Owner"), &c, sizeof c);
+    ue::FString from{const_cast<wchar_t*>(kPinFrom), 9, 9};
+    memcpy(b + act.off("FromWhere"), &from, sizeof from);
+    ue::process_event(nodes, act.f, b);
+    if (!b[act.off("ReturnValue")]) return false;
+    memcpy(n.handle, b + act.off("PriorityNodeHandle"), sizeof n.handle);
+    n.has_handle = true;
+    g.combat_pins++;
+    return true;
+}
+
+void unpin(Npc& n) {
+    if (!n.has_handle) return;
+    n.has_handle = false;
+    static Fn de;
+    static ue::UObject* nodes = priority_lib("/Script/Arkansas.PriorityNodeFunctionLibrary");
+    if (!n.ctrl || !ue::alive(n.ctrl) || ue::class_of(n.ctrl) != n.ctrl_cls || !nodes || !de.init(nodes, "Deactivate")) return;  // the pin went with its controller
+    alignas(16) uint8_t b[64] = {};
+    if (de.size > static_cast<int>(sizeof b)) return;
+    memcpy(b + de.off("PriorityNodeHandle"), n.handle, sizeof n.handle);
+    ue::process_event(nodes, de.f, b);
+}
+
+// The deciding world's word on whom this NPC fights, applied to our copy: it detects that player (or their
+// stand-in) and is pinned on them; looked at again every second (our copy may lose sight of them here).
+void follow_fight(Npc& n, uint8_t word, ue::UObject* pawn) {
+    ue::UObject* want = word == kHostPlayer ? (g.host ? pawn : g.puppet) : word == kClientPlayer ? (g.host ? g.puppet : pawn) : nullptr;
+    if (word == kSomeoneElse && n.other) want = other_actor(n.other);  // the same companion or NPC in this world
+    if (want && !ue::alive(want)) want = nullptr;
+    if (want == g.puppet && g.peer_dead) want = nullptr;  // their stand-in left the fight
+    if (want == n.forced && g.now < n.next_force) return;
+    n.next_force = g.now + 1.0;
+    if (want != n.forced) {
+        unpin(n);
+        n.forced = nullptr;
+    }
+    if (!want) return;
+    if (want == g.puppet) standin_team(true), g.party_fight_until = std::max(g.party_fight_until, g.now + 5.0);
+    if (fighting(n) != want) force_detect(n, want);
+    if (!n.has_handle) pin_target(n, want);
+    n.forced = want;
+}
+
+// Our copy drifted from the deciding world's: snap it there past 3 m, or, in a fight (both copies run their own
+// fight and move a lot), ease it back by 15 % of the gap per update past 1.5 m and snap only past 6 m (run 98: 49
+// snaps of 3 m and more in about 35 s of fighting).
+void snap_npc(Npc& n, double x, double y, double z) {
+    static Fn loc, set, slide;
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return;
+    if (!base_fn(loc, "/Script/Engine.Actor", "K2_GetActorLocation") || !base_fn(set, "/Script/Engine.Actor", "K2_SetActorLocationAndRotation") ||
+        !base_fn(slide, "/Script/Engine.Actor", "K2_SetActorLocation")) return;
+    alignas(16) uint8_t b[512] = {};
+    if (set.size > static_cast<int>(sizeof b) || slide.size > static_cast<int>(sizeof b)) return;
+    ue::process_event(n.actor, loc.f, b);
+    double p[3];
+    memcpy(p, b + loc.off("ReturnValue"), 24);
+    double dx = x - p[0], dy = y - p[1], dz = z - p[2];
+    double d2 = dx * dx + dy * dy + dz * dz;
+    bool fight = n.target != kNobody;
+    double hard = fight ? 600.0 : 300.0;
+    memset(b, 0, sizeof b);
+    if (d2 > hard * hard) {
+        double np[3] = {x, y, z};
+        memcpy(b + set.off("NewLocation"), np, 24);
+        b[set.off("bTeleport")] = 1;
+        ue::process_event(n.actor, set.f, b);
+        g.npc_snapped++;
+        if (fight) g.npc_fight_snapped++;
+    } else if (fight && d2 > 150.0 * 150.0) {
+        double np[3] = {p[0] + dx * 0.15, p[1] + dy * 0.15, p[2] + dz * 0.15};
+        memcpy(b + slide.off("NewLocation"), np, 24);
+        b[slide.off("bSweep")] = 1;  // a wall or another body stops it
+        ue::process_event(n.actor, slide.f, b);
+        g.npc_eased++;
+    }
+}
+
+double dist3(const double a[3], const double b[3]) { return std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2])); }
+
+// Host: which world decides this NPC's fight, and (when it is ours) whom it fights. p: its position, me: the host
+// player's (null when unknown).
+void host_fight(Npc& n, const double p[3], const double* me, ue::UObject* pawn) {
+    bool fresh = !g.snaps.empty() && g.now - g.snaps.back().t < 2.0 && g.puppet_map == g.my_map;
+    double dh = me ? dist3(p, me) : 1e12, dc = 1e12;
+    if (fresh) {
+        const Snapshot& s = g.snaps.back();
+        double c[3] = {s.px, s.py, s.pz};
+        dc = dist3(p, c);
+    }
+    bool own = fresh && (n.client_owned ? dh > 4000 && dc < dh - 1000 : dh > 5000 && dc < dh - 2000);  // 50 m out, 40 m back
+    if (own != n.client_owned) {
+        n.client_owned = own;
+        unpin(n);
+        n.forced = nullptr;
+        n.target = kNobody, n.other = 0;
+        n.owner_at = g.now;
+        g.combat_handoffs++;
+    }
+    if (n.client_owned) {
+        if (g.now - n.owner_at > 2.0) n.target = kNobody;  // no word from the client lately
+        follow_fight(n, n.target, pawn);
+        return;
+    }
+    ue::UObject* t = fighting(n);
+    n.target = fight_of(t, pawn);
+    n.other = n.target == kSomeoneElse ? other_id(t) : 0;
+}
+
 void host_send_npcs(ue::UObject* pawn) {
     Enemies e{};
     e.map_hash = g.my_map;
     static Fn loc;
+    double me[3], v[3];
+    float yaw, pitch;
+    bool have_me = read_transform(pawn, me, yaw, pitch, v);
+    bool sent = false;
+    e.fight = g.opt_combat && party_fight(pawn) ? 1 : 0;
+    if (g.opt_combat) standin_team(e.fight != 0);
+    auto flush = [&] {
+        uint16_t size = static_cast<uint16_t>(offsetof(Enemies, rec) + e.count * sizeof(EnemyRec));
+        fill_header(e.h, kEnemies, size);
+        send_raw(&e, size);
+        g.npc_sent++;
+        e.count = 0, sent = true;
+    };
+    int fights = 0, owned = 0;
     for (auto& kv : g.npcs) {
         Npc& n = kv.second;
-        if (!ue::alive(n.actor) || !ue::alive(n.health) || !loc.init(n.actor, "K2_GetActorLocation")) continue;
+        if (!npc_live(n) || !base_fn(loc, "/Script/Engine.Actor", "K2_GetActorLocation")) continue;
         alignas(16) uint8_t b[64] = {};
         ue::process_event(n.actor, loc.f, b);
         double p[3];
@@ -386,21 +803,99 @@ void host_send_npcs(ue::UObject* pawn) {
         r.id = kv.first, r.px = static_cast<float>(p[0]), r.py = static_cast<float>(p[1]), r.pz = static_cast<float>(p[2]);
         r.health = npc_health(n);
         r.dead = r.health <= 0;
-        if (++e.count == kMaxEnemyRecs) break;  // shortcut: nearest-first ordering and several packets when more fight at once
+        r.target = kNobody, r.flags = 0, r.other = 0;
+        if (r.dead) {  // its last word must not stay (run 106: a dead Ursopod still "fought" the client)
+            n.target = kNobody, n.other = 0;
+            if (n.has_handle) unpin(n), n.forced = nullptr;
+        }
+        if (!r.dead && n.ai && g.opt_combat) {
+            host_fight(n, p, have_me ? me : nullptr, pawn);
+            r.target = n.target, r.flags = n.client_owned ? 1 : 0, r.other = n.other;
+            fights += n.target == kHostPlayer || n.target == kClientPlayer;
+            owned += n.client_owned;
+        }
+        if (++e.count == kMaxEnemyRecs) flush();  // more NPCs near: another packet
     }
-    uint16_t size = static_cast<uint16_t>(offsetof(Enemies, rec) + e.count * sizeof(EnemyRec));
-    fill_header(e.h, kEnemies, size);
-    send_raw(&e, size);
-    g.npc_sent++;
+    if (e.count || !sent) flush();
+    g.combat_fights = fights, g.combat_owned = owned;
+    g.npcs_sent_at = g.now;
+}
+
+// Client, 5 times a second: the fights its world decides, and hints.
+void client_send_combat(ue::UObject* pawn) {
+    CombatMsg m{};
+    m.map_hash = g.my_map;
+    static Fn loc;
+    bool sent = false;
+    m.fight = pawn_in_combat(pawn) ? 1 : 0;
+    standin_team(party_fight(pawn));
+    auto flush = [&] {
+        uint16_t size = static_cast<uint16_t>(offsetof(CombatMsg, rec) + m.count * sizeof(CombatRec));
+        fill_header(m.h, kCombat, size);
+        send_raw(&m, size);
+        m.count = 0, sent = true;
+    };
+    for (auto& kv : g.npcs) {
+        Npc& n = kv.second;
+        if (!n.ai || g.now - n.rec_at > 1.0 || !npc_live(n)) continue;  // only NPCs the host streams now
+        if (!n.client_owned && (n.target != kNobody || g.now < n.next_hint)) continue;
+        ue::UObject* t = fighting(n);
+        if (!n.client_owned) {
+            if (!t || t != pawn) continue;  // a hint: our copy fights our player, the host's copy fights nobody
+            n.next_hint = g.now + 1.0;
+            g.combat_hints_sent++;
+        }
+        if (!base_fn(loc, "/Script/Engine.Actor", "K2_GetActorLocation")) continue;
+        alignas(16) uint8_t b[64] = {};
+        ue::process_event(n.actor, loc.f, b);
+        double p[3];
+        memcpy(p, b + loc.off("ReturnValue"), 24);
+        CombatRec& r = m.rec[m.count];
+        r.id = kv.first, r.px = static_cast<float>(p[0]), r.py = static_cast<float>(p[1]), r.pz = static_cast<float>(p[2]);
+        r.target = fight_of(t, pawn);
+        r.other = r.target == kSomeoneElse ? other_id(t) : 0;
+        r.kind = n.client_owned ? 1 : 2;
+        if (++m.count == kMaxCombatRecs) flush();
+    }
+    if (m.count || !sent) flush();
+}
+
+// Host: the client's fights (NPCs its world decides) and hints (the client was seen first).
+void host_apply_combat(const CombatMsg& m) {
+    if (m.map_hash != g.my_map || !g.opt_combat) return;
+    g.peer_fight = m.fight != 0, g.peer_fight_at = g.now;
+    ue::UObject* pawn = local_pawn();
+    for (int i = 0; i < m.count; i++) {
+        const CombatRec& r = m.rec[i];
+        auto it = g.npcs.find(r.id);
+        if (it == g.npcs.end()) continue;
+        Npc& n = it->second;
+        if (!n.ai || !npc_live(n) || npc_health(n) <= 0) continue;
+        g.combat_recs_in++;
+        if (r.kind == 1 && n.client_owned) {
+            n.target = r.target <= kSomeoneElse ? r.target : kNobody;
+            n.other = r.other;
+            n.owner_at = g.now;
+            if (pawn) follow_fight(n, n.target, pawn);
+            snap_npc(n, r.px, r.py, r.pz);
+        } else if (r.kind == 2 && !n.client_owned && n.target == kNobody && g.now >= n.next_force && g.puppet && standin_ok() && !g.peer_dead) {
+            g.hint_fight_until = g.now + 5.0;
+            standin_team(true);
+            force_detect(n, g.puppet);  // the client's copy saw the client first: ours notices the client's stand-in
+            n.next_force = g.now + 1.0;
+            g.combat_hints_in++;
+        }
+    }
 }
 
 void apply_npcs(const Enemies& e) {
     if (e.map_hash != g.my_map) return;
-    static Fn loc, set;
+    g.peer_fight = e.fight != 0, g.peer_fight_at = g.now;
+    ue::UObject* pawn = local_pawn();
     for (int i = 0; i < e.count; i++) {
         const EnemyRec& r = e.rec[i];
         auto it = g.npcs.find(r.id);
-        if (it == g.npcs.end() || !ue::alive(it->second.actor) || !ue::alive(it->second.health)) continue;
+        if (it == g.npcs.end() || !npc_live(it->second)) continue;
         Npc& n = it->second;
         float local = npc_health(n);
         if (n.host_health >= 0 && local < n.host_health - 0.5f && local < r.health - 0.5f)
@@ -409,20 +904,22 @@ void apply_npcs(const Enemies& e) {
         else if (!r.dead && std::fabs(local - r.health) > 0.5f) npc_set_health(n, r.health);
         n.host_health = r.health;
         g.npc_applied++;
-        if (!r.dead && loc.init(n.actor, "K2_GetActorLocation") && set.init(n.actor, "K2_SetActorLocationAndRotation")) {
-            alignas(16) uint8_t b[512] = {};
-            ue::process_event(n.actor, loc.f, b);
-            double p[3];
-            memcpy(p, b + loc.off("ReturnValue"), 24);
-            double dx = p[0] - r.px, dy = p[1] - r.py, dz = p[2] - r.pz;
-            if (dx * dx + dy * dy + dz * dz > 300.0 * 300.0) {  // drifted more than 3 m: snap to the host's position
-                memset(b, 0, sizeof b);
-                double np[3] = {r.px, r.py, r.pz};
-                memcpy(b + set.off("NewLocation"), np, 24);
-                b[set.off("bTeleport")] = 1;
-                ue::process_event(n.actor, set.f, b);
-                g.npc_snapped++;
-            }
+        n.client_owned = (r.flags & 1) != 0;
+        n.rec_at = g.now;
+        n.target = r.target <= kSomeoneElse ? r.target : kNobody;
+        n.other = r.other;
+        if (r.dead) {  // its pin goes with it
+            unpin(n);
+            n.forced = nullptr;
+            continue;
+        }
+        if (!n.client_owned) snap_npc(n, r.px, r.py, r.pz);  // a fight our world decides moves here, not there
+        if (!n.ai || !g.opt_combat || !pawn) continue;
+        if (n.client_owned) {
+            unpin(n);
+            n.forced = nullptr;
+        } else {
+            follow_fight(n, n.target, pawn);
         }
     }
 }
@@ -456,7 +953,7 @@ void resend_damage() {
 
 void apply_damage(const Damage& d) {
     auto it = g.npcs.find(d.id);
-    if (it == g.npcs.end() || !ue::alive(it->second.actor) || !ue::alive(it->second.health) || d.amount <= 0 || d.amount > 1e6f) return;
+    if (it == g.npcs.end() || !npc_live(it->second) || d.amount <= 0 || d.amount > 1e6f) return;
     float hp = npc_health(it->second);
     if (hp <= 0) return;
     if (hp - d.amount <= 0) npc_kill(it->second);
@@ -469,39 +966,51 @@ std::string bind_ip() {
     return b.empty() ? std::string("0.0.0.0") : b;
 }
 
-void request_resync(const char* reason, bool host_moved = false) {
-    if (!g.host || !g.have_peer || (!host_moved && g.now < g.resync_cooldown)) return;
+bool request_resync(const char* reason, bool host_moved = false, const std::wstring& existing = L"") {
+    if (!g.host || !g.have_peer || (!host_moved && g.now < g.resync_cooldown)) return false;
     try {
         char peer_ip[64] = "";
         inet_ntop(AF_INET, &g.peer.sin_addr, peer_ip, sizeof peer_ip);
         // the campaign goes to the joined player only: its address (TCP), or its SteamID (pushed over Steam)
-        join::host_offer(g.port + 1, bind_ip(), peer_ip, g.steam ? g.peer_id : 0, g.me);
+        join::host_offer(g.port + 1, bind_ip(), peer_ip, g.steam ? g.peer_id : 0, g.me, existing);
     } catch (const std::exception& e) {
         g.last_error = std::string("resync offer: ") + e.what();
         static std::string logged;  // once per reason: the client asks again every few seconds
         if (logged != e.what()) core_log(std::string("hand-over waits: ") + (logged = e.what()));
-        return;
+        return false;
     }
     g.resync_cooldown = g.now + 60.0;  // one hand-over at a time; the client needs ~30-60 s to reload
     g.push_pending = false;
-    g.resync_sends = 6, g.next_resync_send = g.now + 2.0;
+    g.resync_sends = 6, g.next_resync_send = g.now + (existing.empty() ? 2.0 : 0.0);  // a loaded save: no save to wait for
+    g.resync_kind = existing.empty() ? 0 : 1;
     g.resyncs++;
     g.resync_reason = reason;
+    return true;
 }
 
 void client_fetch_resync(const char* body, int len) {
-    if (g.host || len != 8) return;
-    uint32_t port, host_id;
+    if (g.host || len != 16) return;
+    uint32_t port, host_id, kind, id;  // kind 1: a save the host's game loads (a reload); id: which hand-over
     memcpy(&port, body, 4);
     memcpy(&host_id, body + 4, 4);
+    memcpy(&kind, body + 8, 4);
+    memcpy(&id, body + 12, 4);
     char ip[64] = "";
     inet_ntop(AF_INET, &g.peer.sin_addr, ip, sizeof ip);
-    if (g.now < g.fetch_quiet_until) return;  // the host repeats its notice; one hand-over per resync
+    // The host repeats each notice: one fetch per hand-over (run 96: a 30 s quiet window after a death's fetch made
+    // the next reload's first notice wait for the host's load to end, 9 s late).
+    static uint64_t fetched = 0;
+    uint64_t key = static_cast<uint64_t>(host_id) << 32 | id;
+    if (key == fetched) return;
     try {
         if (g.steam) join::client_expect(host_id);  // the host pushes the files on Steam channel 1
         else join::client_fetch(ip, static_cast<int>(port), host_id);
         g.resync_fetches++;
         g.fetch_quiet_until = g.now + 30.0;
+        fetched = key;
+        g.campaign_wanted = false;
+        if (kind == 1) character::use_kept_next();      // a reload: the character as last kept, no save to wait for
+        else if (join::joined()) character::save_now();  // keep the character while the files come (not when dead)
     } catch (const std::exception&) {}  // already fetching
 }
 
@@ -591,7 +1100,7 @@ void process_observed() {
             queue_interact(1, fnv64(path), st, "");
             g.doors_sent++;
             g.last_interact = "sent door " + path.substr(path.rfind('.') + 1) + " -> " + std::to_string(st);
-        } else if (fname == "HandleItemRemoved" || fname == "ItemRemoved") {
+        } else if (fname == "ItemRemoved") {  // containers: watch_boxes sees every take, whole stack or part of one
             int off = param_offset(f, fname == "ItemRemoved" ? "Item" : "ItemStack");
             if (off < 0 || off + 12 > 64) continue;
             ue::UObject* item;
@@ -618,10 +1127,10 @@ void process_observed() {
 // Trading: what the containers near the player hold (every 0.25 s). A container that gained items of a class the
 // player just lost got them from the player: a new stack, or added to one it had (the game fires no event for that,
 // run 71). The other world's same container gets them too.
-std::unordered_map<ue::UClass*, int32_t> box_items(ue::UObject* box) {
-    std::unordered_map<ue::UClass*, int32_t> out;
+std::vector<std::pair<ue::UObject*, int32_t>> stacks_of(ue::UObject* actor) {  // its inventory's item stacks
+    std::vector<std::pair<ue::UObject*, int32_t>> out;
     std::string err;
-    ue::UObject* inv = ue::resolve(ue::addr(box) + ".InventoryComponent", &err);
+    ue::UObject* inv = ue::resolve(ue::addr(actor) + ".InventoryComponent", &err);
     static int items_off = -2;
     if (!inv) return out;
     if (items_off == -2) {
@@ -637,7 +1146,13 @@ std::unordered_map<ue::UClass*, int32_t> box_items(ue::UObject* box) {
     memcpy(&num, reinterpret_cast<const uint8_t*>(inv) + items_off + 8, 4);
     if (!data || num <= 0 || num > 4096 || !ue::readable(data, static_cast<size_t>(num) * sizeof(Stack))) return out;
     for (int i = 0; i < num; i++)
-        if (data[i].item && data[i].count > 0 && ue::alive(data[i].item)) out[ue::class_of(data[i].item)] += data[i].count;
+        if (data[i].item && data[i].count > 0 && ue::alive(data[i].item)) out.push_back({data[i].item, data[i].count});
+    return out;
+}
+
+std::unordered_map<ue::UClass*, int32_t> box_items(ue::UObject* box) {
+    std::unordered_map<ue::UClass*, int32_t> out;
+    for (const auto& s : stacks_of(box)) out[ue::class_of(s.first)] += s.second;
     return out;
 }
 
@@ -652,10 +1167,10 @@ void watch_boxes(ue::UObject* pawn) {
     std::unordered_map<uint64_t, std::unordered_map<ue::UClass*, int32_t>> close_by;  // ('near' is a Windows macro)
     for (auto& kv : g.interactables) {
         ue::UObject* box = kv.second;
-        if (!ue::alive(box) || !ue::is_a(box, g.container_class)) continue;
+        if (!ue::alive(box) || !ue::is_a(box, g.container_class) || box == g.give_box) continue;  // (the giving chest: gifts)
         auto at = g.box_pos.find(kv.first);
         if (at == g.box_pos.end()) {
-            if (budget-- <= 0 || !loc.init(box, "K2_GetActorLocation")) continue;
+            if (budget-- <= 0 || !base_fn(loc, "/Script/Engine.Actor", "K2_GetActorLocation")) continue;
             alignas(16) uint8_t b[64] = {};
             ue::process_event(box, loc.f, b);
             std::array<double, 3> p;
@@ -677,6 +1192,14 @@ void watch_boxes(ue::UObject* pawn) {
                 queue_interact(3, kv.first, gained, ue::path_of(it.first));
                 g.items_sent++;
                 g.last_interact = "sent store " + std::to_string(gained) + "x " + ue::name_of(it.first);
+            }
+            for (const auto& w : was->second) {  // taken out: a whole stack or part of one (the other player's takes
+                auto now = items.find(w.first);   // applied here already lowered the snapshot: no echo)
+                int32_t lost = w.second - (now == items.end() ? 0 : now->second);
+                if (lost <= 0) continue;
+                queue_interact(2, kv.first, lost, ue::path_of(w.first));
+                g.items_sent++;
+                g.last_interact = "sent take " + std::to_string(lost) + "x " + ue::name_of(w.first);
             }
         }
         close_by[kv.first] = std::move(items);
@@ -799,7 +1322,7 @@ void apply_interact(const InteractMsg& m) {
     ue::UObject* actor = interactable(m.id);
     if (!actor && m.kind == 2) {  // a looted dead NPC: the NPC registry knows it by the same path id
         auto it = g.npcs.find(m.id);
-        if (it != g.npcs.end() && ue::alive(it->second.actor)) actor = it->second.actor;
+        if (it != g.npcs.end() && npc_live(it->second)) actor = it->second.actor;
     }
     if (!actor) return;
     std::string err;
@@ -863,6 +1386,8 @@ void apply_interact(const InteractMsg& m) {
                 if (have > 0) {
                     q.set("Count", std::min(have, static_cast<int>(m.a)));
                     ue::call(inv, ue::find_func(ue::class_of(inv), "RemoveItemFromActor"), q);
+                    auto snap = g.box_counts.find(m.id);  // the container watch must not send this take back
+                    if (snap != g.box_counts.end()) snap->second[item] = std::max(0, snap->second[item] - std::min(have, static_cast<int>(m.a)));
                     g.items_applied++;
                     g.last_interact = "applied take " + std::to_string(m.a) + "x " + ue::name_of(item) + " from " + ue::name_of(actor);
                 }
@@ -876,6 +1401,647 @@ void apply_interact(const InteractMsg& m) {
 
 void on_face(const char* body, int len);  // below: the other player's look, in pieces
 
+void close_transfer();  // below (giving items): the transfer screen we opened, closed as the player would
+void call_quiet(const std::string& ref, const char* fn, const json& args);  // below
+
+// ---------------------------------------------------------------- following a travel
+// A travel (a door into an interior, the ship, a fast travel: the TravelManager's ActiveTravelDestination gets set)
+// starts the same travel in the other world at once, so both players load the new map together; before, the client
+// waited for the host's save of the new map (run 81: 22 s behind the host). The client follows the host's travels and
+// the host the client's. The save hand-over stays the fallback: a travel refused or not answered, and loads that are no
+// travel (a save loaded, a death).
+ue::UObject* travel_manager() {
+    static ue::UObject* tm = nullptr;
+    static double next_look = 0;
+    if (tm && ue::alive(tm)) return tm;
+    if (g.now < next_look) return nullptr;  // none (the main menu): a search walks every object, not each frame
+    next_look = g.now + 2.0;
+    std::vector<ue::UObject*> v = ue::instances(ue::find_class("/Script/Arkansas.TravelManager"), false, 1);
+    return tm = v.empty() ? nullptr : v[0];
+}
+
+ue::UObject* travel_destination(ue::UObject* tm) {  // the travel under way, nullptr if none
+    static int off = -1;
+    if (off < 0) {
+        ue::FProperty* p = ue::find_prop(ue::class_of(tm), "ActiveTravelDestination");
+        off = p ? ue::prop_offset(p) : 0;
+    }
+    ue::UObject* d = off ? *reinterpret_cast<ue::UObject**>(reinterpret_cast<uint8_t*>(tm) + off) : nullptr;
+    return d && ue::alive(d) ? d : nullptr;
+}
+
+void queue_travel(uint32_t id, uint8_t ack, const std::string& text) {  // 3 copies, 0.15 s apart (UDP may drop one)
+    TravelMsg m{};
+    m.id = id, m.ack = ack;
+    m.len = static_cast<uint16_t>(std::min(text.size(), sizeof m.path));
+    memcpy(m.path, text.data(), m.len);
+    for (int i = 0; i < 3; i++) g.travel_out.push_back({m, g.now + 0.15 * i});
+}
+
+void send_travels() {
+    for (size_t i = 0; i < g.travel_out.size();) {
+        if (g.now < g.travel_out[i].second) { i++; continue; }
+        const TravelMsg& m = g.travel_out[i].first;
+        send_typed(kTravel, &m, static_cast<int>(offsetof(TravelMsg, path)) + m.len);
+        g.travel_out.erase(g.travel_out.begin() + i);
+    }
+}
+
+void on_travel(const char* body, int len) {
+    TravelMsg m{};
+    if (len < static_cast<int>(offsetof(TravelMsg, path)) || len > static_cast<int>(sizeof m)) { g.bad++; return; }
+    memcpy(&m, body, len);
+    if (m.len > sizeof m.path || len != static_cast<int>(offsetof(TravelMsg, path)) + m.len) { g.bad++; return; }
+    std::string text(m.path, m.len);
+    if (m.ack) {  // the answer to our travel
+        if (m.id != g.travel_id || g.travel_acked == m.id) return;
+        g.travel_acked = m.id;
+        if (g.host) g.follow_until = m.ack == 1 ? g.now + 90.0 : 0;  // the client comes by itself: no hand-over meanwhile
+        g.last_travel = m.ack == 1 ? "the other player follows" : "the other player stays (" + text + "): the save hand-over brings them";
+        core_log("travel: " + g.last_travel);
+        return;
+    }
+    uint64_t key = static_cast<uint64_t>(g.remote_id) << 32 | m.id;  // a restarted game counts its travels from 1 again
+    if (key == g.travel_in_key) return;                                  // a copy
+    g.travel_in_key = key, g.travel_in_id = m.id;
+    g.travel_in = text, g.travel_in_at = g.now;
+}
+
+// Our own travel starting: ask the other player to follow.
+void watch_travel() {
+    ue::UObject* tm = travel_manager();
+    ue::UObject* d = tm ? travel_destination(tm) : nullptr;
+    if (d == g.travel_seen) return;
+    g.travel_seen = d;
+    if (!d) { g.travel_following = nullptr; return; }  // a travel ended
+    if (d == g.travel_following) return;               // the one we started to follow the other player's
+    if (!g.have_peer || !g.remote_id || (!g.host && !join::joined())) return;  // nobody to bring, or the friend's own campaign
+    queue_travel(++g.travel_id, 0, ue::path_of(d));
+    g.travels_sent++;
+    g.last_travel = "to " + ue::name_of(d) + ": the other player is asked to follow";
+    core_log("travel: " + g.last_travel);
+}
+
+bool in_combat(ue::UObject* pawn) {
+    ue::UFunction* f = ue::find_func(ue::class_of(pawn), "IsInCombat");
+    try { return f && ue::call(pawn, f, json::object()).get("ReturnValue").asBool(false); } catch (const std::exception&) { return false; }
+}
+
+// The other player's travel: start the same one here (game thread, in gameplay).
+void follow_travel(ue::UObject* pawn) {
+    if (g.travel_in.empty() || join::loading()) return;
+    if (g.transfer_widget) { close_transfer(); return; }  // its chest goes away with this world
+    std::string path = g.travel_in;
+    uint32_t id = g.travel_in_id;
+    g.travel_in.clear();
+    auto answer = [&](bool ok, const std::string& why) {
+        queue_travel(id, ok ? 1 : 2, why);
+        if (ok) g.travels_followed++;
+        else g.travels_refused++;
+        g.last_travel = (ok ? "following the other player to " : "not following the other player to ") + path.substr(path.rfind('.') + 1) + (ok ? "" : " (" + why + ")");
+        core_log("travel: " + g.last_travel);
+    };
+    if (!g.opt_follow) return answer(false, "following is off (test)");
+    if (g.died) return answer(false, "dead: the fetched game brings you there");
+    if (g.now - g.travel_in_at > 20.0) return answer(false, "asked too long ago");
+    if (!g.host && !join::joined()) return answer(false, "playing your own campaign");
+    if (g.host && in_combat(pawn)) return answer(false, "the host is in combat");  // the host's campaign: never cut a fight short
+    ue::UObject* tm = travel_manager();
+    if (!tm) return answer(false, "no TravelManager");
+    ue::UObject* d = ue::find_path(path);
+    if (!d && path.rfind("/Game/", 0) == 0) {  // not loaded yet in this world
+        ue::UClass* k = ue::find_class("/Script/Engine.KismetSystemLibrary");
+        json a = json::object();
+        a.set("Asset", path);
+        try { ue::call(ue::cdo(k), ue::find_func(k, "LoadAsset_Blocking"), a); } catch (const std::exception&) {}
+        d = ue::find_path(path);
+    }
+    if (!d) return answer(false, "destination not found");
+    if (!ue::is_a(d, ue::find_class("/Script/Arkansas.PointOfInterestData"))) return answer(false, "not a travel destination");  // from the other player
+    if (travel_destination(tm) != d) {
+        ue::UFunction* f = ue::find_func(ue::class_of(tm), "BeginTravelToBP");
+        if (!f) return answer(false, "no BeginTravelToBP");
+        json a = json::object();
+        a.set("Destination", ue::addr(d)).set("bPassGametime", false).set("bTriggerAutosave", false).set("bForceBlocking", false);
+        try { ue::call(tm, f, a); } catch (const std::exception& e) { return answer(false, e.what()); }
+        if (travel_destination(tm) != d) return answer(false, "the game did not start the travel");
+    }
+    g.travel_following = g.travel_seen = d;  // not announced back
+    if (g.host) g.follow_until = g.now + 90.0;  // the client leads: it will be in the new map, no hand-over meanwhile
+    answer(true, "");
+}
+
+// ---------------------------------------------------------------- giving items (the other player's stand-in)
+// Look at the other player's stand-in (within 3.5 m) and press E: the game's own transfer screen opens between your
+// inventory and a hidden, empty chest at the stand-in (on the stand-in itself, the screen crashed reading its NPC
+// clothes, probe 83). What you move into it leaves at once and goes into the other player's inventory (resent until
+// they confirm it; back to you after 20 s without an answer). A given weapon or armor arrives as a new copy with the
+// same level and rarity, without its mods.
+std::atomic<bool> give_key{false};
+WNDPROC game_proc = nullptr;
+HWND game_hwnd = nullptr;
+
+LRESULT CALLBACK key_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_KEYDOWN && w == 'E' && !(l & (1 << 30))) give_key = true;  // a new press (bit 30: a repeat)
+    return game_proc ? CallWindowProcW(game_proc, h, msg, w, l) : DefWindowProcW(h, msg, w, l);
+}
+
+BOOL CALLBACK find_game_window(HWND h, LPARAM out) {
+    DWORD pid = 0;
+    wchar_t cls[32] = L"";
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId() || !IsWindowVisible(h) || !GetClassNameW(h, cls, 32) || wcscmp(cls, L"UnrealWindow") != 0) return TRUE;
+    *reinterpret_cast<HWND*>(out) = h;
+    return FALSE;
+}
+
+void watch_keys() {  // E presses reach the game's window procedure; the window may be made again (display mode change)
+    static double next = 0;
+    if (g.now < next) return;
+    next = g.now + 5.0;
+    if (game_hwnd && IsWindow(game_hwnd)) return;  // ours already (never twice: an overlay chained after us would loop)
+    HWND h = nullptr;
+    EnumWindows(find_game_window, reinterpret_cast<LPARAM>(&h));
+    if (!h) return;
+    LONG_PTR old = SetWindowLongPtrW(h, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(key_proc));
+    if (old && old != reinterpret_cast<LONG_PTR>(key_proc)) game_proc = reinterpret_cast<WNDPROC>(old), game_hwnd = h;
+}
+
+void close_transfer() {  // as the player would: Escape (its chest must not go away with a world under an open screen)
+    if (!g.transfer_widget || !game_hwnd || g.now < g.next_close) return;
+    g.next_close = g.now + 0.5;
+    PostMessageW(game_hwnd, WM_KEYDOWN, VK_ESCAPE, 1 | (MapVirtualKeyW(VK_ESCAPE, 0) << 16));
+    PostMessageW(game_hwnd, WM_KEYUP, VK_ESCAPE, 1 | (MapVirtualKeyW(VK_ESCAPE, 0) << 16) | (1u << 30) | (1u << 31));
+}
+
+int item_prop(const char* name) {  // offset of an Item property (ItemLevel, ItemRarity), -1 if missing
+    ue::UClass* k = ue::find_class("/Script/Arkansas.Item");
+    ue::FProperty* p = k ? ue::find_prop(k, name) : nullptr;
+    return p && ue::prop_size(p) == 4 ? ue::prop_offset(p) : -1;
+}
+
+int32_t read_i32(ue::UObject* o, int off) {
+    int32_t v = 0;
+    if (o && off >= 0) memcpy(&v, reinterpret_cast<const uint8_t*>(o) + off, 4);
+    return v;
+}
+
+// The mods on a weapon or armor item (probe 85). A weapon keeps them in WeaponModContainer.ModSlots, a map of slot ->
+// FWeaponModSlot (CurrentMod: the mod installed, DefaultMod: the slot's stock one); an armor in ArmorModSlots (a fixed
+// array) and BonusArmoringSlot (CurrentModClass).
+std::vector<ue::UClass*> mods_of(ue::UObject* item) {
+    std::vector<ue::UClass*> out;
+    static ue::UClass* const weapon_k = ue::find_class("/Script/Arkansas.Weapon");
+    static ue::UClass* const armor_k = ue::find_class("/Script/Arkansas.ArmorItem");
+    if (!item || !ue::alive(item)) return out;
+    if (weapon_k && ue::is_a(item, weapon_k)) {
+        static int cont_off = -2, slots_off = -1, cur_off = -1, def_off = -1, slot_size = 0;
+        if (cont_off == -2) {
+            ue::FProperty* c = ue::find_prop(weapon_k, "WeaponModContainer");
+            ue::UClass* ck = ue::find_class("/Script/Arkansas.WeaponModContainer");
+            ue::FProperty* s = ck ? ue::find_prop(ck, "ModSlots") : nullptr;
+            ue::UStruct* st = ue::find_path("/Script/Arkansas.WeaponModSlot");
+            ue::FProperty* cm = st ? ue::find_prop(st, "CurrentMod") : nullptr;
+            ue::FProperty* dm = st ? ue::find_prop(st, "DefaultMod") : nullptr;
+            cont_off = c ? ue::prop_offset(c) : -1, slots_off = s ? ue::prop_offset(s) : -1;
+            cur_off = cm ? ue::prop_offset(cm) : -1, def_off = dm ? ue::prop_offset(dm) : -1, slot_size = st ? ue::struct_size(st) : 0;
+        }
+        if (cont_off < 0 || slots_off < 0 || cur_off < 0 || def_off < 0 || slot_size <= 0) return out;
+        ue::UObject* cont = nullptr;
+        memcpy(&cont, reinterpret_cast<const uint8_t*>(item) + cont_off, 8);
+        if (!cont || !ue::alive(cont)) return out;
+        // TMap<EModSlot, FWeaponModSlot>: a sparse array of {key byte, padding to 8, value, two hash ints}, its
+        // allocation bits inline at +0x10 (or behind the pointer at +0x20 when they don't fit)
+        const uint8_t* map = reinterpret_cast<const uint8_t*>(cont) + slots_off;
+        const uint8_t* data = nullptr;
+        const uint32_t* heap_bits = nullptr;
+        int32_t num = 0;
+        memcpy(&data, map, 8), memcpy(&num, map + 8, 4), memcpy(&heap_bits, map + 0x20, 8);
+        const uint32_t* bits = heap_bits ? heap_bits : reinterpret_cast<const uint32_t*>(map + 0x10);
+        size_t elem = (8 + static_cast<size_t>(slot_size) + 8 + 7) & ~static_cast<size_t>(7);
+        if (!data || num <= 0 || num > 64 || !ue::readable(data, elem * num) || !ue::readable(bits, 8)) return out;
+        for (int i = 0; i < num; i++) {
+            if (!((bits[i / 32] >> (i % 32)) & 1)) continue;  // a free entry
+            const uint8_t* v = data + elem * i + 8;
+            ue::UObject* cur = nullptr;
+            ue::UClass* def = nullptr;
+            memcpy(&cur, v + cur_off, 8), memcpy(&def, v + def_off, 8);
+            if (cur && ue::alive(cur) && ue::class_of(cur) != def) out.push_back(ue::class_of(cur));
+        }
+    } else if (armor_k && ue::is_a(item, armor_k)) {
+        static int slots_off = -2, bonus_off = -1, dim = 0, cls_off = -1, slot_size = 0;
+        if (slots_off == -2) {
+            ue::FProperty* s = ue::find_prop(armor_k, "ArmorModSlots");
+            ue::FProperty* b = ue::find_prop(armor_k, "BonusArmoringSlot");
+            ue::UStruct* st = ue::find_path("/Script/Arkansas.ArmorSetModSlot");
+            ue::FProperty* c = st ? ue::find_prop(st, "CurrentModClass") : nullptr;
+            slots_off = s ? ue::prop_offset(s) : -1, bonus_off = b ? ue::prop_offset(b) : -1;
+            dim = s ? ue::prop_dim(s) : 0;
+            cls_off = c ? ue::prop_offset(c) : -1, slot_size = st ? ue::struct_size(st) : 0;
+        }
+        if (slots_off < 0 || cls_off < 0 || slot_size <= 0 || dim < 1 || dim > 16) return out;
+        std::vector<int> at;
+        for (int i = 0; i < dim; i++) at.push_back(slots_off + i * slot_size);
+        if (bonus_off >= 0) at.push_back(bonus_off);
+        const uint8_t* stock = reinterpret_cast<const uint8_t*>(ue::cdo(ue::class_of(item)));  // a unique's built-in mods
+        for (int o : at) {
+            ue::UClass *k = nullptr, *def = nullptr;
+            memcpy(&k, reinterpret_cast<const uint8_t*>(item) + o + cls_off, 8);
+            if (stock) memcpy(&def, stock + o + cls_off, 8);
+            if (k && k != def && ue::alive(k)) out.push_back(k);
+        }
+    }
+    return out;
+}
+
+bool install_mod(ue::UObject* item, ue::UClass* mod) {  // the game's own install, as its debug commands do it
+    static ue::UClass* const weapon_k = ue::find_class("/Script/Arkansas.Weapon");
+    static ue::UClass* const armor_k = ue::find_class("/Script/Arkansas.ArmorItem");
+    static ue::UClass* const wmod_k = ue::find_class("/Script/Arkansas.WeaponMod");
+    static ue::UClass* const amod_k = ue::find_class("/Script/Arkansas.ArmorModItem");
+    ue::UObject* cdo = mod ? ue::cdo(mod) : nullptr;
+    void* ref = mod;  // TSubclassOf<>: the class pointer, passed by reference
+    if (!cdo || !item || !ue::alive(item)) return false;
+    if (weapon_equip_mod && weapon_k && wmod_k && ue::is_a(item, weapon_k) && ue::is_a(cdo, wmod_k)) return weapon_equip_mod(item, &ref, true);
+    if (armor_equip_mod && armor_k && amod_k && ue::is_a(item, armor_k) && ue::is_a(cdo, amod_k)) {
+        armor_equip_mod(item, &ref, false, true, true, true);
+        auto now = mods_of(item);
+        return std::find(now.begin(), now.end(), mod) != now.end();
+    }
+    return false;
+}
+
+// Into the local player's inventory, with the game's own notification; a new single item gets the level, rarity and
+// mods of the given one.
+void give_to_player(ue::UClass* k, int32_t n, int32_t level, int32_t rarity, const std::vector<ue::UClass*>& mods = {}) {
+    ue::UObject* pawn = local_pawn();
+    std::string err;
+    ue::UObject* inv = pawn ? ue::resolve(ue::addr(pawn) + ".InventoryComponent", &err) : nullptr;
+    ue::UFunction* f = inv ? ue::find_func(ue::class_of(inv), "GiveItemToPlayer") : nullptr;
+    if (!f) throw std::runtime_error("no player inventory");
+    std::vector<ue::UObject*> before;
+    for (const auto& s : stacks_of(pawn)) if (ue::class_of(s.first) == k) before.push_back(s.first);
+    json a = json::object();
+    a.set("ItemType", ue::addr(k)).set("Count", n).set("bShowNotification", true).set("bPlayItemPickupAudio", true);
+    ue::call(inv, f, a);
+    static const int lv = item_prop("ItemLevel"), ra = item_prop("ItemRarity");
+    for (const auto& s : stacks_of(pawn)) {
+        if (ue::class_of(s.first) != k || std::find(before.begin(), before.end(), s.first) != before.end()) continue;
+        if (lv >= 0 && level > 0 && level < 10000) memcpy(reinterpret_cast<uint8_t*>(s.first) + lv, &level, 4);
+        if (ra >= 0 && rarity >= 0 && rarity < 16) memcpy(reinterpret_cast<uint8_t*>(s.first) + ra, &rarity, 4);
+        for (ue::UClass* m : mods)
+            if (!install_mod(s.first, m)) core_log("give: could not put the mod " + ue::name_of(m) + " on " + ue::name_of(s.first));
+    }
+}
+
+constexpr const char* kGiveBoxClass = "/Game/Blueprints/World/Interactable/Container/BP_Container_Chest_Small.BP_Container_Chest_Small_C";
+
+ue::UObject* spawn_give_box(ue::UObject* standin) {  // an empty, hidden chest 2 m under the stand-in, never saved
+    ue::UClass* cls = load_class(kGiveBoxClass);
+    double at[3], v[3];
+    float yaw, pitch;
+    if (!cls || !read_transform(standin, at, yaw, pitch, v)) return nullptr;
+    std::string err;
+    ue::UObject* gs = ue::cdo(ue::find_class("/Script/Engine.GameplayStatics"));
+    json xf = json::object(), tr = json::array(), rot = json::object(), sc = json::array();
+    tr.push(at[0]).push(at[1]).push(at[2] - 200.0);
+    rot.set("X", 0.0).set("Y", 0.0).set("Z", 0.0).set("W", 1.0);
+    sc.push(1.0).push(1.0).push(1.0);
+    xf.set("Rotation", rot).set("Translation", tr).set("Scale3D", sc);
+    json a = json::object();
+    a.set("WorldContextObject", ue::addr(ue::resolve("pc", &err))).set("ActorClass", ue::addr(cls)).set("SpawnTransform", xf);
+    a.set("CollisionHandlingOverride", "AlwaysSpawn");
+    std::string ref = ue::call(gs, ue::find_func(ue::class_of(gs), "BeginDeferredActorSpawnFromClass"), a).get("ReturnValue").asString();
+    ue::UObject* box = ref.rfind("0x", 0) == 0 ? reinterpret_cast<ue::UObject*>(static_cast<uintptr_t>(strtoull(ref.c_str(), nullptr, 16))) : nullptr;
+    if (!box || !ue::alive(box)) return nullptr;
+    ue::set_path(ue::addr(box) + ".bShouldSaveGameState", json(false));    // as the stand-in: out of the host's saves
+    ue::set_path(ue::addr(box) + ".bLootManagerLootApplied", json(true));  // no loot of its own
+    json f = json::object();
+    f.set("Actor", ue::addr(box)).set("SpawnTransform", xf);
+    ue::call(gs, ue::find_func(ue::class_of(gs), "FinishSpawningActor"), f);
+    json hide = json::object(), nocol = json::object(), noint = json::object();
+    hide.set("bNewHidden", true), nocol.set("bNewActorEnableCollision", false), noint.set("bNewInteractionsEnabled", false);
+    call_on(box, "SetActorHiddenInGame", hide);
+    call_on(box, "SetActorEnableCollision", nocol);
+    call_quiet(ue::addr(box) + ".InteractableComponent", "SetInteractionsEnabled", noint);
+    std::string ierr;
+    ue::UObject* inv = ue::resolve(ue::addr(box) + ".InventoryComponent", &ierr);
+    for (const auto& st : stacks_of(box)) {  // in case the chest came with something anyway
+        json q = json::object();
+        q.set("Actor", ue::addr(box)).set("ItemType", ue::addr(ue::class_of(st.first))).set("Count", st.second);
+        if (inv) call_on(inv, "RemoveItemFromActor", q);
+    }
+    return box;
+}
+
+void drop_give_box() {
+    if (g.give_box && ue::alive(g.give_box)) call_on(g.give_box, "K2_DestroyActor", json::object());
+    g.give_box = nullptr;
+}
+
+bool open_give(std::string& why) {
+    if (!open_transfer_fn) return why = "the game's transfer screen was not found in this build", false;
+    if (!g.puppet || !standin_ok()) return why = "no stand-in of the other player here", false;
+    if (!g.host && !join::joined()) return why = "playing your own campaign", false;
+    std::string err;
+    ue::UObject* hud = ue::resolve("pc.MyHUD", &err);
+    if (!hud || !ue::is_a(hud, ue::find_class("/Script/Arkansas.IndianaUI"))) return why = "no game HUD", false;
+    drop_give_box();
+    g.give_box = spawn_give_box(g.puppet);
+    if (!g.give_box) return why = "could not place the hidden chest", false;
+    void* w = open_transfer_fn(hud, g.give_box);
+    if (!w) { drop_give_box(); return why = "the game did not open its transfer screen", false; }
+    g.transfer_widget = static_cast<ue::UObject*>(w), g.next_give_check = 0;
+    return true;
+}
+
+bool looking_at(ue::UObject* pawn, ue::UObject* target) {  // within 3.5 m, the view crossing its body
+    double me[3], at[3], v[3];
+    float yaw, pitch;
+    std::string err;
+    ue::UObject* pc = ue::resolve("pc", &err);
+    ue::UFunction* rot = pc ? ue::find_func(ue::class_of(pc), "GetControlRotation") : nullptr;
+    if (!rot || !read_transform(pawn, me, yaw, pitch, v) || !read_transform(target, at, yaw, pitch, v)) return false;
+    json r = ue::call(pc, rot, json::object()).get("ReturnValue");
+    double cy = r.get("Yaw").asNumber(0) * 3.14159265 / 180, cp = r.get("Pitch").asNumber(0) * 3.14159265 / 180;
+    double dx = at[0] - me[0], dy = at[1] - me[1], h = std::hypot(dx, dy);
+    if (h > 350 || h < 1) return false;
+    double off = std::fabs(std::remainder(std::atan2(dy, dx) - cy, 2 * 3.14159265));  // sideways angle
+    double z = me[2] + 60 + h * std::tan(cp);                                                // view height at the stand-in
+    return off < std::atan2(45.0, h) + 0.1 && z > at[2] - 100 && z < at[2] + 100;
+}
+
+void try_give(ue::UObject* pawn) {  // E was pressed
+    if (g.transfer_widget || !g.puppet || !standin_ok() || g.puppet_map != g.my_map) return;
+    json cursor;
+    try { cursor = ue::eval_path("pc.bShowMouseCursor"); } catch (const std::exception&) {}
+    if (cursor.asBool(false) || !looking_at(pawn, g.puppet)) return;  // a menu is open, or E was for something else
+    std::string why;
+    bool ok = false;
+    try { ok = open_give(why); } catch (const std::exception& e) { why = e.what(), drop_give_box(); }
+    g.last_gift = ok ? "transfer screen open for the other player" : "could not open the transfer screen: " + why;
+    core_log("give: " + g.last_gift);
+}
+
+// The open transfer screen: what landed in the hidden chest goes to the other player, stack by stack (an item leaves
+// by class, which takes the first stack of that class: the one read; shortcut: two copies of one weapon with different
+// mods moved together rely on that order).
+void watch_gifts() {
+    if (!g.transfer_widget || g.now < g.next_give_check || g.opt_give_hold) return;
+    g.next_give_check = g.now + 0.2;
+    ue::UObject* s = g.give_box;
+    bool shown = false;
+    if (ue::alive(g.transfer_widget)) {
+        ue::UFunction* f = ue::find_func(ue::class_of(g.transfer_widget), "IsInViewport");
+        try { shown = f && ue::call(g.transfer_widget, f, json::object()).get("ReturnValue").asBool(false); } catch (const std::exception&) {}
+    }
+    if (s && ue::alive(s)) {
+        static const int lv = item_prop("ItemLevel"), ra = item_prop("ItemRarity");
+        std::string err;
+        ue::UObject* inv = ue::resolve(ue::addr(s) + ".InventoryComponent", &err);
+        ue::UFunction* rm = inv ? ue::find_func(ue::class_of(inv), "RemoveItemFromActor") : nullptr;
+        for (int guard = 0; rm && guard < 64; guard++) {
+            auto stacks = stacks_of(s);
+            if (stacks.empty()) break;
+            ue::UObject* one = stacks.front().first;
+            int32_t n = stacks.front().second;
+            ue::UClass* k = ue::class_of(one);
+            Ctx::Gift x{};
+            x.item = k, x.count = n, x.level = read_i32(one, lv), x.rarity = read_i32(one, ra), x.mods = mods_of(one);
+            json q = json::object();
+            q.set("Actor", ue::addr(s)).set("ItemType", ue::addr(k)).set("Count", n);
+            bool removed = false;
+            try { removed = ue::call(inv, rm, q).get("ReturnValue").asBool(false); } catch (const std::exception&) {}
+            if (!removed) { g.last_gift = "could not take " + ue::name_of(k) + " out of the chest"; break; }
+            x.m.eid = (g.me & 0xFFFF0000u) | (g.next_eid++ & 0xFFFFu);
+            x.m.kind = 5, x.m.a = n, x.m.id = static_cast<uint32_t>(x.level) | static_cast<uint64_t>(static_cast<uint32_t>(x.rarity)) << 32;
+            std::string path = ue::path_of(k);
+            for (ue::UClass* m : x.mods) {
+                std::string mp = ue::path_of(m);
+                if (path.size() + 1 + mp.size() <= sizeof x.m.path) path += "|" + mp;
+            }
+            x.m.len = static_cast<uint16_t>(std::min(path.size(), sizeof x.m.path));
+            memcpy(x.m.path, path.data(), x.m.len);
+            x.size = static_cast<int>(offsetof(InteractMsg, path)) + x.m.len;
+            x.next = g.now, x.until = g.now + 20.0;
+            g.gifts_out.push_back(x);
+            g.gifts_sent++;
+            g.last_gift = "giving " + std::to_string(n) + "x " + ue::name_of(k) + (x.mods.empty() ? "" : " with " + std::to_string(x.mods.size()) + " mod(s)") + " to the other player";
+            core_log("give: " + g.last_gift);
+        }
+    }
+    if (!shown || !s || !ue::alive(s)) g.transfer_widget = nullptr, drop_give_box();  // closed (a last pass ran)
+}
+
+void send_gifts() {  // resent every 0.5 s until confirmed; back to the giver after 20 s
+    for (size_t i = 0; i < g.gifts_out.size();) {
+        Ctx::Gift& x = g.gifts_out[i];
+        if (g.now >= x.until) {
+            std::string what = std::to_string(x.count) + "x " + ue::name_of(x.item);
+            try {
+                give_to_player(x.item, x.count, x.level, x.rarity, x.mods);
+                g.last_gift = "the other player did not answer: " + what + " given back to you";
+            } catch (const std::exception& e) {
+                if (g.now < x.until + 60.0) { i++; continue; }  // no player now (a load): try again for a minute
+                g.last_gift = "the other player did not answer and " + what + " could not be given back: " + e.what();
+            }
+            g.gifts_returned++;
+            core_log("give: " + g.last_gift);
+            g.gifts_out.erase(g.gifts_out.begin() + i);
+            continue;
+        }
+        if (g.now >= x.next) send_typed(kInteract, &x.m, x.size), x.next = g.now + 0.5;
+        i++;
+    }
+}
+
+// A gift (kind 5) or the answer to ours (kind 6), in any world state: a gift waits in the inbox for a player.
+bool take_gift(const char* body, int len) {
+    InteractMsg m{};
+    if (len < static_cast<int>(offsetof(InteractMsg, path)) || len > static_cast<int>(sizeof m)) return false;
+    memcpy(&m, body, len);
+    if (m.kind == 6) {
+        for (size_t i = 0; i < g.gifts_out.size(); i++) {
+            if (g.gifts_out[i].m.eid != static_cast<uint32_t>(m.id)) continue;
+            g.last_gift = "gave " + std::to_string(g.gifts_out[i].count) + "x " + ue::name_of(g.gifts_out[i].item) + " to the other player";
+            core_log("give: " + g.last_gift);
+            g.gifts_out.erase(g.gifts_out.begin() + i);
+            break;
+        }
+        return true;
+    }
+    if (m.kind != 5) return false;
+    g.recv++;
+    if (m.len > sizeof m.path || len != static_cast<int>(offsetof(InteractMsg, path)) + m.len) { g.bad++; return true; }
+    if (!g.opt_gifts || (!g.host && !join::joined())) return true;  // no answer: the giver gets it back
+    if (first_time(m.eid)) g.gift_inbox.push_back(m);
+    InteractMsg ack{};
+    ack.eid = (g.me & 0xFFFF0000u) | (g.next_eid++ & 0xFFFFu), ack.kind = 6, ack.id = m.eid;
+    send_typed(kInteract, &ack, static_cast<int>(offsetof(InteractMsg, path)));
+    return true;
+}
+
+void apply_gifts() {
+    if (g.gift_inbox.empty()) return;
+    std::vector<InteractMsg> todo;
+    todo.swap(g.gift_inbox);
+    ue::UClass* base = ue::find_class("/Script/Arkansas.Item");
+    static ue::UClass* const mod_base = ue::find_class("/Script/Arkansas.ItemMod");
+    for (const InteractMsg& m : todo) {
+        std::string all(m.path, m.len), cls = all.substr(0, all.find('|'));  // "<item class>|<mod class>|..."
+        // From the other player (trust boundary): /Game/ classes of items and of item mods, a sane count.
+        ue::UClass* item = cls.rfind("/Game/", 0) == 0 && m.a > 0 && m.a <= 1000000 ? load_class(cls) : nullptr;
+        if (!item || !base || !ue::cdo(item) || !ue::is_a(ue::cdo(item), base)) { core_log("give: ignored a gift that is no item: " + cls); continue; }
+        std::vector<ue::UClass*> mods;
+        for (size_t at = all.find('|'); at != std::string::npos;) {
+            size_t next = all.find('|', at + 1);
+            std::string mp = all.substr(at + 1, next == std::string::npos ? std::string::npos : next - at - 1);
+            ue::UClass* mk = mp.rfind("/Game/", 0) == 0 ? load_class(mp) : nullptr;
+            if (mk && mod_base && ue::cdo(mk) && ue::is_a(ue::cdo(mk), mod_base)) mods.push_back(mk);
+            else core_log("give: ignored a mod that is no item mod: " + mp);
+            at = next;
+        }
+        try {
+            give_to_player(item, m.a, static_cast<int32_t>(m.id & 0xFFFFFFFFu), static_cast<int32_t>(m.id >> 32), mods);
+        } catch (const std::exception&) {
+            g.gift_inbox.push_back(m);  // no player right now: next frame
+            continue;
+        }
+        g.gifts_received++;
+        g.last_gift = "got " + std::to_string(m.a) + "x " + ue::name_of(item) + (mods.empty() ? "" : " with " + std::to_string(mods.size()) + " mod(s)") + " from the other player";
+        core_log("give: " + g.last_gift);
+    }
+}
+
+// ---------------------------------------------------------------- one clock
+// The game's calendar runs in each world: the host waiting, sleeping or flying the ship moves its time, a menu stops
+// it. The client follows the host's hour: behind by more than 6 game minutes, its calendar jumps ahead; ahead, it
+// waits (RequestPauseTime) until the host's catches up.
+ue::UObject* calendar() {
+    static ue::UObject* c = nullptr;
+    static double next_look = 0;
+    if (c && ue::alive(c)) return c;
+    if (g.now < next_look) return nullptr;
+    next_look = g.now + 2.0;
+    std::vector<ue::UObject*> v = ue::instances(ue::find_class("/Script/Arkansas.GameCalendar"), false, 1);
+    return c = v.empty() ? nullptr : v[0];
+}
+
+float raw_hour(ue::UObject* c) {
+    ue::UFunction* f = ue::find_func(ue::class_of(c), "K2_GetRawHour");
+    try { return f ? static_cast<float>(ue::call(c, f, json::object()).get("ReturnValue").asNumber(-1)) : -1.0f; } catch (const std::exception&) { return -1.0f; }
+}
+
+bool game_paused() {
+    static ue::UObject* gs = ue::cdo(ue::find_class("/Script/Engine.GameplayStatics"));
+    ue::UFunction* f = gs ? ue::find_func(ue::class_of(gs), "IsGamePaused") : nullptr;
+    std::string err;
+    ue::UObject* pc = ue::resolve("pc", &err);
+    if (!f || !pc) return false;
+    json a = json::object();
+    a.set("WorldContextObject", ue::addr(pc));
+    try { return ue::call(gs, f, a).get("ReturnValue").asBool(false); } catch (const std::exception&) { return false; }
+}
+
+void send_clock() {
+    ue::UObject* c = calendar();
+    float h = c ? raw_hour(c) : -1.0f;
+    if (h >= 0) send_typed(kClock, &h, 4);
+}
+
+void hold_clock(ue::UObject* c, bool on) {
+    if (g.clock_held == on) return;
+    json a = json::object();
+    a.set("RequestContext", "tow2coop");
+    call_on(c, on ? "RequestPauseTime" : "RequestUnpauseTime", a);
+    g.clock_held = on;
+    if (on) g.clock_holds++;
+}
+
+void keep_clock() {
+    ue::UObject* c = calendar();
+    if (!c) return;
+    bool fresh = g.host_hour >= 0 && g.now - g.host_hour_at < 5.0 && g.in_gameplay && join::joined();
+    if (!fresh) { hold_clock(c, false); return; }  // no host to follow: the client's own time runs
+    float mine = raw_hour(c);
+    if (mine < 0) return;
+    float d = std::remainder(g.host_hour - mine, 24.0f);  // hours, -12..12
+    if (d > 0.1f) {  // behind by more than 6 game minutes: jump to the host's time
+        hold_clock(c, false);
+        json a = json::object();
+        a.set("Days", 0.0).set("Hours", 0.0).set("Minutes", d * 60.0).set("Seconds", 0.0);
+        call_on(c, "K2_AdvanceTime", a);
+        g.clock_jumps++;
+        g.host_hour = -1;  // the next report tells where we are
+    } else {
+        hold_clock(c, d < -0.02f);  // ahead: wait for the host (a menu stopped its clock)
+    }
+}
+
+// ---------------------------------------------------------------- death and reload
+// The friend's own game must never load one of its own saves into the joined game: it would put a stale or foreign
+// world under the host's (probe 85: "Continue" after a death loads the newest local save). When the friend dies, the
+// host's current game is fetched at once and held; "Continue" (or Load) then loads it with the friend's last kept
+// character. A trauma kit revive drops it.
+void watch_life(ue::UObject* pawn) {
+    g.next_life_check = g.now + 0.5;
+    std::string err;
+    ue::UObject* hc = ue::resolve(ue::addr(pawn) + ".HealthComponent", &err);
+    ue::UFunction* f = hc ? ue::find_func(ue::class_of(hc), "GetStateOfBeing") : nullptr;
+    if (!f) return;
+    std::string st;
+    try { st = ue::call(hc, f, json::object()).get("ReturnValue").asString(); } catch (const std::exception&) { return; }
+    bool dead = st == "Dying" || st == "Dead";
+    if (dead && !g.died) {
+        g.died = true, g.deaths++;
+        join::hold(true);
+        g.campaign_wanted = true, g.next_campaign_ask = 0;
+        core_log("death: the host's current game is fetched; Continue loads it with your last kept character");
+    } else if (!dead && g.died) {
+        g.died = false, g.campaign_wanted = false;
+        join::hold(false);
+        join::discard();
+        core_log("death: revived, no reload");
+    }
+}
+
+}  // namespace
+
+int on_load_request(const std::wstring& name) {
+    if (!g.on || name.empty() || name.rfind(L"CoopHost", 0) == 0) return -1;  // the mod's own hand-over loads
+    std::string n(name.begin(), name.end());
+    if (g.host) {
+        // The host's game loads a save (death Continue, Load, Quickload): that file, complete on disk, goes to the
+        // friend before the load starts. LoadGame only returns once the new world is up (probe 88: 16 s, ticking the
+        // engine inside), so the friend loads it at the same time instead of after the host.
+        if (!g.have_peer) return -1;
+        if (request_resync("the host loaded a save", true, name)) {
+            g.reload_handed_at = g.now, g.reloads_handed++;
+            uint32_t body[4] = {static_cast<uint32_t>(g.port + 1), g.me, 1, static_cast<uint32_t>(g.resyncs)};
+            send_typed(kResync, body, 16);  // the first notice now: the frames that send the others wait for the load
+            core_log("reload: " + n + " goes to the other player as the host's game loads it");
+        } else {
+            g.reload_handed_at = -1e9;  // an earlier reload's timestamp must not skip this one's hand-over
+            core_log("reload: " + n + " could not go to the other player now (" + g.last_error + "); the hand-over follows once loaded");
+        }
+        return -1;
+    }
+    if (!join::joined()) return -1;
+    // The joined friend's game loads one of its own saves: the host's current game comes instead.
+    join::hold(false);
+    if (!g.campaign_wanted && g.now >= g.fetch_quiet_until) g.campaign_wanted = true, g.next_campaign_ask = 0;
+    g.loads_redirected++;
+    core_log("reload: your game's own load (" + n + ") is replaced by the host's current game");
+    return 21;  // ELoadGameResult::LoadCanceledByUser
+}
+
+void on_load_started(const std::wstring& name, uint8_t result) {
+    if (!g.on || !g.host || result == 0 || name.empty() || name.rfind(L"CoopHost", 0) == 0) return;
+    if (g.now - g.reload_handed_at < 60.0) g.reload_handed_at = -1e9;  // the friend got a save the host did not load
+    core_log("reload: the game did not load " + std::string(name.begin(), name.end()) + " (result " + std::to_string(result) + ")");
+}
+
+namespace {
 // One datagram from the other player: UDP gives its address (from), Steam its SteamID (from_id).
 void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t from_id) {
     if (n < static_cast<int>(sizeof(Header))) { g.bad++; return; }
@@ -908,6 +2074,8 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
     g.remote_last_seq = h.seq;
     if (h.type == kResync && !g.host) { g.last_recv_t = g.now; client_fetch_resync(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }
     if (h.type == kInteract && take_xp(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)))) { g.last_recv_t = g.now; return; }
+    if (h.type == kTravel) { g.last_recv_t = g.now; on_travel(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }  // even while settling
+    if (h.type == kInteract && take_gift(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)))) { g.last_recv_t = g.now; return; }
     if (!g.in_gameplay || g.now < g.settle_until) { g.last_recv_t = g.now; g.stale++; return; }  // not in a settled world: data ignored
     if (h.type == kResync && !g.host) {  // handled even while not settled: the client may be anywhere
         client_fetch_resync(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)));
@@ -927,15 +2095,16 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
         uint32_t reason = 1;
         if (n == static_cast<int>(sizeof(Header)) + 4) memcpy(&reason, buf + sizeof(Header), 4);
         g.resync_requests++;
-        request_resync(reason == 2 ? "client joins from the main menu" : "client could not apply a quest outcome");
+        request_resync(reason == 2 ? "client joins from the main menu" : reason == 3 ? "the client loads (its game's Continue or Load)"
+                       : reason == 4 ? "the client died" : "client could not apply a quest outcome", reason >= 3);
         return;
     }
-    if (h.type == story::kStory && !g.host) {
+    if (h.type == story::kStory) {
         g.recv++;
         story::on_story(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)), send_typed);
         return;
     }
-    if (h.type == story::kStoryAck && g.host) {
+    if (h.type == story::kStoryAck) {
         story::on_ack(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)));
         return;
     }
@@ -946,6 +2115,15 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
         if (n < head || e.count > kMaxEnemyRecs || n != head + e.count * static_cast<int>(sizeof(EnemyRec))) { g.bad++; return; }
         g.recv++;
         apply_npcs(e);
+        return;
+    }
+    if (h.type == kCombat && g.host) {
+        CombatMsg m;
+        int head = static_cast<int>(offsetof(CombatMsg, rec));
+        memcpy(&m, buf, std::min(n, static_cast<int>(sizeof m)));
+        if (n < head || m.count > kMaxCombatRecs || n != head + m.count * static_cast<int>(sizeof(CombatRec))) { g.bad++; return; }
+        g.recv++;
+        host_apply_combat(m);
         return;
     }
     if (h.type == kDamage && g.host) {
@@ -962,6 +2140,13 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
         return;
     }
     if (h.type == kAppearance) { on_face(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }
+    if (h.type == kClock && !g.host) {
+        float hour;
+        if (n != static_cast<int>(sizeof(Header)) + 4) { g.bad++; return; }
+        memcpy(&hour, buf + sizeof(Header), 4);
+        if (hour >= 0 && hour < 24.5f) g.host_hour = hour, g.host_hour_at = g.now;
+        return;
+    }
     if (h.type == kLook) {
         if (n != static_cast<int>(sizeof(Header) + sizeof(Look))) { g.bad++; return; }
         Look l;
@@ -987,6 +2172,7 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
     g.last_recv_t = g.now;
     g.snaps.push_back({g.now, st.px, st.py, st.pz, st.vx, st.vy, st.vz, st.yaw});
     g.puppet_map = st.map_hash;
+    g.peer_dead = (st.flags & 1) != 0;
     while (g.snaps.size() > 64) g.snaps.pop_front();
 }
 
@@ -1248,7 +2434,7 @@ void dress_puppet() {
 }
 
 void tame_puppet(bool full) {
-    if (!g.puppet || !ue::alive(g.puppet)) return;
+    if (!g.puppet || !standin_ok()) return;
     std::string p = ue::addr(g.puppet);
     json reason = json::object();
     reason.set("Reason", "coop puppet");
@@ -1278,10 +2464,11 @@ void tame_puppet(bool full) {
     nt.set("bNewTargetable", false);
     call_quiet(p + ".TargetableComponent", "SetTargetable", nt);
     call_quiet(p + ".ChatterComponent", "Deactivate", json::object());
+    standin_team(false);  // neutral to all until the party fights (co-op combat)
 }
 
 void destroy_puppet() {
-    if (g.puppet && ue::alive(g.puppet)) {
+    if (g.puppet && standin_ok()) {
         try { ue::call(g.puppet, ue::find_func(ue::class_of(g.puppet), "K2_DestroyActor"), json::object()); } catch (...) {}
     }
     g.puppet = nullptr;
@@ -1321,6 +2508,7 @@ bool spawn_puppet(const Snapshot& s) {
     // dereference waiting to happen), but its behaviour is stopped and it can't be talked to, targeted or killed.
     ue::set_path(ue::addr(actor) + ".CharacterMovement.MovementMode", "MOVE_Walking");
     g.puppet = actor;
+    g.puppet_cls = ue::class_of(actor);
     g.puppet_in_air = false;
     tame_puppet(true);
     return true;
@@ -1342,7 +2530,11 @@ void drive_puppet() {
     double pos[3] = {a->px + (b->px - a->px) * k + b->vx * ext, a->py + (b->py - a->py) * k + b->vy * ext, a->pz + (b->pz - a->pz) * k + b->vz * ext};
     float dyaw = std::remainder(b->yaw - a->yaw, 360.0f);
     double yaw = a->yaw + dyaw * k;
-    if (!g.puppet || !ue::alive(g.puppet)) {
+    if (g.peer_dead) {  // a dead player has no stand-in: the enemies on it turn to the living (probe 91: they keep it)
+        if (g.puppet) destroy_puppet(), core_log("combat: the other player died, their stand-in leaves until they live again");
+        return;
+    }
+    if (!g.puppet || !standin_ok()) {
         g.puppet = nullptr;
         Snapshot s = *b;
         s.px = pos[0], s.py = pos[1], s.pz = pos[2];
@@ -1359,7 +2551,7 @@ void drive_puppet() {
         try { dress_outfit(); } catch (const std::exception& e) { g.last_error = std::string("outfit: ") + e.what(); }
     }
     static Fn set;
-    if (!set.init(g.puppet, "K2_SetActorLocationAndRotation")) return;
+    if (!base_fn(set, "/Script/Engine.Actor", "K2_SetActorLocationAndRotation")) return;
     alignas(16) uint8_t buf[512] = {};
     double rot[3] = {0, yaw, 0};
     memcpy(buf + set.off("NewLocation"), pos, 24);
@@ -1458,6 +2650,39 @@ json face_debug() {
 // own quest XP is dropped: its quest graph follows the host's); discoveries, collectibles, bits and debug XP stay with
 // the player who earned them (each player discovers and picks up on their own).
 AddXpFn add_xp_original = nullptr, add_xp_entry = nullptr;
+OpenTransferFn open_transfer_fn = nullptr;
+WeaponModFn weapon_equip_mod = nullptr;
+ArmorModFn armor_equip_mod = nullptr;
+
+json mods_test(const json& p) {  // test bridge: the mods on an item, after installing "add" (a class path) if given
+    std::string err;
+    ue::UObject* item = ue::resolve(p.get("item").asString(), &err);
+    if (!item) throw std::runtime_error("item: " + err);
+    json r = json::object();
+    if (p.get("add").isString()) {
+        ue::UClass* k = load_class(p.get("add").asString());
+        r.set("installed", k && install_mod(item, k));
+    }
+    json list = json::array();
+    for (ue::UClass* m : mods_of(item)) list.push(ue::path_of(m));
+    r.set("mods", list).set("weaponInstall", weapon_equip_mod != nullptr).set("armorInstall", armor_equip_mod != nullptr);
+    return r;
+}
+
+json give_open() {  // test bridge: the transfer screen on the stand-in, without the key and the aim
+    std::string why;
+    bool ok = false;
+    try { ok = open_give(why); } catch (const std::exception& e) { why = e.what(), drop_give_box(); }
+    json r = json::object();
+    r.set("open", ok).set("why", why).set("widget", ok ? ue::addr(g.transfer_widget) : std::string());
+    return r;
+}
+
+bool close_screens() {
+    if (!g.transfer_widget) return false;
+    close_transfer();
+    return true;
+}
 namespace {
 constexpr int kXpOffset = 0x93C;  // UPlayerInfoComponent's XP (int32), from AddXP's code in build CL-2994920
 constexpr uint16_t kSharedXp = 1 << 0 | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 10 | 1 << 11 | 1 << 12, kQuestXp = 1 << 1 | 1 << 2;
@@ -1610,26 +2835,46 @@ void frame(float) {
         g.world_ptr = reinterpret_cast<uintptr_t>(world);
         if (!g.host) story::client_reset();  // the client's world now holds a save's state: replay the story log
         g.settle_until = g.now + 10.0;
+        g.arrived_by_travel = false;
         g.puppet = nullptr;  // it belonged to the old world
         g.npcs.clear(), g.scanning.clear(), g.scan_cursor = 0;
         g.interactables.clear(), g.inter_scan.clear();  // old world's doors and containers
         g.box_pos.clear(), g.box_counts.clear();
         doors.clear(), door_cursor = 0;
         g.at_menu = world && ue::path_of(world).find("MainMenu") != std::string::npos;
-        if (g.at_menu) join::set_joined(false);  // back at the menu: the player's own games save again
-        if (g.host) g.push_pending = true, g.push_ready_at = 0;  // the client follows the host's new map (or its reload)
+        if (g.at_menu) join::set_joined(false), join::hold(false), g.died = false, g.campaign_wanted = false;  // back at the menu: the player's own games save again
+        bool same_save = g.now - g.reload_handed_at < 60.0 && join::status().get("state").asString() != "failed";
+        if (g.host && !same_save) g.push_pending = true, g.push_ready_at = 0;  // the client follows the host's new map (or reload)
+        else if (g.host) core_log("reload: the other player loads the same save, no hand-over");
         g.map_since = g.now;
+        core_log("world: " + (world ? ue::name_of(world) : std::string("none")));  // timings of loads and travels
         g.map_changes++;
     }
     // Only a gameplay world counts (the main menu has its own pawn class); nothing touches the world before that.
     bool gameplay = pawn && ue::class_name(pawn) == "IndianaPlayerCharacter_BP_C";
+    if (gameplay && g.now < g.settle_until) {  // after a travel, the game's own loading screen ends it: settled 1 s later
+        ue::UObject* tm = travel_manager();       // (probe 82: ~7 s after the world appears, instead of a fixed 10 s)
+        bool travelling = tm && travel_destination(tm);
+        if (travelling) g.arrived_by_travel = true;
+        else if (g.arrived_by_travel) g.settle_until = std::min(g.settle_until, g.now + 1.0), g.arrived_by_travel = false;
+    }
     bool settled = gameplay && g.now >= g.settle_until;
     g.in_gameplay = settled;
     receive();  // after the world check: data for the old world's objects is ignored until the new one settles
+    watch_travel();
+    if (gameplay) follow_travel(pawn);
+    send_travels();
+    send_gifts();
+    bool give_pressed = give_key.exchange(false);
     // The host's map changed: hand the campaign over as soon as it can save, not after the map settles and the client
-    // reports another map (two-PC test: 15 s, then 7 s of transfer).
+    // reports another map (two-PC test: 15 s, then 7 s of transfer). Not while the client follows a travel by itself.
+    bool followed = g.host && g.follow_until > g.now;
+    if (followed && g.push_pending && g.puppet_map == g.my_map && !g.snaps.empty() && g.now - g.snaps.back().t < 2.0) {
+        g.follow_until = 0, g.push_pending = false, followed = false;  // (only once the host is in its new map: run 84)
+        core_log("travel: the other player arrived by itself, no hand-over");
+    }
     if (g.host && g.push_pending && gameplay && !g.push_ready_at) g.push_ready_at = g.now + 2.0;  // placed at its saved spot
-    if (g.host && g.push_pending && g.have_peer && gameplay && g.push_ready_at && g.now >= g.push_ready_at && g.now >= g.next_push_try) {
+    if (g.host && g.push_pending && !followed && g.have_peer && gameplay && g.push_ready_at && g.now >= g.push_ready_at && g.now >= g.next_push_try) {
         g.next_push_try = g.now + 0.5;
         request_resync("the host changed map", true);
     }
@@ -1645,6 +2890,11 @@ void frame(float) {
             st.yaw = yaw, st.pitch = pitch;
             st.vx = static_cast<float>(vel[0]), st.vy = static_cast<float>(vel[1]), st.vz = static_cast<float>(vel[2]);
             st.map_hash = g.my_map;
+            if (g.now >= g.next_dead_check) {
+                g.next_dead_check = g.now + 0.5;
+                g.me_dead = character::dead();
+            }
+            st.flags = g.me_dead || g.opt_fake_dead ? 1 : 0;
             send_raw(&st, sizeof st);
         }
     }
@@ -1663,6 +2913,12 @@ void frame(float) {
         if (join::joined()) core_log("saves are off in this joined game: the host keeps the campaign, your own saves stay untouched");
     }
     if (!g.host) character::frame(g.now, pawn && settled && gameplay && join::joined());
+    if (!g.host && gameplay && join::joined() && g.now >= g.next_life_check) watch_life(pawn);
+    if (!g.host && g.campaign_wanted && g.now >= g.next_campaign_ask && g.now >= g.fetch_quiet_until) {
+        uint32_t reason = g.died ? 4 : 3;  // asked again every 5 s: the host can't save in a fight
+        send_typed(kResyncRequest, &reason, 4);
+        g.next_campaign_ask = g.now + 5.0;
+    }
     if (!g.host && pawn && settled && join::joined() && g.snapped_world != g.world_ptr && g.puppet && !g.snaps.empty() &&
         g.now - g.snaps.back().t < 1.0 && g.puppet_map == g.my_map) {
         g.snapped_world = g.world_ptr;
@@ -1678,6 +2934,10 @@ void frame(float) {
         }
     }
     if (pawn && settled) {
+        watch_keys();
+        if (give_pressed) try_give(pawn);
+        watch_gifts();
+        apply_gifts();
         setup_watches();
         process_observed();
         watch_boxes(pawn);
@@ -1695,9 +2955,22 @@ void frame(float) {
         drive_puppet();
         if (g.opt_scan) scan_step(pawn);
         if (g.host && g.opt_story) story::host_frame(g.now, send_typed);  // polls even without a peer: the log covers the whole session
-        if (g.host && g.opt_npcs && g.have_peer && g.now >= g.next_npc_send) {
-            g.next_npc_send = g.now + 0.1;
-            host_send_npcs(pawn);
+        if (g.host && g.have_peer && g.now >= g.next_clock) {
+            g.next_clock = g.now + 2.0;
+            g.host_paused = game_paused();
+            send_clock();
+        }
+        if (g.host && g.opt_npcs && g.have_peer && g.now >= g.next_npc_send) {  // a menu pauses the host's NPCs, not
+            g.next_npc_send = g.now + 0.1;                                       // the client's: no corrections then
+            bool paused = game_paused();                                         // (looked at each time: run 96)
+            if (paused != g.host_paused) core_log(paused ? "the host's game is paused (a menu, a conversation)" : "the host's game runs again");
+            g.host_paused = paused;
+            if (!g.host_paused) host_send_npcs(pawn);
+        }
+        if (!g.host) keep_clock();
+        if (!g.host && g.opt_combat && g.have_peer && g.now >= g.next_combat_send) {
+            g.next_combat_send = g.now + 0.2;
+            client_send_combat(pawn);
         }
         if (!g.host) {
             client_report_damage();
@@ -1709,7 +2982,7 @@ void frame(float) {
             }
         }
         if (g.host && g.have_peer) {  // the client is in another map (the host travelled): hand the campaign over
-            bool other = g.puppet_map != 0 && g.puppet_map != g.my_map && !g.snaps.empty() && g.now - g.snaps.back().t < 2.0;
+            bool other = g.puppet_map != 0 && g.puppet_map != g.my_map && !g.snaps.empty() && g.now - g.snaps.back().t < 2.0 && g.follow_until <= g.now;
             if (!other) g.mismatch_since = -1;
             else if (g.mismatch_since < 0) g.mismatch_since = g.now;
             else if (g.now - g.mismatch_since > 5.0) request_resync("the client is in another map");
@@ -1725,8 +2998,8 @@ void frame(float) {
         g.join_requests++;
     }
     if (g.host && g.resync_sends > 0 && g.now >= g.next_resync_send) {  // tell the client (repeated: UDP)
-        uint32_t body[2] = {static_cast<uint32_t>(g.port + 1), g.me};
-        send_typed(kResync, body, 8);
+        uint32_t body[4] = {static_cast<uint32_t>(g.port + 1), g.me, g.resync_kind, static_cast<uint32_t>(g.resyncs)};
+        send_typed(kResync, body, 16);
         g.resync_sends--;
         g.next_resync_send = g.now + 1.0;
     }
@@ -1743,11 +3016,43 @@ void observe(void* o, void* f, const void* p) {
 }
 
 json set_options(const json& p) {
-    for (auto& kv : {std::make_pair("story", &g.opt_story), std::make_pair("doors", &g.opt_doors), std::make_pair("npcs", &g.opt_npcs), std::make_pair("scan", &g.opt_scan)})
+    for (auto& kv : {std::make_pair("story", &g.opt_story), std::make_pair("doors", &g.opt_doors), std::make_pair("npcs", &g.opt_npcs), std::make_pair("scan", &g.opt_scan),
+                     std::make_pair("follow", &g.opt_follow), std::make_pair("gifts", &g.opt_gifts), std::make_pair("giveHold", &g.opt_give_hold), std::make_pair("combat", &g.opt_combat), std::make_pair("fakeDead", &g.opt_fake_dead)})
         if (p.get(kv.first).isBool()) *kv.second = p.get(kv.first).asBool(true);
     json s = json::object();
-    s.set("story", g.opt_story).set("doors", g.opt_doors).set("npcs", g.opt_npcs).set("scan", g.opt_scan);
+    s.set("story", g.opt_story).set("doors", g.opt_doors).set("npcs", g.opt_npcs).set("scan", g.opt_scan).set("follow", g.opt_follow).set("gifts", g.opt_gifts).set("combat", g.opt_combat);
     return s;
+}
+
+// Test bridge, game thread: the NPCs fighting in this world, or pinned, with the deciding world's word.
+json fights() {
+    json out = json::array();
+    ue::UObject* pawn = local_pawn();
+    double me[3] = {}, v[3];
+    float yaw, pitch;
+    bool have_me = pawn && read_transform(pawn, me, yaw, pitch, v);
+    static Fn loc;
+    base_fn(loc, "/Script/Engine.Actor", "K2_GetActorLocation");
+    for (auto& kv : g.npcs) {
+        Npc& n = kv.second;
+        if (!n.ai || !npc_live(n)) continue;
+        uint8_t here = fight_of(fighting(n), pawn);
+        if (here == kNobody && n.target == kNobody && !n.has_handle) continue;
+        std::string path = ue::path_of(n.actor);
+        json f = json::object();
+        f.set("npc", path.substr(path.rfind('.') + 1)).set("owner", n.client_owned ? "client" : "host");
+        f.set("word", static_cast<double>(n.target)).set("here", static_cast<double>(here)).set("pinned", n.has_handle);
+        if (n.target == kSomeoneElse) f.set("otherHere", other_actor(n.other) != nullptr);
+        if (have_me && loc.f) {
+            alignas(16) uint8_t b[64] = {};
+            ue::process_event(n.actor, loc.f, b);
+            double p[3];
+            memcpy(p, b + loc.off("ReturnValue"), 24);
+            f.set("dist", dist3(p, me) / 100.0);
+        }
+        out.push(f);
+    }
+    return out;
 }
 
 json status() {
@@ -1770,8 +3075,35 @@ json status() {
     s.set("xpHook", add_xp_original != nullptr).set("xpSent", static_cast<double>(g.xp_sent)).set("xpApplied", static_cast<double>(g.xp_applied));
     s.set("xpBlocked", static_cast<double>(g.xp_blocked)).set("xpPending", static_cast<double>(g.xp_inbox.size())).set("xpDetails", static_cast<double>(g.xp_details_filled)).set("lastXp", g.last_xp);
     s.set("resyncs", static_cast<double>(g.resyncs)).set("resyncRequests", static_cast<double>(g.resync_requests)).set("resyncFetches", static_cast<double>(g.resync_fetches)).set("resyncReason", g.resync_reason);
+    s.set("travelsSent", static_cast<double>(g.travels_sent)).set("travelsFollowed", static_cast<double>(g.travels_followed)).set("travelsRefused", static_cast<double>(g.travels_refused));
+    s.set("lastTravel", g.last_travel).set("followWait", std::max(0.0, g.follow_until - g.now));
+    s.set("giftsSent", static_cast<double>(g.gifts_sent)).set("giftsReceived", static_cast<double>(g.gifts_received)).set("giftsReturned", static_cast<double>(g.gifts_returned));
+    s.set("giftsPending", static_cast<double>(g.gifts_out.size())).set("lastGift", g.last_gift).set("transferOpen", g.transfer_widget != nullptr);
+    s.set("giveReady", open_transfer_fn != nullptr && game_proc != nullptr).set("giveBox", g.give_box ? ue::addr(g.give_box) : std::string());
+    s.set("died", g.died).set("deaths", static_cast<double>(g.deaths)).set("campaignWanted", g.campaign_wanted).set("loadsRedirected", static_cast<double>(g.loads_redirected));
+    s.set("reloadsHanded", static_cast<double>(g.reloads_handed)).set("joinHeld", join::held());
+    s.set("worldAge", g.now - g.map_since);  // seconds since this core saw its world change (timings, test bridge)
+    s.set("clockJumps", static_cast<double>(g.clock_jumps)).set("clockHolds", static_cast<double>(g.clock_holds)).set("clockHeld", g.clock_held).set("hostPaused", g.host_paused);
     s.set("npcs", static_cast<double>(g.npcs.size())).set("npcSent", static_cast<double>(g.npc_sent)).set("npcApplied", static_cast<double>(g.npc_applied));
-    s.set("npcKilled", static_cast<double>(g.npc_killed)).set("npcSnapped", static_cast<double>(g.npc_snapped));
+    s.set("npcKilled", static_cast<double>(g.npc_killed)).set("npcSnapped", static_cast<double>(g.npc_snapped)).set("npcEased", static_cast<double>(g.npc_eased)).set("npcFightSnapped", static_cast<double>(g.npc_fight_snapped));
+    s.set("combatPins", static_cast<double>(g.combat_pins)).set("combatDetections", static_cast<double>(g.combat_detections));
+    s.set("combatHintsSent", static_cast<double>(g.combat_hints_sent)).set("combatHintsIn", static_cast<double>(g.combat_hints_in));
+    s.set("combatRecsIn", static_cast<double>(g.combat_recs_in)).set("combatHandoffs", static_cast<double>(g.combat_handoffs));
+    s.set("combatFights", static_cast<double>(g.combat_fights)).set("combatOwned", static_cast<double>(g.combat_owned));
+    s.set("partyFight", g.now < g.party_fight_until).set("standinFighting", g.standin_fighting).set("standinTeamChanges", static_cast<double>(g.standin_team_changes));
+    s.set("meDead", g.me_dead).set("peerDead", g.peer_dead).set("standinSpell", g.standin_spell);
+    if (g.host) s.set("npcsSentAgo", g.now - g.npcs_sent_at);
+    if (g.puppet && standin_ok()) {  // the stand-in's untargetable effect, as the game sees it
+        static ue::UClass* effect = ue::find_class("/Script/Arkansas.UntargetableByAIStatusEffect");
+        std::string err;
+        ue::UObject* sem = ue::resolve(ue::addr(g.puppet) + ".StatusEffectManagerComponent", &err);
+        ue::UFunction* has = sem ? ue::find_func(ue::class_of(sem), "BPHasStatusEffect") : nullptr;
+        if (effect && has) {
+            json a = json::object();
+            a.set("StatusEffect", ue::addr(effect));
+            try { s.set("standinUntargetable", ue::call(sem, has, a).get("ReturnValue").asBool(false)); } catch (const std::exception&) {}
+        }
+    }
     s.set("dmgSent", static_cast<double>(g.dmg_sent)).set("dmgApplied", static_cast<double>(g.dmg_applied)).set("drops", static_cast<double>(g.drops)).set("dmgResent", static_cast<double>(g.dmg_resent)).set("dmgPending", static_cast<double>(g.dmg_pending.size())).set("joinRequests", static_cast<double>(g.join_requests)).set("atMenu", g.at_menu).set("mapChanges", static_cast<double>(g.map_changes)).set("settled", g.now >= g.settle_until).set("brainStops", static_cast<double>(g.brain_stops));
     if (!g.snaps.empty()) {
         const Snapshot& b = g.snaps.back();

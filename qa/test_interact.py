@@ -126,10 +126,17 @@ def main():
     check(picked is not None, "a container with the same item in both worlds", picked and picked[5])
     if picked:
         path, h, c, hc, cc, name = picked
+        # the host stands at the container (the mod watches the containers near the player), takes one, steps back
+        here = call("ue.call", {"ref": h, "fn": "K2_GetActorLocation"}, inst=0)["ReturnValue"]
+        stood = call("ue.call", {"ref": "pawn", "fn": "K2_GetActorLocation"}, inst=0)["ReturnValue"]
+        call("ue.call", {"ref": "pawn", "fn": "K2_SetActorLocation", "args": {"NewLocation": {"X": here["X"] + 100, "Y": here["Y"], "Z": here["Z"] + 100},
+                                                                              "bSweep": False, "bTeleport": True}}, inst=0)
+        time.sleep(1.5)
         n0, n1 = count(0, h, hc), count(1, c, cc)
         call("ue.call", {"ref": h + ".InventoryComponent", "fn": "RemoveItemFromActor", "args": {"Actor": h, "ItemType": hc, "Count": 1}}, inst=0)
         check(count(0, h, hc) == n0 - 1, f"host took one {name}", f"{n0} -> {count(0, h, hc)}")
         check(wait(lambda: count(1, c, cc) == n1 - 1), "the client's container lost it too", f"{n1} -> {count(1, c, cc)}")
+        call("ue.call", {"ref": "pawn", "fn": "K2_SetActorLocation", "args": {"NewLocation": stood, "bSweep": False, "bTeleport": True}}, inst=0)
     # A dead NPC's loot: the game rebuilds the inventory at death from its loot table (run 58: items given before the
     # kill were gone; probe 59: the generated loot was the same in both worlds), so the test takes from the real loot.
     looted = 0
@@ -188,6 +195,11 @@ def main():
             call("ue.call", {"ref": f"{mine}.InventoryComponent", "fn": "GiveItemToActor", "args": {"Actor": mine, "ItemType": k, "Count": 3, "bLootable": True}}, inst=inst)
             check(wait(lambda: count(other, theirs, ko) == n_other + 3, 8), f"the {side} stored 3 {name} in a container; it is in the other world's container too",
                   f"{n_other} -> {count(other, theirs, ko)}")
+            # part of that stack taken back out (the game fires no "item removed" for it): 2 of the 3 leave both
+            call("ue.call", {"ref": f"{mine}.InventoryComponent", "fn": "RemoveItemFromActor", "args": {"Actor": mine, "ItemType": k, "Count": 2}}, inst=inst)
+            call("ue.call", {"ref": "pawn.InventoryComponent", "fn": "GiveItemToActor", "args": {"Actor": "pawn", "ItemType": k, "Count": 2}}, inst=inst)
+            check(wait(lambda: count(other, theirs, ko) == n_other + 1, 8), f"the {side} took 2 of them back out; the other world's container lost 2 too",
+                  f"{n_other + 3} -> {count(other, theirs, ko)}")
             # back where it stood (run 73: placed above the container, the client could not load the next hand-over)
             call("ue.call", {"ref": "pawn", "fn": "K2_SetActorLocation", "args": {"NewLocation": stood, "bSweep": False, "bTeleport": True}}, inst=inst)
     s0, s1 = call("coop.status", {}, inst=0), call("coop.status", {}, inst=1)

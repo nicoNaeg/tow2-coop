@@ -10,6 +10,7 @@
 #include <shlobj.h>
 #include "join.hpp"
 #include "character.hpp"
+#include "coop.hpp"
 #include "steamnet.hpp"
 #include "ue.hpp"
 #include <atomic>
@@ -35,7 +36,8 @@ double refused_since = -1, retry_at = 0;  // the game refused the load (a fall, 
 double refused_fetch = -1;                // which hand-over (its start time) was refused
 std::atomic<int> test_refusals{0};
 int refusals = 0;
-std::atomic<bool> joined_world{false};
+std::atomic<bool> joined_world{false}, hold_load{false};
+double drop_before = 0;  // a campaign whose transfer began before then is dropped (the friend was revived)
 uintptr_t load_world = 0;           // the world it was started from
 
 double now_s() { return GetTickCount64() / 1000.0; }
@@ -177,9 +179,9 @@ void rx_begin(uint32_t host_id) {
 
 // Host worker: wait until the save folder stops changing, then serve it to one client. Framing per file:
 // u32 name bytes, UTF-16 name, u64 size, data; a zero name length ends the stream.
-void host_worker(std::wstring dir, int port, std::string bind_ip, std::string allow_ip, uint64_t steam_to, uint32_t host_id) {
+void host_worker(std::wstring dir, int port, std::string bind_ip, std::string allow_ip, uint64_t steam_to, uint32_t host_id, bool complete) {
     DWORD64 last_total = ~0ull;
-    for (int stable = 0, i = 0; stable < 3 && i < 120; i++) {  // 3 quiet half-seconds, at most 60 s
+    for (int stable = 0, i = 0; !complete && stable < 3 && i < 120; i++) {  // a new save: 3 quiet half-seconds, at most 60 s
         Sleep(500);
         DWORD64 total = 0;
         for (auto& f : files_of(dir)) {
@@ -312,11 +314,27 @@ std::wstring local_folder() {
 bool joined() { return joined_world.load(); }
 void refuse_loads(int n) { test_refusals = n; }
 void set_joined(bool on) { joined_world = on; }
+void hold(bool on) { hold_load = on; }
+bool held() { return hold_load.load(); }
+void discard() {  // also the transfer under way, or one the host starts within 5 s (asked for before the revive);
+    drop_before = now_s() + 5.0;  // a later hand-over (the host reloads) is kept (run 94: a 30 s window dropped one)
+    if (ready_to_load.exchange(false)) set_state("dropped"), core_log("hand-over: the fetched campaign was dropped (you were revived)");
+}
 
-json host_offer(int port, const std::string& bind_ip, const std::string& allow_ip, uint64_t steam_to, uint32_t host_id) {
+json host_offer(int port, const std::string& bind_ip, const std::string& allow_ip, uint64_t steam_to, uint32_t host_id, const std::wstring& existing) {
     if (busy.exchange(true)) throw std::runtime_error("a transfer is already running");
     std::wstring dir = saves_dir();
     if (dir.empty()) { busy = false; throw std::runtime_error("cannot resolve the save folder"); }
+    if (!existing.empty()) {  // the save the host's game is loading: complete on disk, sent at once
+        if (existing.find_first_of(L"\\/:") != std::wstring::npos || existing == L"." || existing == L"..") { busy = false; throw std::runtime_error("bad save name"); }
+        if (files_of(dir + L"\\" + existing).empty()) { busy = false; throw std::runtime_error("the loaded save has no files"); }
+        bytes = 0, started = now_s(), error.clear();
+        set_state("sending the loaded save");
+        std::thread(host_worker, dir + L"\\" + existing, port, bind_ip, allow_ip, steam_to, host_id, true).detach();
+        json out = json::object();
+        out.set("save", "loaded").set("port", port);
+        return out;
+    }
     std::vector<ue::UObject*> found = ue::instances(ue::find_class("/Script/Arkansas.SaveGameManager"), false, 1);
     ue::UObject* sgm = found.empty() ? nullptr : found[0];
     if (!sgm) { busy = false; throw std::runtime_error("no SaveGameManager"); }
@@ -333,7 +351,7 @@ json host_offer(int port, const std::string& bind_ip, const std::string& allow_i
     }
     bytes = 0, started = now_s(), error.clear();
     set_state("saving");
-    std::thread(host_worker, dir + L"\\CoopHost", port, bind_ip, allow_ip, steam_to, host_id).detach();
+    std::thread(host_worker, dir + L"\\CoopHost", port, bind_ip, allow_ip, steam_to, host_id, false).detach();
     json out = json::object();
     out.set("save", r.get("ReturnValue")).set("port", port);
     return out;
@@ -430,12 +448,20 @@ void block_saves(bool block) {
 // Game thread: load the received save once (the front end must have run for a while, see session.py).
 void frame(uint64_t frames) {
     if (frames < 3600 || !ready_to_load.load() || now_s() < retry_at) return;  // LoadGame in the first ~15 s after start crashed the engine
+    if (hold_load) { set_state("received: loads when you continue"); return; }
     std::string f;
     double fetch;
     { std::lock_guard<std::mutex> g(mu); f = folder, fetch = started; }
+    if (fetch < drop_before) {  // asked for before a revive
+        ready_to_load = false, drop_before = 0;
+        set_state("dropped");
+        core_log("hand-over: the fetched campaign was dropped (you were revived)");
+        return;
+    }
     if (refused_fetch != fetch) refused_since = -1;  // a new hand-over: its own splice and refusal clock
     // The joined player's own character goes into the received campaign first (it may save it for a few seconds); a
     // retry after a refused load finds it there already.
+    if (coop::close_screens()) { set_state("closing the transfer screen"); return; }  // its stand-in goes away with this world
     if (refused_since < 0 && !character::before_load(saves_dir() + L"\\" + std::wstring(f.begin(), f.end()))) { set_state("keeping your character"); return; }
     ready_to_load = false;
     std::vector<ue::UObject*> found = ue::instances(ue::find_class("/Script/Arkansas.SaveGameManager"), false, 1);

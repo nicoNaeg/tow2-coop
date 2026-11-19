@@ -15,5 +15,7 @@ bool before_load(const std::wstring& dir);
 void loaded();                           // game thread: the hand-over LoadGame succeeded
 void frame(double now, bool joined_gameplay);  // game thread, every frame; joined_gameplay: settled in a joined world
 void save_now();                         // game thread: start a private save now (test bridge)
+bool dead();                             // game thread: the local player is dying or dead
+void use_kept_next();                    // game thread: the next hand-over takes the last kept character, no new save
 coopbridge::json::Value status();        // any thread
 }  // namespace character

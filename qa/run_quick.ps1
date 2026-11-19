@@ -41,8 +41,13 @@ Step 'outfit and hair' { python -I test_look.py }
 Step 'stand-in animation' { python -I test_anim.py $p[1] }
 Step 'interact and loot' { python -I test_interact.py }
 Step 'party XP' { python -I test_xp.py }
+Step 'story both ways' { python -I test_resync.py AS }
+Step 'give items' { python -I test_give.py $p[0] $p[1] }
 Step 'own character' { python -I test_character.py }
-Step 'resync map travel' { python -I test_resync.py B }
+Step 'co-op combat' { python -I test_combat.py ABCDE $p[0] }  # before the reloads: they bring the NPCs back
+Step 'death and reload' { python -I test_death.py ABCD $p[0] }
+Step 'world sync' { python -I test_world.py $p[0] }
+Step 'resync map travel' { python -I test_resync.py B2C }  # host leads (followed), host leads (fallback), client leads
 foreach ($i in 0, 1) { Get-ChildItem "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes" -ErrorAction SilentlyContinue | ForEach-Object { "crash report in copy ${i}: $($_.Name)" | Tee-Object -FilePath $log -Append } }
 Step 'no caught faults' {
     $bad = @(foreach ($f in $coreLogs) {

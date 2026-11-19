@@ -54,8 +54,12 @@ Step 'interact' { python -I test_interact.py }
 Step 'outfit follows' { python -I test_look.py }
 Step 'stand-in animation' { python -I test_anim.py $p[1] }
 Step 'party XP' { python -I test_xp.py }
-Step 'resync quest outcome' { python -I test_resync.py A }
-Step 'resync map travel' { python -I test_resync.py B }
+Step 'give items' { python -I test_give.py $p[0] $p[1] }
+Step 'co-op combat' { python -I test_combat.py ABCDE $p[0] }  # before the reloads: they bring the NPCs back
+Step 'death and reload' { python -I test_death.py ABCD $p[0] }
+Step 'world sync' { python -I test_world.py $p[0] }
+Step 'story both ways' { python -I test_resync.py AS }
+Step 'resync map travel' { python -I test_resync.py B2C }  # host leads (followed), host leads (fallback), client leads
 Step 'client saves (session)' { python -I test_client_saves.py "$hub\local\gamepool\instances\tow2\1\sandbox" session "$hub\local\the-outer-worlds-2\test-saves\TheOuterWorlds2" }
 Step 'resume save' { python -I test_resume.py save "$Out\resume-facts.json" }
 Down

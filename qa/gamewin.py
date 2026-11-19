@@ -18,7 +18,7 @@ user32.EnumWindows.argtypes = [EnumProc, wintypes.LPARAM]
 user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 
 VK = {"SPACE": 0x20, "ENTER": 0x0D, "ESCAPE": 0x1B, "TAB": 0x09, "UP": 0x26, "DOWN": 0x28, "LEFT": 0x25, "RIGHT": 0x27,
-      "SHIFT": 0x10, "CTRL": 0x11, "F5": 0x74, "F9": 0x79}
+      "SHIFT": 0x10, "CTRL": 0x11, "F5": 0x74, "F9": 0x78}  # VK_F9 is 0x78 (0x79 is F10)
 WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
 HERE = Path(__file__).resolve().parent
 

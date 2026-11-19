@@ -16,7 +16,7 @@ using json = ue::json;
 std::mutex mu;  // status() runs on the bridge thread
 std::string key = "direct", source = "none", note;
 bool saving = false, strip_pending = false, protect = false;  // protect: the world holds the host's copy, never store it
-double save_started = 0, last_check = 0, next_periodic = 0, last_saved = -1;
+double save_started = 0, last_check = 0, next_periodic = 0, last_saved = -1, kept_only_until = -1;
 long long last_size = -1;
 constexpr double kEvery = 180.0;  // a private save every 3 minutes keeps a crash from losing much
 
@@ -47,6 +47,17 @@ ue::UObject* player_pawn() {
     return p && ue::class_name(p) == "IndianaPlayerCharacter_BP_C" ? p : nullptr;
 }
 
+bool player_dead() {  // dying or dead: never kept (the last kept character goes in instead)
+    std::string err;
+    ue::UObject* hc = ue::resolve("pawn.HealthComponent", &err);
+    ue::UFunction* f = hc ? ue::find_func(ue::class_of(hc), "GetStateOfBeing") : nullptr;
+    if (!f) return false;
+    try {
+        std::string s = ue::call(hc, f, json::object()).get("ReturnValue").asString();
+        return s == "Dying" || s == "Dead";
+    } catch (const std::exception&) { return false; }
+}
+
 long long file_size(const std::wstring& path, FILETIME* written = nullptr) {
     WIN32_FILE_ATTRIBUTE_DATA a;
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return -1;
@@ -59,7 +70,7 @@ long long file_size(const std::wstring& path, FILETIME* written = nullptr) {
 bool start_save() {
     if (saving) return true;
     ue::UObject* sgm = save_manager();
-    if (!sgm || !player_pawn()) return false;
+    if (!sgm || !player_pawn() || player_dead()) return false;
     ue::UFunction* dis = ue::find_func(ue::class_of(sgm), "DisableSaves");
     json on = json::object(), off = json::object(), a = json::object();
     on.set("bDisable", true), off.set("bDisable", false);
@@ -189,6 +200,8 @@ void strip() {
 }
 }  // namespace
 
+bool dead() { return player_dead(); }
+
 void set_host(const std::string& k) {
     std::lock_guard<std::mutex> g(mu);
     key = k;
@@ -200,15 +213,17 @@ bool before_load(const std::wstring& dir) {
     static double first_try = -1;
     double t = now_s();
     if (first_try < 0 || t - first_try > 30.0) first_try = t;  // a new hand-over (an older attempt was abandoned)
-    bool kept_now = last_saved >= first_try;                   // this hand-over's save is done
-    if (!kept_now && !saving && t - first_try < 6.0 && player_pawn() && join::joined() && !protect && !start_save()) return false;
-    if (saving) {
+    bool kept_now = last_saved >= first_try || t < kept_only_until;  // this hand-over's save is done (or not wanted: a reload)
+    if (!kept_now && !saving && t - first_try < 6.0 && player_pawn() && !player_dead() && join::joined() && !protect && !start_save()) return false;
+    if (saving && t >= kept_only_until) {  // a reload doesn't wait for a save under way either
         poll_save();
         if (saving) return false;
     }
-    first_try = -1;
+    first_try = -1, kept_only_until = -1;
     return splice(dir);
 }
+
+void use_kept_next() { kept_only_until = now_s() + 60.0; }
 
 void loaded() { next_periodic = now_s() + kEvery; }
 

@@ -11,6 +11,7 @@
 #include "join.hpp"
 #include "steamnet.hpp"
 #include "character.hpp"
+#include "story.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdarg>
@@ -34,6 +35,67 @@ constexpr uint32_t kPoolFnRva = 0x109EFEC;
 // UPlayerInfoComponent::AddXP(XP, EXPGainReason, TArray* details): every XP gain but the debug command's (inlined)
 constexpr uint32_t kAddXpRva = 0x139E03C;
 constexpr uint8_t kAddXpBytes[20] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x41, 0x56, 0x41, 0x57};
+// UIndianaUI::OpenItemTransfer(AActor*) (probe 82): reads ItemTransferClass (+0x540), creates the widget and binds it to
+// the actor's inventory. No direct caller in the exe (virtual or a delegate target), so it has the standard ABI.
+constexpr uint32_t kOpenTransferRva = 0x6BC7764;
+// Mod installs (probe 85): UWeapon::EquipModByClass (reads the item's WeaponModContainer at +0x1EC8; 13 callers in the
+// exe), and the armor install EquipmentComponent::EquipArmorModByClassDebug calls with (armor, &class, 0, 1, 1, 1).
+constexpr uint32_t kWeaponModRva = 0x6D3ED8C, kArmorModRva = 0x179A0F0;
+// USaveGameManager::LoadGame(const FString& Filename, bool bPreValidateMetadata) -> ELoadGameResult: virtual (slot
+// 0x2F8; no direct caller), the death screen's Continue and the Load menu end up here (probe 85).
+constexpr uint32_t kLoadGameRva = 0x6B30B90;
+// UQuestManager's quest lookup by GUID (the exec thunk of GetQuestState_BP calls it; 15 callers): the quest instance.
+constexpr uint32_t kFindQuestRva = 0x14BEE2C;
+constexpr uint8_t kFindQuestBytes[16] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0x42, 0x0C, 0x48, 0x8B, 0xDA};
+constexpr uint8_t kLoadGameBytes[22] = {0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x55, 0x57, 0x41, 0x56, 0x48, 0x8D, 0xAC, 0x24, 0x30, 0xFC, 0xFF, 0xFF};
+// USaveGameManager::Quickload() -> ELoadGameResult (virtual, slot 0x310): its own inner load, not LoadGame (run 93: F9
+// went past the LoadGame hook). The newest "Quicksave*" folder is what it loads.
+constexpr uint32_t kQuickloadRva = 0x1B2478C;
+constexpr uint8_t kQuickloadBytes[21] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x68, 0x10, 0x48, 0x89, 0x70, 0x18, 0x48, 0x89, 0x78, 0x20, 0x41, 0x56};
+using LoadGameFn = uint8_t (*)(void* sgm, ue::FString* filename, bool prevalidate);
+LoadGameFn o_load_game;
+uint8_t hk_load_game(void* sgm, ue::FString* filename, bool prevalidate) {
+    std::wstring name;
+    if (filename && filename->data && filename->num > 1 && filename->num < 1024 && ue::readable(filename->data, filename->num * 2))
+        name.assign(filename->data, filename->num - 1);
+    int verdict = -1;
+    try { verdict = coop::on_load_request(name); } catch (...) {}  // called from game code: nothing may escape
+    if (verdict >= 0) return static_cast<uint8_t>(verdict);
+    uint8_t r = o_load_game(sgm, filename, prevalidate);
+    try { coop::on_load_started(name, r); } catch (...) {}
+    return r;
+}
+
+std::wstring newest_quicksave() {
+    std::wstring dir = join::saves_folder(), best;
+    FILETIME best_t{};
+    WIN32_FIND_DATAW fd;
+    HANDLE h = dir.empty() ? INVALID_HANDLE_VALUE : FindFirstFileW((dir + L"\\Quicksave*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return L"";
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && CompareFileTime(&fd.ftLastWriteTime, &best_t) > 0) best_t = fd.ftLastWriteTime, best = fd.cFileName;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return best;
+}
+
+using QuickloadFn = uint8_t (*)(void* sgm);
+QuickloadFn o_quickload;
+uint8_t hk_quickload(void* sgm) {
+    std::wstring name;
+    int verdict = -1;
+    try {
+        name = newest_quicksave();
+        verdict = coop::on_load_request(name.empty() ? std::wstring(L"Quicksave") : name);
+    } catch (...) {}
+    if (verdict >= 0) return static_cast<uint8_t>(verdict);
+    uint8_t r = o_quickload(sgm);
+    try { coop::on_load_started(name, r); } catch (...) {}
+    return r;
+}
+constexpr uint8_t kWeaponModBytes[17] = {0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x99, 0xC8, 0x1E, 0x00, 0x00};
+constexpr uint8_t kArmorModBytes[21] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x56, 0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x50, 0x48, 0x8B, 0x3A};
+constexpr uint8_t kOpenTransferBytes[16] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x48, 0x85, 0xD2};
 
 uint8_t* g_base;
 std::string g_logpath, g_status = "starting", g_verify_report;
@@ -182,6 +244,7 @@ using TickFn = void (*)(void*, float, bool);
 TickFn o_tick;
 void hk_tick(void* self, float dt, bool idle) {
     g_game_thread = GetCurrentThreadId();
+    ue::new_epoch();
     g_frames++;
     g_last_dt = dt;
     if (g_bridge_on) {
@@ -440,9 +503,34 @@ DWORD WINAPI init_thread(LPVOID) {
     o_add_xp = reinterpret_cast<coop::AddXpFn>(hook::install(g_base + kAddXpRva, kAddXpBytes, sizeof kAddXpBytes, reinterpret_cast<void*>(hk_add_xp), err));
     if (o_add_xp) coop::add_xp_original = o_add_xp, coop::add_xp_entry = reinterpret_cast<coop::AddXpFn>(g_base + kAddXpRva);
     else logmsg("XP sharing off: %s", err.c_str());
+    if (!memcmp(g_base + kOpenTransferRva, kOpenTransferBytes, sizeof kOpenTransferBytes)) coop::open_transfer_fn = reinterpret_cast<coop::OpenTransferFn>(g_base + kOpenTransferRva);
+    else logmsg("giving items off: the game's transfer screen is not where this build has it");
+    reg("coop.give", [](const Value&) { return coop::give_open(); });  // test: the transfer screen on the stand-in, no key
+    if (!memcmp(g_base + kWeaponModRva, kWeaponModBytes, sizeof kWeaponModBytes)) coop::weapon_equip_mod = reinterpret_cast<coop::WeaponModFn>(g_base + kWeaponModRva);
+    if (!memcmp(g_base + kArmorModRva, kArmorModBytes, sizeof kArmorModBytes)) coop::armor_equip_mod = reinterpret_cast<coop::ArmorModFn>(g_base + kArmorModRva);
+    if (!coop::weapon_equip_mod || !coop::armor_equip_mod) logmsg("given weapons and armor arrive without their mods: the game's mod install is not where this build has it");
+    reg("coop.mods", [](const Value& p) { return coop::mods_test(p); });  // test: an item's mods, or install one
+    if (!memcmp(g_base + kFindQuestRva, kFindQuestBytes, sizeof kFindQuestBytes)) story::find_quest = reinterpret_cast<story::FindQuestFn>(g_base + kFindQuestRva);
+    else logmsg("quest outcomes reach the client by a save resync: the game's quest lookup is not where this build has it");
+    o_load_game = reinterpret_cast<LoadGameFn>(hook::install(g_base + kLoadGameRva, kLoadGameBytes, sizeof kLoadGameBytes, reinterpret_cast<void*>(hk_load_game), err));
+    if (!o_load_game) logmsg("faster reloads off: %s", err.c_str());
+    o_quickload = reinterpret_cast<QuickloadFn>(hook::install(g_base + kQuickloadRva, kQuickloadBytes, sizeof kQuickloadBytes, reinterpret_cast<void*>(hk_quickload), err));
+    if (!o_quickload) logmsg("faster quickloads off: %s", err.c_str());
+    reg("diag.vtable", [](const Value& p) {  // test: the function in an object's virtual table (read only)
+        std::string err;
+        ue::UObject* o = ue::resolve(p.get("ref").asString(), &err);
+        int off = static_cast<int>(p.get("offset").asInt(-1));
+        if (!o || off < 0 || off % 8) throw std::runtime_error(o ? "offset: a multiple of 8" : err);
+        void** vt = *reinterpret_cast<void***>(o);
+        if (!ue::readable(vt + off / 8, 8)) throw std::runtime_error("unreadable table");
+        Value r = Value::object();
+        r.set("fn", ue::addr(vt[off / 8])).set("rva", ue::addr(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(vt[off / 8]) - reinterpret_cast<uintptr_t>(g_base))));
+        return r;
+    });
     reg("coop.xp", [](const Value& p) { return coop::xp_test(static_cast<int>(p.get("xp").asInt(10)), static_cast<int>(p.get("reason").asInt(0))); });  // test
     std::string coop_why;
     reg("coop.status", [](const Value&) { return coop::status(); });
+    reg("coop.fights", [](const Value&) { return coop::fights(); });  // test: whom the NPCs fight here, and the deciding word
     reg("coop.set", [](const Value& p) { return coop::set_options(p); });
     reg("coop.steamProbe", [](const Value&) { return coop::steam_probe(); }, false);  // waits: off the game thread
     reg("coop.face", [](const Value&) { return coop::face_debug(); });  // test: look texts

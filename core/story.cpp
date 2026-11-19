@@ -12,6 +12,7 @@
 
 namespace story {
 using json = coopbridge::json::Value;
+FindQuestFn find_quest = nullptr;
 namespace {
 struct Guid { uint8_t b[16]; bool operator<(const Guid& o) const { return memcmp(b, o.b, 16) < 0; } };
 struct Quest {
@@ -63,13 +64,16 @@ struct State {
     std::map<Guid, int> quest_by_id;
     std::vector<Guid> globals;
     std::vector<Probe> probes;
+    std::map<std::pair<int, int32_t>, size_t> quest_probe;  // (quest index, 0 = state | addendum id) -> probe
+    std::map<Guid, size_t> global_probe;                    // global -> probe
     size_t cursor = 0;
     Call get_state, addendum_triggered, is_global, start, mention, trigger_addendum, set_global;
     ue::UObject* qm = nullptr;
-    // reliable channel
-    std::vector<Event> log;     // host: every change since this session started (seq = index + 1)
-    uint32_t peer_acked = 0;    // host: highest seq the client applied
-    uint32_t applied = 0;       // client
+    // reliable channel, each way
+    std::vector<Event> log;     // our changes since this session started (seq = index + 1)
+    uint32_t peer_acked = 0;    // highest seq of ours the other side applied
+    uint32_t applied = 0;       // highest seq of the other side's that we applied
+    uint32_t dropped_to = 0;    // client: its changes up to here were made before a reload, never sent
     double next_send = 0;
     uint64_t applied_count = 0, skipped_count = 0, sent_packets = 0;
     std::string last_applied;
@@ -143,10 +147,11 @@ bool load(std::string& err) {
         g.quests.push_back(q);
     }
     for (int i = 0; i < static_cast<int>(g.quests.size()); i++) {
+        g.quest_probe[{i, 0}] = g.probes.size();
         g.probes.push_back({1, i, 0});
-        for (int32_t a : g.quests[i].addendums) g.probes.push_back({2, i, a});
+        for (int32_t a : g.quests[i].addendums) g.quest_probe[{i, a}] = g.probes.size(), g.probes.push_back({2, i, a});
     }
-    for (int i = 0; i < static_cast<int>(g.globals.size()); i++) g.probes.push_back({3, i, 0});
+    for (int i = 0; i < static_cast<int>(g.globals.size()); i++) g.global_probe[g.globals[i]] = g.probes.size(), g.probes.push_back({3, i, 0});
     std::vector<ue::UObject*> qms = ue::instances(ue::find_class("/Script/Arkansas.OwQuestManager"), false, 1);
     g.qm = qms.empty() ? nullptr : qms[0];
     ue::UObject* qc = ue::cdo(ue::find_class("/Script/OEIFlowCharts.QuestConditionals"));
@@ -220,26 +225,38 @@ void poll_some(int budget) {
     }
 }
 
+void baseline(size_t probe, int32_t v) {  // a change we apply is not ours to send back
+    if (probe < g.probes.size()) g.probes[probe].last = v, g.probes[probe].known = true;
+}
+
 void apply(const Event& e) {
     Guid id;
     memcpy(id.b, e.guid, 16);
     char what[96];
     if (e.kind == 1) {
         auto it = g.quest_by_id.find(id);
-        if (it == g.quest_by_id.end()) { g.skipped_count++; return; }
+        if (it == g.quest_by_id.end() || e.a < 0 || e.a > 4) { g.skipped_count++; return; }
+        auto qp = g.quest_probe.find({it->second, 0});
+        if (qp != g.quest_probe.end()) baseline(qp->second, e.a);
         const Quest& q = g.quests[it->second];
         int32_t local = quest_state(id);
         alignas(16) uint8_t b[64] = {};
         if (e.a == 1 && (local == 0 || local == 4)) { g.start.put(b, "QuestID", id); g.start.run(b); }
         else if (e.a == 4 && local == 0) { g.mention.put(b, "QuestID", id); g.mention.run(b); }
         else if ((e.a == 2 || e.a == 3) && local != e.a) {
-            // No script completes or fails a quest in this build (QuestComplete/QuestFail do nothing in shipping).
-            // The synced inputs (globals, addendums, kills) usually let the client's own quest graph get there;
-            // if it has not after 5 s, the client asks the host for a save resync.
+            // No script completes or fails a quest in this build (QuestComplete/QuestFail do nothing in shipping):
+            // the quest's own state takes the host's outcome (what GetQuestState_BP reads). Without the lookup, the
+            // synced inputs may still let the client's quest graph get there; if not after 5 s, a save resync.
+            uint8_t* quest = find_quest && g.qm ? find_quest(g.qm, id.b) : nullptr;
+            if (quest && ue::readable(quest + kQuestStateOffset, 1)) quest[kQuestStateOffset] = static_cast<uint8_t>(e.a);
             g.pending.push_back({id, e.a, g.now + 5.0});
         } else { g.skipped_count++; return; }
         snprintf(what, sizeof what, "quest %s -> %d", q.name.c_str(), e.a);
     } else if (e.kind == 2) {
+        auto it0 = g.quest_by_id.find(id);
+        auto ap = it0 == g.quest_by_id.end() ? g.quest_probe.end() : g.quest_probe.find({it0->second, e.a});
+        if (ap == g.quest_probe.end()) { g.skipped_count++; return; }  // an addendum the quest data does not have
+        baseline(ap->second, 1);
         if (addendum_on(id, e.a)) { g.skipped_count++; return; }
         alignas(16) uint8_t b[64] = {};
         g.trigger_addendum.put(b, "QuestID", id);
@@ -249,6 +266,9 @@ void apply(const Event& e) {
         auto it = g.quest_by_id.find(id);
         snprintf(what, sizeof what, "addendum %s #%d", it != g.quest_by_id.end() ? g.quests[it->second].name.c_str() : "?", e.a);
     } else if (e.kind == 3) {
+        auto gp = g.global_probe.find(id);
+        if (gp == g.global_probe.end()) { g.skipped_count++; return; }  // only the objective globals are shared
+        baseline(gp->second, e.a);
         if (global_is(id, 0, e.a)) { g.skipped_count++; return; }
         alignas(16) uint8_t b[64] = {};
         g.set_global.put(b, "Variable", id);
@@ -273,31 +293,40 @@ bool ensure_loaded() {
     return true;
 }
 
-void reset_peer() { g.peer_acked = 0; }  // a (re)joined client loaded a save; replaying is idempotent
+void reset_peer() { g.peer_acked = 0, g.applied = 0; }  // a (re)joined client: replay ours (idempotent), take its anew
 
-void host_frame(double now, const SendFn& send) {
-    if (!ensure_loaded()) return;
-    poll_some(80);
-    if (g.peer_acked >= g.log.size() || now < g.next_send) return;
+void send_log(double now, const SendFn& send) {  // our changes the other side has not applied yet
+    uint32_t from = std::max(g.peer_acked, g.dropped_to);
+    if (from >= g.log.size() || now < g.next_send) return;
     g.next_send = now + 0.1;
-    uint8_t body[2 + kMaxEvents * sizeof(Event)];
+    uint8_t body[6 + kMaxEvents * sizeof(Event)];
     uint16_t count = 0;
-    for (uint32_t s = g.peer_acked; s < g.log.size() && count < kMaxEvents; s++, count++)
-        memcpy(body + 2 + count * sizeof(Event), &g.log[s], sizeof(Event));
-    memcpy(body, &count, 2);
-    send(kStory, body, 2 + count * static_cast<int>(sizeof(Event)));
+    uint32_t base = g.dropped_to + 1;  // the first of our changes still valid (older ones were dropped by a reload)
+    for (uint32_t s = from; s < g.log.size() && count < kMaxEvents; s++, count++)
+        memcpy(body + 6 + count * sizeof(Event), &g.log[s], sizeof(Event));
+    memcpy(body, &base, 4), memcpy(body + 4, &count, 2);
+    send(kStory, body, 6 + count * static_cast<int>(sizeof(Event)));
     g.sent_packets++;
 }
 
+void host_frame(double now, const SendFn& send) {
+    if (!ensure_loaded()) return;
+    g.pending.clear();  // the host has no one to resync from
+    poll_some(80);
+    send_log(now, send);
+}
+
 void on_story(const char* body, int len, const SendFn& send) {
-    if (len < 2 || !ensure_loaded() || g.reset_ack) return;  // a reset is announced first
+    if (len < 6 || !ensure_loaded() || g.reset_ack) return;  // a reset is announced first
+    uint32_t base;
     uint16_t count;
-    memcpy(&count, body, 2);
-    if (count > kMaxEvents || len != 2 + count * static_cast<int>(sizeof(Event))) return;
+    memcpy(&base, body, 4), memcpy(&count, body + 4, 2);
+    if (count > kMaxEvents || len != 6 + count * static_cast<int>(sizeof(Event))) return;
+    if (base > g.applied + 1) g.applied = base - 1;  // the sender dropped its changes made before a reload
     for (int i = 0; i < count; i++) {
         Event e;
-        memcpy(&e, body + 2 + i * sizeof(Event), sizeof e);
-        if (e.seq != g.applied + 1) continue;  // in order only; the host resends from our ack
+        memcpy(&e, body + 6 + i * sizeof(Event), sizeof e);
+        if (e.seq != g.applied + 1) continue;  // in order only; the sender resends from our ack
         apply(e);
         g.applied = e.seq;
     }
@@ -317,6 +346,8 @@ void client_reset() {  // the client's world was reloaded from a save: ask for a
     g.applied = 0;
     g.pending.clear();
     g.reset_ack = true;
+    g.dropped_to = static_cast<uint32_t>(g.log.size());  // changes made before the reload are not sent any more
+    for (Probe& p : g.probes) p.known = false;          // the reloaded world is the new baseline
 }
 
 void client_frame(double now, const SendFn& send) {
@@ -325,6 +356,10 @@ void client_frame(double now, const SendFn& send) {
         uint32_t body[2] = {0, 1};
         send(kStoryAck, body, 8);
         g.reset_ack = false;
+    }
+    if (ensure_loaded()) {  // our own changes go to the host too (the first look at each probe is the baseline)
+        poll_some(80);
+        send_log(now, send);
     }
     for (size_t i = 0; i < g.pending.size();) {
         if (now < g.pending[i].at) { i++; continue; }
@@ -345,7 +380,7 @@ json status() {
     s.set("globals", static_cast<double>(g.globals.size())).set("probes", static_cast<double>(g.probes.size()));
     s.set("events", static_cast<double>(g.log.size())).set("peerAcked", static_cast<double>(g.peer_acked)).set("applied", static_cast<double>(g.applied));
     s.set("appliedCount", static_cast<double>(g.applied_count)).set("skipped", static_cast<double>(g.skipped_count)).set("lastApplied", g.last_applied);
-    s.set("pendingOutcomes", static_cast<double>(g.pending.size()));
+    s.set("pendingOutcomes", static_cast<double>(g.pending.size())).set("ownEvents", static_cast<double>(g.log.size()));
     return s;
 }
 }  // namespace story

@@ -26,7 +26,10 @@ def main():
 
     w0 = call("eval", {"expr": "world"}, inst=0)["value"].split()[-1]
     w1 = safe(lambda: call("eval", {"expr": "world"}, inst=1)["value"].split()[-1], "?")
-    check("ConversationalMainMenu" in w1, "client starts at the main menu", w1[-40:])
+    # The client either sits at the main menu, or already got the host's campaign when the host's game loaded its save
+    # (the save being loaded goes straight to a waiting client).
+    early = w1 == w0 and safe(lambda: call("coop.status", {}, inst=0)["resyncReason"], "") == "the host loaded a save"
+    check("ConversationalMainMenu" in w1 or early, "client starts at the main menu (or joined with the host's load)", w1[-40:])
     t0 = time.time()
     while time.time() - t0 < 360:
         w1 = safe(lambda: call("eval", {"expr": "world"}, inst=1, timeout_s=10)["value"].split()[-1], "loading")
