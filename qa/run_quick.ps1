@@ -1,14 +1,15 @@
 # Targeted regression on one pair for the two-PC fixes (stand-in look and animation, interactions incl. dead-NPC loot,
 # map-travel hand-over), plus the owner-state and caught-fault checks. The whole suite is run_suite.ps1.
 # Usage: run_quick.ps1 -Out <evidence folder> [-NoRamCheck] [-Only 'interact and loot','...'] [-Menu] (the join steps always run;
-# -Menu: the copies start in menu mode and the players host and join through the game's main menu instead)
-param([Parameter(Mandatory)][string]$Out, [switch]$NoRamCheck, [string[]]$Only, [switch]$Warm, [switch]$Menu)
+# -NewGame: menu mode, copy 1 without saves of its own, then only the new-game-together test; -Bare: only start the copies; -Stay: leave the joined pair running after god mode, for probes; -Menu: the copies start in menu mode and the players host and join through the game's main menu instead)
+param([Parameter(Mandatory)][string]$Out, [switch]$NoRamCheck, [string[]]$Only, [switch]$Warm, [switch]$Menu, [switch]$Stay, [switch]$Bare, [switch]$NewGame)
 $ErrorActionPreference = 'Continue'
 $hub = 'C:\coop-anything'; $qa = "$hub\local\tow2-coop\qa"; $cfg = "$qa\tow2.gamepool.json"
 New-Item -ItemType Directory -Force $Out | Out-Null
 $log = "$Out\suite.log"; $results = [ordered]@{}
 function Step([string]$name, [scriptblock]$body) {
     if ($Only -and $name -notin $Only -and $name -notin 'host load', 'auto-join', 'co-op menu', 'players invulnerable', 'no caught faults') { return }
+    if ($NewGame -and $name -notin 'new game together', 'no caught faults') { return }  # its own run: the rest needs the usual start
     "=== $name ($(Get-Date -Format HH:mm:ss))" | Tee-Object -FilePath $log -Append | Out-Host
     $text = & $body 2>&1 | Out-String
     $text | Tee-Object -FilePath $log -Append | Out-Host
@@ -24,9 +25,11 @@ python -I local/tow2-coop/qa/owner_guard.py snapshot "$Out\owner-before.json" | 
 $coreLogs = foreach ($i in 0, 1) { "$hub\local\gamepool\instances\tow2\$i\sandbox\tow2coop.log" }
 $logStart = @{}; foreach ($f in $coreLogs) { $logStart[$f] = if (Test-Path $f) { (Get-Item $f).Length } else { 0 } }
 Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-File', "$qa\memguard.ps1", '-Out', $Out
+if ($NewGame) { $Menu = $true; New-Item -ItemType Directory -Force "$Out\nosaves\TheOuterWorlds2" | Out-Null }
 foreach ($i in 0, 1) {
     python -I local/tow2-coop/qa/deploy.py --config $cfg --instance $i | Out-Null
-    python -I local/tow2-coop/qa/prep_instance.py --config $cfg --instance $i | Out-Null
+    $saves = @(); if ($NewGame -and $i -eq 1) { $saves = @('--saves', "$Out\nosaves\TheOuterWorlds2") }  # a player with no character yet
+    python -I local/tow2-coop/qa/prep_instance.py --config $cfg --instance $i @saves | Out-Null
     $cr = "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes"; if (Test-Path $cr) { Remove-Item $cr -Recurse -Force }
     $kept = "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\tow2coop\characters"; if (Test-Path $kept) { Remove-Item $kept -Recurse -Force }  # a first join: no character kept from an earlier run
 }
@@ -36,9 +39,12 @@ if ($Menu) { $env:TOW2_COOP_MENU = '1' } else { Remove-Item Env:TOW2_COOP_MENU -
 python -I tools/gamepool/gamepool.py --config $cfg up --pairs 1 --stagger 60 @extra 2>&1 | Select-Object -Last 2 | Out-Host
 Get-Process -Name 'TheOuterWorlds2-Win64-Shipping' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$hub\local\gamepool\instances\*" } | ForEach-Object { & "$qa\unminimize.ps1" -ProcessId $_.Id | Out-Null }
 Set-Location $qa
-if ($Menu) { $p = Pids; Step 'co-op menu' { python -I test_menu.py $p[0] $p[1] } }
+if ($Bare) { "copies started, no steps (-Bare); stop them: close_copies.ps1, gamepool down, then $Out\memguard.stop"; return }
+if ($NewGame) { $p = Pids; Step 'new game together' { python -I test_newgame.py $p[0] $p[1] } }
+elseif ($Menu) { $p = Pids; Step 'co-op menu' { python -I test_menu.py $p[0] $p[1] } }
 else { Step 'host load' { python -I session.py --instances 0 }; Step 'auto-join' { python -I test_autojoin.py } }
 Step 'players invulnerable' { python -I god.py }
+if ($Stay) { "the pair stays up for probes; stop it: close_copies.ps1, gamepool down, then $Out\memguard.stop"; return }
 Start-Sleep 10
 $p = Pids
 Step 'outfit and hair' { python -I test_look.py }

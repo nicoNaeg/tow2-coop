@@ -1,19 +1,22 @@
 # tow2-coop: two-player co-op for The Outer Worlds 2 (work in progress)
 
-Status: **v0.4.0, a test build: co-op through Steam (friends, or public games; no IP or port), or direct IP.**
-0.4.0: a Windows installer (`tow2coop-setup.exe`); public games anyone can join, and Steam's "Join game" from the
-friends list; the game's menus no longer pause it in co-op, while conversations are shared (the other player sees the
-screen, can choose too, and their game pauses meanwhile); the host's companions show where they are in both worlds; the
-friend's character is kept a few seconds after it changes; doors, containers and XP are resent until confirmed; a
-quest the friend completes gives its XP to both. 0.3.0: host and join from the game's own main menu; the other
+Status: **v0.5.0, a test build: co-op through Steam (friends, or public games; no IP or port), or direct IP.**
+0.5.0: the player who starts a conversation leads it, and the other player's game plays the same conversation (the
+same lines, camera, voices and cinematics, the same choices on screen); only the leader chooses, and their pick is
+made in both games. A new game together from the very beginning: the host hosts a New Game, the friend makes their
+character in the game's character creator and joins the host's start. A quest one player completes is completed in
+the other game the game's own way (its banner, journal and XP). 0.4.0: a Windows installer (`tow2coop-setup.exe`);
+public games anyone can join, and Steam's "Join game" from the friends list; the game's menus no longer pause it in
+co-op; the host's companions show where they are in both worlds; the friend's character is kept a few seconds after it
+changes; doors, containers and XP are resent until confirmed. 0.3.0: host and join from the game's own main menu; the other
 player's stand-in holds their weapon with its mods and uses it, and crouches with them; enemies the game spawns
 during play are shared. The 0.2.0 betas gave each player their own character: the friend joins with nothing and keeps what they pick up, their own
 look, level and XP (XP earned together is shared), and players give each other items through the other's stand-in. A
 map change no longer waits for a save: when one player travels, the other starts the same travel at once and both
 arrive together. Fights are shared: an enemy that spots either player starts the fight in both games, and the enemies
 spread over both players. Tested on one PC with two copies (runs 70-111); the first real session across two PCs
-(2026-11-17, beta.4) ran the earlier features. 0.3.0 and 0.4.0 were tested on one PC too (runs 112-143).
-Use 0.4.0 on both PCs (an older version on the other PC does not connect; the log says so). Two independent copies of
+(2026-11-17, beta.4) ran the earlier features. 0.3.0 to 0.5.0 were tested on one PC too (runs 112-157).
+Use 0.5.0 on both PCs (an older version on the other PC does not connect; the log says so). Two independent copies of
 the game share one campaign owned by the host: the client joins by receiving the host's save, each player controls their
 own character, sees the other (position, rotation, walk/idle animation, the player's look, armor and helmet changes),
 and the host owns NPC health and deaths, quest progress, door states and container contents; either player can lead a
@@ -31,8 +34,9 @@ Entertainment or Xbox; it ships no game files. MIT license.
   quicksave slots are the friend's own campaign's); the friend's own games, loaded from the main menu, save normally.
   The mod keeps the friend's character itself (see Characters).
 - **Host and join:** in the main menu, the Moon Man's choices have one more: *Let's play together (co-op).* Pick it
-  (its number key or a click), then *I'll host* (your Steam friends can join your game) or *I'll join a friend's
-  game* (the Steam friends who host are listed: pick one). The host then loads or continues their campaign as usual;
+  (its number key or a click), then *I'll host* (your Steam friends can join your game), *I'll host a new game* (you
+  both start from the very beginning) or *I'll join a friend's game* (the Steam friends who host are listed: pick
+  one). The host then loads or continues their campaign as usual;
   the friend's game joins it: the host saves its current campaign ("CoopHost") and hands it over, and the friend's game
   loads it into its own save folder `CoopHost_<host id>` (never over the friend's own saves). The same choice shows
   who you play with, and stops hosting or joining.
@@ -40,8 +44,18 @@ Entertainment or Xbox; it ships no game files. MIT license.
   save (their look, level, skills, perks), with nothing in their pockets: no items, no money. From then on the friend
   keeps their own items (with ammo in the magazine, mods, durability), money, XP and level across every hand-over: before
   loading the campaign the host sends, the friend's mod saves its own character (a private save named "CoopSelf") and
-  puts it into the host's campaign. The character is kept per host in `%LOCALAPPDATA%\tow2coop\characters\`. To start
-  fresh, create a character in a new game of your own first (its save becomes your newest save), then join.
+  puts it into the host's campaign. The character is kept per host in `%LOCALAPPDATA%\tow2coop\characters\`.
+- **A new game together:** the host picks *I'll host a new game*: their game starts the game's own New Game (the
+  character creator, then the intro). The friend picks that host as usual (*Join ... (a new game: you make your
+  character first)*): their own New Game starts, they make their character, and once the intro allows a save (after
+  its opening conversation) the mod keeps that character and the friend joins the host's game with it. A friend who
+  joins any host without a character of their own makes one the same way first.
+- **Conversations:** the player who starts a conversation leads it. The other player is moved next to them and their
+  game plays the same conversation: the same lines (the same one where the game draws a line at random), its camera,
+  voices and cinematics, and the same choices on screen, but only the leader chooses (the other's keys and clicks on
+  the choices do nothing); the leader's pick is made in both games, and when the leader's conversation ends, so does
+  theirs. Both games run the conversation's own effects (items, quests, reputation), as each player's game does for
+  them. No game pauses for a conversation (the base game doesn't).
 - **Progression:** level, skills and perks are each player's own (they travel with the character). XP is party XP:
   a kill, a lock pick, a hack, a conversation or an interaction earns XP for both players (each with their own
   multipliers); quest XP comes from the host's campaign (the friend's game does not add its own); discovering a place
@@ -194,10 +208,11 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
   picked with the mouse or its number key, not yet with a gamepad. Public games and Steam's "Join game" were tested on
   one Steam account only (a public game made, searched for, left); a join between two accounts is still to try.
 - In co-op the game's menus (pause, inventory, map, a flaw offer) no longer pause it: the world goes on, as in a
-  multiplayer game. A conversation is shared: the other player sees a simple screen of it (the speaker, the line, the
-  responses as text; no camera, no voice), can choose too (keys 1-9), and their game pauses meanwhile. The
-  conversation itself runs in the starter's game, which keeps running as in the base game (paused, the conversation
-  itself stopped at its first line).
+  multiplayer game.
+- In a conversation the other player sees the leader's choices as their own game shows them: a choice their character
+  can't take (a skill check, a flaw) shows as unavailable there; when the leader picks it, the other game starts the
+  conversation again at that response (a short camera cut). Each game runs the conversation's effects: an item the
+  NPC gives goes to both players, a payment is taken from both.
 - Co-op combat was tested against Ursopods (melee creatures) and an Order soldier fighting nearby; a large fight with
   many armed humans was not tried yet.
 - The friend's character is kept by a private save the friend's game makes about 5 s after it changes (items, money,
@@ -208,9 +223,9 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
   giving with the game's inventory functions, not with mouse clicks in the screen.
 - Following a travel was tested with the game's travel into and out of an interior and with fast travel; ship travel
   was not tried yet.
-- Quest outcomes made in the friend's game are set on the host's quest directly when the host's own quest graph has
-  not got there by itself: the host gets the quest's XP from the friend's game (and shares it back), but its game shows
-  no "quest completed" banner for it.
+- A quest one player completes is walked to the same end in the other game with the game's own quest steps (a step a
+  second: the banner, the journal and the quest's XP come as usual). When that path ends the other way or gets stuck
+  (more than 15 steps or 30 s), the quest's state is set directly, without the banner.
 - In a joined game the friend can't load one of their own saves (Continue, Load and Quickload bring back the host's
   current game): to play their own campaign, go back to the main menu first. After a death the friend comes back with
   the character as last kept (up to 3 minutes earlier). If the host is in a fight, that reload waits until the host's

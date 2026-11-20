@@ -74,9 +74,9 @@ struct Outgoing {  // sent until the other game acknowledges it (kInteractAck), 
     double next, until;
     int sent;
 };
-constexpr uint32_t kMagic = 0x35433254;  // "T2C5": the last character is the protocol version, bump it on any packet change
-constexpr const char* kVersion = "0.4.0";
-constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13, kTravel = 14, kClock = 15, kCombat = 16, kSpawns = 17, kSpawnOffers = 18, kWeaponMods = 19, kInteractAck = 20, kConversation = 21, kConvPick = 22, kParty = 23;
+constexpr uint32_t kMagic = 0x36433254;  // "T2C6": the last character is the protocol version, bump it on any packet change
+constexpr const char* kVersion = "0.5.0";
+constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13, kTravel = 14, kClock = 15, kCombat = 16, kSpawns = 17, kSpawnOffers = 18, kWeaponMods = 19, kInteractAck = 20, kConversation = 21, kParty = 23;  // 22: 0.4.0's response pick
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";
 
@@ -151,7 +151,20 @@ struct TravelMsg {
     uint16_t len;
     char path[256];
 };
+struct ConvMsg {             // the conversation its sender leads (shared conversations)
+    uint8_t open;            // 1: it leads one; 0: it ended (sent a few times)
+    uint8_t asset_len, owner_len, pad;
+    uint32_t conv;           // the sender's conversation number
+    int32_t node, prev;      // its node now, and the one before
+    int32_t group;           // the bank its line was drawn from (-1: none)
+    uint32_t picks;          // the responses picked in it so far
+    int32_t recent[4];       // the last ones, newest first
+    float pos[3], yaw;       // where the sender stands
+    uint64_t owner_id;       // other_id() of whom it talks to (0: by its path)
+    char text[512];          // the asset's path, then the owner's path
+};
 #pragma pack(pop)
+constexpr int kConvHead = static_cast<int>(offsetof(ConvMsg, text));
 
 // Whom an NPC fights, in both players' terms (the same value in both worlds).
 enum Fight : uint8_t { kNobody = 0, kHostPlayer = 1, kClientPlayer = 2, kSomeoneElse = 3 };
@@ -256,6 +269,10 @@ struct Ctx {
     bool menu_mode = false, role_chosen = true, start_host = false;
     uint64_t join_target = 0, menu_picks = 0;  // join_target: the Steam friend picked in the menu
     bool host_public = false, join_public = false;  // a public game (a Steam lobby): anyone may join / we join a stranger
+    bool host_new = false;   // host: a new game together (the friend makes a character first)
+    bool new_char = false;   // client: our own New Game makes our character, then we join
+    int new_char_stage = 0;  // 0 making it, 1 keeping it (a private save), 2 asking for the host's game
+    double new_char_since = 0;
     uint64_t pending_join = 0;                       // a host to join from Steam ("Join game", an invite, the command line)
     bool public_wanted = false;                      // a public game picked in the menu: joined once its lobby is entered
     uint64_t spawn_copies = 0, spawn_matched = 0, spawn_removed = 0;
@@ -269,15 +286,12 @@ struct Ctx {
     double start_time = 0, next_join_request = 0, map_since = 0;
     bool at_menu = false;
     bool opt_story = true, opt_doors = true, opt_npcs = true, opt_scan = true, opt_follow = true;  // coop.set
-    bool opt_no_pause = true, opt_party = true, opt_conv_pause = true, conv_paused = false;
+    bool opt_no_pause = true, opt_party = true, opt_conv_follow = true;
     uint64_t pauses_lifted = 0;
-    // shared conversations: the other player's (its screen's texts: speaker, line, responses) and a pick sent to ours
-    std::vector<std::string> peer_conv;
-    bool peer_conv_open = false, conv_sent_open = false, mirror_shown = false, mirror_paused = false;
-    double peer_conv_at = 0, next_conv_send = 0, last_conv_full = 0;
-    int conv_close_left = 0, conv_pick = 0;
-    std::string conv_last_sent;
-    uint64_t conv_states_sent = 0, conv_picks_sent = 0, conv_picks_done = 0, mirrors_shown = 0;
+    // shared conversations: the one the other player leads (open: they lead one now)
+    ConvMsg peer_conv{};
+    double peer_conv_at = -100;
+    uint64_t conv_states_sent = 0, conv_leads = 0, conv_follows = 0, conv_picks_sent = 0, conv_picks_applied = 0, conv_jumps = 0, conv_advances = 0;
     uint64_t dmg_resent = 0, join_requests = 0;
     uint32_t next_eid = 1;
     std::vector<Outgoing> outgoing;
@@ -1145,12 +1159,11 @@ void setup_watches() {
     uint32_t d = ue::make_name("OnItemCountChangedInInventory", false).index;  // part of the player's stack left (run 70)
     uint32_t t = ue::make_name("TriggerEventBP", false).index;  // a weapon's visuals hear its events: fire, swing, reload
     if (!b || !c || !d) return;
-    watch[0] = reinterpret_cast<void*>(static_cast<uintptr_t>(b));
-    watch[1] = reinterpret_cast<void*>(static_cast<uintptr_t>(c));
-    watch[2] = reinterpret_cast<void*>(static_cast<uintptr_t>(d));
-    watch[3] = reinterpret_cast<void*>(static_cast<uintptr_t>(t));
+    int k = 0;
+    for (uint32_t x : {b, c, d, t})
+        if (x) watch[k++] = reinterpret_cast<void*>(static_cast<uintptr_t>(x));
     trigger_event_name = t;
-    watch_count.store(t ? 4 : 3, std::memory_order_release);
+    watch_count.store(k, std::memory_order_release);
     g.watches_set = true;
 }
 
@@ -2113,10 +2126,7 @@ float raw_hour(ue::UObject* c) {
 // world with the engine's own pause, the persistent level's WorldSettings.PauserPlayerState (probe 105: the player's
 // state while the pause menu or the inventory is open). While the other player is in the game it is lifted at once:
 // the menu stays open, the world goes on, as in a multiplayer game.
-bool in_conversation();  // below: the local player is in a conversation
-
 void keep_running() {
-    if (g.mirror_shown || in_conversation()) return;  // a conversation pauses both games (owner): its pause stays
     std::string err;
     ue::UObject* ws = ue::resolve("world.PersistentLevel.WorldSettings", &err);
     static ue::FProperty* prop = nullptr;
@@ -2273,20 +2283,22 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
     if (g.remote_id != h.sender && g.host) story::reset_peer();  // a (re)joined client gets the story log replayed
     g.remote_id = h.sender;
     g.remote_last_seq = h.seq;
-    if (h.type == kResync && !g.host) { g.last_recv_t = g.now; client_fetch_resync(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }
-    if (h.type == kConversation) {  // the other player's conversation screen: open flag, then its lines
+    if (h.type == kResync && !g.host) {
+        g.last_recv_t = g.now;
+        // New game together: the host's game comes once our new character is kept (new_char_frame asks for it then);
+        // the host offers it earlier when it sees us in another map (the character creator): not taken (run 152).
+        if (!g.new_char || g.new_char_stage >= 2) client_fetch_resync(buf + sizeof(Header), n - static_cast<int>(sizeof(Header)));
+        return;
+    }
+    if (h.type == kConversation) {  // the conversation the other player leads
         int len = n - static_cast<int>(sizeof(Header));
-        const char* body = buf + sizeof(Header);
-        if (len < 1) { g.bad++; return; }
-        g.peer_conv_open = body[0] != 0, g.peer_conv_at = g.now, g.last_recv_t = g.now;
-        g.peer_conv.clear();
-        std::string rest(body + 1, len - 1);
-        for (size_t at = 0; at < rest.size() && g.peer_conv.size() < 12;) {
-            size_t e = rest.find('\n', at);
-            if (e == std::string::npos) e = rest.size();
-            g.peer_conv.push_back(rest.substr(at, e - at));
-            at = e + 1;
-        }
+        ConvMsg m{};
+        if (len < kConvHead || len > static_cast<int>(sizeof m)) { g.bad++; return; }
+        memcpy(&m, buf + sizeof(Header), len);
+        bool sane = kConvHead + m.asset_len + m.owner_len == len && std::isfinite(m.pos[0]) && std::isfinite(m.pos[1]) && std::isfinite(m.pos[2]) &&
+                    std::isfinite(m.yaw);  // trust boundary
+        if (!sane) { g.bad++; return; }
+        g.peer_conv = m, g.peer_conv_at = g.now, g.last_recv_t = g.now;
         return;
     }
     if (h.type == kParty && !g.host) {  // the host's companions: calm flag, count, then id, position, yaw, velocity each
@@ -2307,14 +2319,6 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
             auto& e = g.party_in[id];
             e.first = e.second.t > 0 ? e.second : s, e.second = s;
         }
-        return;
-    }
-    if (h.type == kConvPick) {  // the other player picked a response on its mirror of our conversation
-        if (n == static_cast<int>(sizeof(Header)) + 1) {
-            int k = static_cast<uint8_t>(buf[sizeof(Header)]);
-            if (k >= 1 && k <= 9) g.conv_pick = k;  // trust boundary
-        }
-        g.last_recv_t = g.now;
         return;
     }
     if (h.type == kInteractAck) { g.last_recv_t = g.now; on_interact_ack(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }
@@ -3497,6 +3501,7 @@ void steam_discovery() {
         return;
     }
     steamnet::set_presence("tow2coop", g.host ? "host" : "");
+    steamnet::set_presence("tow2coop_new", g.host && g.host_new ? "1" : "");
     if (g.host) {  // "Join game" for friends (rich presence connect); a public game: a lobby whose members are accepted
         steamnet::set_presence("connect", ("-tow2coop_join=" + std::to_string(steamnet::me())).c_str());
         if (g.host_public) {
@@ -3789,7 +3794,7 @@ struct MenuState {
 
 double menu_last[2] = {};  // the last click, in viewport pixels (test bridge)
 
-enum MenuAction { kOpen = 1, kHost, kStopHosting, kJoinList, kStopJoining, kBack, kSearch, kJoinDirect, kHostPublic, kJoinFriend = 100, kJoinPublic = 200 };
+enum MenuAction { kOpen = 1, kHost, kStopHosting, kJoinList, kStopJoining, kBack, kSearch, kJoinDirect, kHostPublic, kHostNew, kJoinFriend = 100, kJoinPublic = 200 };
 
 const char* tr(const char* en, const char* fr) {
     if (menu.lang < 0) {
@@ -3973,6 +3978,32 @@ std::vector<uint64_t> hosting_friends() {
     return out;
 }
 
+// The game's own New Game, from the main menu: Scripts.MainMenuNewGame (what the Moon Man's "New Game" runs) sets
+// where his conversation leads; ending it starts the New Game (the character creator: CharacterCreation_Lite, then
+// 0501_PS_Intro_P; probe 109).
+ue::UObject* active_conversation();  // shared conversations, below
+bool main_menu_new_game() {
+    ue::UClass* k = ue::find_class("/Script/Arkansas.Scripts");
+    ue::UFunction* f = k ? ue::find_func(k, "MainMenuNewGame") : nullptr;
+    ue::UObject* lib = nullptr;
+    if (ue::UClass* c = ue::find_class("/Script/Arkansas.ConversationBlueprintLibrary")) lib = ue::cdo(c);
+    ue::UObject* menu_talk = active_conversation();
+    if (!f || !lib || !menu_talk) return false;
+    try {
+        ue::call(ue::cdo(k), f, json::object());
+        json a = json::object();
+        a.set("Instance", ue::addr(menu_talk));
+        ue::call(lib, ue::find_func(ue::class_of(lib), "EndConversationInstance"), a);
+    } catch (const std::exception& e) {
+        g.last_error = std::string("new game: ") + e.what();
+        return false;
+    }
+    core_log("new game together: the game's New Game starts (the character creator)");
+    return true;
+}
+
+bool host_is_new(uint64_t host) { return g.steam && steamnet::on() && steamnet::presence(host, "tow2coop_new") == "1"; }
+
 void choose_off() {
     if (g.steam && steamnet::on()) {
         steamnet::set_presence("tow2coop", "");
@@ -3982,7 +4013,8 @@ void choose_off() {
         g.have_peer = false;
     }
     g.role_chosen = false, g.join_target = 0, g.snaps.clear(), g.remote_id = 0, g.remote_last_seq = 0, g.gestures_synced = false;
-    g.host_public = false, g.join_public = false, g.public_wanted = false;
+    g.host_public = false, g.join_public = false, g.public_wanted = false, g.host_new = false, g.new_char = false, g.new_char_stage = 0;
+    if (g.steam && steamnet::on()) steamnet::set_presence("tow2coop_new", "");
     destroy_puppet();
     core_log("co-op menu: co-op off");
 }
@@ -3999,18 +4031,29 @@ void menu_act(int action) {
     else if (action == kBack) menu.level = menu.level == 2 ? 1 : 0;
     else if (action == kHost) choose_role(true, 0), menu.level = 0;
     else if (action == kHostPublic) choose_role(true, 0), g.host_public = true, menu.level = 0;
+    else if (action == kHostNew) {  // the game's New Game, hosted: the friend makes a character and joins it
+        choose_role(true, 0), g.host_new = true, menu.level = 0;
+        if (!main_menu_new_game()) core_log("new game together: the game's New Game did not start (" + g.last_error + ")");
+    }
     else if (action == kStopHosting || action == kStopJoining) choose_off(), menu.level = 0;
     else if (action == kJoinList || action == kSearch) {
         menu.level = 2, menu.search_from = g.now, menu.next_refresh = 0, menu.hosts.clear(), menu.publics.clear();
         if (steam_up())
             for (uint64_t f : steamnet::friends_in_game()) steamnet::request_presence(f);
-    } else if (action == kJoinDirect) choose_role(false, 0), menu.level = 0;
+    } else if (action == kJoinDirect) {
+        choose_role(false, 0), menu.level = 0;
+        if (!character::has_own()) g.new_char = main_menu_new_game();  // a character of their own first
+    }
     else if (action >= kJoinPublic && action - kJoinPublic < static_cast<int>(menu.publics.size())) {
         if (g.role_chosen) choose_off();
         steamnet::lobby_join(menu.publics[action - kJoinPublic].id);  // entered: its owner is the host (frame)
         g.public_wanted = true, menu.level = 0;
         core_log("co-op menu: joining the public game of " + menu.publics[action - kJoinPublic].host);
-    } else if (action >= kJoinFriend && action - kJoinFriend < static_cast<int>(menu.hosts.size())) choose_role(false, menu.hosts[action - kJoinFriend]), menu.level = 0;
+    } else if (action >= kJoinFriend && action - kJoinFriend < static_cast<int>(menu.hosts.size())) {
+        uint64_t h = menu.hosts[action - kJoinFriend];
+        choose_role(false, h), menu.level = 0;
+        if (host_is_new(h) || !character::has_own()) g.new_char = main_menu_new_game();  // their new game: our character first
+    }
     g.menu_picks++;
 }
 
@@ -4039,6 +4082,7 @@ std::vector<std::pair<std::string, int>> menu_wanted() {
         if (hosting) v.push_back({tr("I'll stop hosting.", "Je n'héberge plus."), kStopHosting});
         else if (can_host) {
             v.push_back({tr("I'll host: my Steam friends can join my game.", "J'héberge : mes amis Steam pourront me rejoindre."), kHost});
+            v.push_back({tr("I'll host a new game: we both start from the very beginning.", "J'héberge une nouvelle partie : on commence tous les deux depuis le début."), kHostNew});
             if (g.steam && steamnet::lobbies_on())
                 v.push_back({tr("I'll host: anyone can join (public game).", "J'héberge : tout le monde peut me rejoindre (partie publique)."), kHostPublic});
         }
@@ -4054,11 +4098,13 @@ std::vector<std::pair<std::string, int>> menu_wanted() {
             static double checked = -100;
             static bool own = true;
             if (g.now - checked > 5.0) checked = g.now, own = character::has_own();
-            if (!own)
-                v.push_back({tr("You have no character yet: start a New Game to make yours, save, then come back to join.",
-                                "Tu n'as pas encore de personnage : lance une Nouvelle partie pour créer le tien, sauvegarde, puis reviens rejoindre."), kBack});
-            for (size_t i = 0; i < menu.hosts.size() && i < 7; i++)
-                v.push_back({fill(tr("Join {}.", "Rejoindre {}."), steamnet::name(menu.hosts[i])), kJoinFriend + static_cast<int>(i)});
+            for (size_t i = 0; i < menu.hosts.size() && i < 7; i++) {  // a new game, or no character yet: ours is made first
+                bool fresh = host_is_new(menu.hosts[i]);
+                const char* label = fresh ? tr("Join {} (a new game: you make your character first).", "Rejoindre {} (nouvelle partie : tu crées d'abord ton personnage).")
+                                    : !own ? tr("Join {} (you make your character first).", "Rejoindre {} (tu crées d'abord ton personnage).")
+                                           : tr("Join {}.", "Rejoindre {}.");
+                v.push_back({fill(label, steamnet::name(menu.hosts[i])), kJoinFriend + static_cast<int>(i)});
+            }
             for (size_t i = 0; i < menu.publics.size() && v.size() < 7; i++)
                 v.push_back({fill(tr("Join {} (public game).", "Rejoindre {} (partie publique)."), menu.publics[i].host.empty() ? std::string("?") : menu.publics[i].host),
                              kJoinPublic + static_cast<int>(i)});
@@ -4089,7 +4135,7 @@ void menu_frame() {
             shown = b[vis.off("ReturnValue")] && (menu.level > 0 || game_responses().size() >= 2);
         }
     }
-    menu_listen.store(shown || g.mirror_shown);
+    menu_listen.store(shown);
     if (!shown) {
         if (menu.level || !menu.mine.empty() || !menu.hidden.empty()) menu_reset();
         return;
@@ -4261,12 +4307,18 @@ void client_drive_party(ue::UObject* pawn) {
 }  // namespace
 
 // ---------------------------------------------------------------- shared conversations
-// Owner, 2026-11-19: a conversation pauses the game and concerns both players: when one starts a conversation, the
-// other's game shows its screen (the speaker, the line, the responses) and pauses too; either player picks (1-9).
-// The conversation runs in the starter's game only (its scripts, items and XP happen once; the story sync carries its
-// outcome): the other side shows a mirror of the game's own response lines (probe 106: a ConversationWidget made
-// without a conversation shows nothing; the response widgets alone do).
+// Owner, 2026-11-20: the player who starts a conversation leads it; the other player's game plays the same conversation
+// (its camera, voices and cinematics) next to the leader and can't choose: it shows the choices, and the leader's pick
+// is made there too. The follower starts the leader's conversation asset at the leader's node (StartConversation's
+// StartNode: any node, a response too; probe 108). A response the leader picks is picked there by its node (a response
+// widget keeps its flowchart node at +0x378: id at +8, type at +0x10), else the conversation starts again at it. Lines
+// run on their own in both games; a follower left behind skips to the leader's line. Both games run the conversation's
+// scripts (items, quests, globals): the story sync then finds them applied. No game pauses for it (the base game's own
+// conversations don't pause, and a paused one stops at its first line: run 139).
 namespace {
+constexpr int kRespNodeOff = 0x378;    // ConversationResponseWidget -> its FPlayerResponseNode (not reflected; probe 108)
+constexpr int kRespParentOff = 0x388;  // -> the line it answers (its FTalkNode)
+
 ue::UObject* conv_lib_cdo() {
     static ue::UObject* cdo = nullptr;
     if (!cdo)
@@ -4286,53 +4338,246 @@ ue::UObject* conv_screen() {  // the conversation screen on show (ConversationWi
     return nullptr;
 }
 
-std::string text_of(const std::string& path) {
-    std::string err;
-    ue::UObject* t = ue::resolve(path, &err);
-    ue::UFunction* f = t ? ue::find_func(ue::class_of(t), "GetText") : nullptr;
-    if (!f) return "";
-    try {
-        std::string s = ue::call(t, f, json::object()).get("ReturnValue").asString();
-        for (char& c : s)
-            if (c == '\n' || c == '\r') c = ' ';
-        return s;
-    } catch (const std::exception&) { return ""; }
+ue::UObject* active_conversation() {  // the local player's conversation (GetActivePlayerConversation), or nullptr
+    static Fn f;
+    ue::UObject* cdo = conv_lib_cdo();
+    if (!cdo || !base_fn(f, "/Script/Arkansas.ConversationBlueprintLibrary", "GetActivePlayerConversation")) return nullptr;
+    alignas(16) uint8_t b[16] = {};
+    ue::process_event(cdo, f.f, b);
+    ue::UObject* inst = nullptr;
+    memcpy(&inst, b + f.off("ReturnValue"), 8);
+    return inst && ue::alive(inst) ? inst : nullptr;
 }
 
-std::vector<std::string> read_conversation() {  // speaker, line, then the responses (empty: no screen)
-    std::vector<std::string> v;
-    ue::UObject* c = conv_screen();
-    if (!c) return v;
-    std::string w = ue::addr(c);
-    v.push_back(text_of(w + ".SpeakerTextBlock").substr(0, 40));
-    v.push_back(text_of(w + ".ConversationMessage.MessageTextBlock").substr(0, 420));
-    static ue::FProperty* arr = nullptr;
-    if (!arr) arr = ue::find_prop(ue::class_of(c), "SelectableResponseWidgets");
-    if (!arr) return v;
+// OEICineConversationInstance.NavigatorState: its CurrentNodeID and Conversation.ConversationAsset.
+struct NavOff { int node = -1, asset = -1; } nav_off;
+bool nav_ready(ue::UObject* inst) {
+    if (nav_off.node >= 0) return true;
+    ue::FProperty* ns = ue::find_prop(ue::class_of(inst), "NavigatorState");
+    ue::UStruct* st = ns ? ue::struct_of(ns) : nullptr;
+    ue::FProperty* cur = st ? ue::find_prop(st, "CurrentNodeID") : nullptr;
+    ue::FProperty* ref = st ? ue::find_prop(st, "Conversation") : nullptr;
+    ue::UStruct* rs = ref ? ue::struct_of(ref) : nullptr;
+    ue::FProperty* asset = rs ? ue::find_prop(rs, "ConversationAsset") : nullptr;
+    if (!cur || !asset) return false;
+    nav_off.node = ue::prop_offset(ns) + ue::prop_offset(cur);
+    nav_off.asset = ue::prop_offset(ns) + ue::prop_offset(ref) + ue::prop_offset(asset);
+    return true;
+}
+int32_t conv_node(ue::UObject* inst) {
+    return inst && nav_ready(inst) ? *reinterpret_cast<const int32_t*>(reinterpret_cast<const uint8_t*>(inst) + nav_off.node) : -1;
+}
+ue::UObject* conv_asset(ue::UObject* inst) {
+    if (!inst || !nav_ready(inst)) return nullptr;
+    ue::UObject* a = *reinterpret_cast<ue::UObject* const*>(reinterpret_cast<const uint8_t*>(inst) + nav_off.asset);
+    return a && ue::alive(a) ? a : nullptr;
+}
+
+struct Shown { int32_t node, parent; bool selectable; const uint8_t* data; };
+std::vector<Shown> shown_responses(ue::UObject* screen) {  // the responses on a conversation screen, by node
+    std::vector<Shown> out;
+    if (!screen) return out;
+    static ue::FProperty *sel = nullptr, *uns = nullptr;
+    if (!sel) sel = ue::find_prop(ue::class_of(screen), "SelectableResponseWidgets"), uns = ue::find_prop(ue::class_of(screen), "UnselectableResponseWidgets");
+    if (!sel || !uns) return out;
     struct TArr { ue::UObject** data; int32_t num, max; };
-    TArr a;
-    memcpy(&a, reinterpret_cast<uint8_t*>(c) + ue::prop_offset(arr), sizeof a);
-    for (int i = 0; i < a.num && i < 9 && a.data; i++)
-        if (a.data[i] && ue::alive(a.data[i])) v.push_back(text_of(ue::addr(a.data[i]) + ".MessageTextBlock").substr(0, 110));
-    return v;
-}
-
-void send_conversation(bool open, const std::vector<std::string>& lines) {
-    std::string body(1, open ? '\1' : '\0');
-    for (size_t i = 0; i < lines.size(); i++) {
-        if (body.size() + lines[i].size() + 1 > 1380) break;
-        body += (i ? "\n" : "") + lines[i];
+    for (int pass = 0; pass < 2; pass++) {
+        TArr a;
+        memcpy(&a, reinterpret_cast<uint8_t*>(screen) + ue::prop_offset(pass ? uns : sel), sizeof a);
+        for (int i = 0; i < a.num && i < 16 && a.data; i++) {
+            const uint8_t* w = reinterpret_cast<const uint8_t*>(a.data[i]);
+            if (!w || !ue::alive(a.data[i]) || !ue::readable(w + kRespNodeOff, kRespParentOff + 8 - kRespNodeOff)) continue;
+            const uint8_t* n = *reinterpret_cast<const uint8_t* const*>(w + kRespNodeOff);
+            const uint8_t* up = *reinterpret_cast<const uint8_t* const*>(w + kRespParentOff);
+            if (!n || !ue::readable(n, 0x28) || n[0x10] != 1) continue;  // EFlowChartNodeType::PlayerResponse
+            int32_t parent = up && ue::readable(up, 0x10) ? *reinterpret_cast<const int32_t*>(up + 8) : -1;
+            out.push_back({*reinterpret_cast<const int32_t*>(n + 8), parent, pass == 0, n});
+        }
     }
-    send_typed(kConversation, body.data(), static_cast<int>(body.size()));
-    g.conv_states_sent++;
+    return out;
 }
 
-struct Mirror {
-    std::vector<ue::UObject*> rows;
-    std::vector<std::string> texts;
-} mirror;
+// A conversation asset's graph: its links by node (ConversationBundle.DialogueLinks: FromNodeID at +8, ToNodeID at
+// +0xc, 0x20 each) and the bank each line belongs to (BankNodes: a random line drawn among ChildNodeIDs). Read once.
+struct ConvGraph {
+    std::unordered_map<int32_t, std::vector<int32_t>> next;
+    std::unordered_map<int32_t, int32_t> bank;                         // line -> its bank
+    std::unordered_map<int32_t, std::pair<int32_t*, int32_t>> lines;   // bank -> its ChildNodeIDs (in the asset)
+};
+const ConvGraph& conv_graph(ue::UObject* asset) {
+    static ue::UObject* cached = nullptr;
+    static int32_t cached_num = -1, links_off = -1, banks_off = -1, bank_size = 0, children_off = -1;
+    static ConvGraph gr;
+    struct TArr { const uint8_t* data; int32_t num, max; };
+    if (asset && links_off < 0) {
+        ue::FProperty* b = ue::find_prop(ue::class_of(asset), "ConversationBundle");
+        ue::UStruct* bs = b ? ue::struct_of(b) : nullptr;
+        ue::FProperty* l = bs ? ue::find_prop(bs, "DialogueLinks") : nullptr;
+        ue::FProperty* k = bs ? ue::find_prop(bs, "BankNodes") : nullptr;
+        ue::FProperty* in = k ? ue::array_inner(k) : nullptr;
+        ue::FProperty* ch = in && ue::struct_of(in) ? ue::find_prop(ue::struct_of(in), "ChildNodeIDs") : nullptr;
+        if (!l) return gr;
+        links_off = ue::prop_offset(b) + ue::prop_offset(l);
+        if (ch) banks_off = ue::prop_offset(b) + ue::prop_offset(k), bank_size = ue::prop_size(in), children_off = ue::prop_offset(ch);
+    }
+    TArr links{};
+    if (asset && links_off >= 0) memcpy(&links, reinterpret_cast<const uint8_t*>(asset) + links_off, sizeof links);
+    if (asset == cached && links.num == cached_num) return gr;
+    cached = asset, cached_num = links.num, gr.next.clear(), gr.bank.clear(), gr.lines.clear();
+    if (!links.data || links.num <= 0 || links.num > 100000 || !ue::readable(links.data, static_cast<size_t>(links.num) * 0x20)) return gr;
+    for (int32_t k = 0; k < links.num; k++) {
+        const uint8_t* e = links.data + static_cast<size_t>(k) * 0x20;
+        gr.next[*reinterpret_cast<const int32_t*>(e + 8)].push_back(*reinterpret_cast<const int32_t*>(e + 0xc));
+    }
+    TArr banks{};
+    if (banks_off >= 0) memcpy(&banks, reinterpret_cast<const uint8_t*>(asset) + banks_off, sizeof banks);
+    if (banks.data && banks.num > 0 && banks.num < 10000 && bank_size >= children_off + 16 && ue::readable(banks.data, static_cast<size_t>(banks.num) * bank_size))
+        for (int32_t k = 0; k < banks.num; k++) {
+            const uint8_t* b = banks.data + static_cast<size_t>(k) * bank_size;
+            TArr c;
+            memcpy(&c, b + children_off, sizeof c);
+            if (!c.data || c.num <= 0 || c.num > 256 || !ue::readable(c.data, static_cast<size_t>(c.num) * 4)) continue;
+            int32_t id = *reinterpret_cast<const int32_t*>(b + 8);
+            gr.lines[id] = {reinterpret_cast<int32_t*>(const_cast<uint8_t*>(c.data)), c.num};
+            for (int32_t i = 0; i < c.num; i++) gr.bank[reinterpret_cast<const int32_t*>(c.data)[i]] = id;
+        }
+    return gr;
+}
+// The follower draws the leader's line: its copy of the bank lists that line only (the ids overwritten in place: the
+// array stays the game's own), put back when following ends. The last 4 banks the leader went through stay pinned (the
+// follower may still be a line behind).
+struct Pin { ue::UObject* asset; int32_t bank; int32_t* ids; std::vector<int32_t> was; };
+std::vector<Pin> pins;
+void unpin_banks() {
+    for (const Pin& p : pins)
+        if (ue::alive(p.asset) && ue::readable(p.ids, p.was.size() * 4)) memcpy(p.ids, p.was.data(), p.was.size() * 4);
+    pins.clear();
+}
+void pin_bank(ue::UObject* asset, int32_t bank, int32_t line) {
+    for (const Pin& p : pins)
+        if (p.asset == asset && p.bank == bank) {
+            if (p.ids[0] == line) return;
+            std::fill(p.ids, p.ids + p.was.size(), line);  // the leader went through it again: its new line
+            return;
+        }
+    const ConvGraph& gr = conv_graph(asset);
+    auto it = gr.lines.find(bank);
+    if (it == gr.lines.end() || !ue::readable(it->second.first, static_cast<size_t>(it->second.second) * 4)) return;
+    std::vector<int32_t> was(it->second.first, it->second.first + it->second.second);
+    if (std::find(was.begin(), was.end(), line) == was.end()) return;  // not a line of that bank
+    if (pins.size() >= 4) {  // the oldest one goes back
+        const Pin& o = pins.front();
+        if (ue::alive(o.asset) && ue::readable(o.ids, o.was.size() * 4)) memcpy(o.ids, o.was.data(), o.was.size() * 4);
+        pins.erase(pins.begin());
+    }
+    std::fill(it->second.first, it->second.first + it->second.second, line);
+    pins.push_back({asset, bank, it->second.first, std::move(was)});
+}
 
-ue::UObject* mirror_row() {  // a response line of the game's own, alone in the viewport, on one line
+int32_t conv_group(ue::UObject* inst) {  // the bank the current line was drawn from, or -1
+    const ConvGraph& gr = conv_graph(conv_asset(inst));
+    auto it = gr.bank.find(conv_node(inst));
+    return it == gr.bank.end() ? -1 : it->second;
+}
+
+// The response picked, from the line it led to: the game names the next line, not the response (BP_OnConversation-
+// NodeChanged: once per pick, for the line; run 145), and a response often goes there through hidden branch nodes
+// and random banks (probe 110: 153 -> bank 160, which drew 88, 161 or 162). The shown response with the shortest path
+// to the line or its bank (4 links at most).
+int32_t response_to(ue::UObject* asset, const std::vector<Shown>& shown, int32_t to, int32_t group) {
+    const auto& next = conv_graph(asset).next;
+    int32_t best = -1;
+    int best_d = 5;
+    for (const Shown& r : shown) {
+        std::vector<int32_t> front{r.node}, nx;
+        std::unordered_set<int32_t> seen{r.node};
+        for (int d = 1; d < best_d && !front.empty(); d++) {
+            nx.clear();
+            for (int32_t f : front) {
+                auto it = next.find(f);
+                if (it == next.end()) continue;
+                for (int32_t t : it->second)
+                    if (seen.insert(t).second) nx.push_back(t);
+            }
+            if (std::find(nx.begin(), nx.end(), to) != nx.end() || (group >= 0 && std::find(nx.begin(), nx.end(), group) != nx.end())) {
+                best = r.node, best_d = d;
+                break;
+            }
+            front.swap(nx);
+        }
+    }
+    return best;
+}
+
+ue::UObject* ret_object(const json& r) {  // a call's ReturnValue object ("0x... Class path"), or nullptr
+    std::string s = r.get("ReturnValue").asString(), err;
+    return s.rfind("0x", 0) == 0 ? ue::resolve(s.substr(0, s.find(' ')), &err) : nullptr;
+}
+
+json conv_lib_call(const char* fn, const json& a) {
+    ue::UObject* cdo = conv_lib_cdo();
+    ue::UFunction* f = cdo ? ue::find_func(ue::class_of(cdo), fn) : nullptr;
+    if (!f) throw std::runtime_error(std::string("no ") + fn);
+    return ue::call(cdo, f, a);
+}
+
+void conv_call(const char* fn, ue::UObject* inst) {  // EndConversationInstance, AdvanceConversationInstance
+    if (!inst) return;
+    json a = json::object();
+    a.set("Instance", ue::addr(inst));
+    try { conv_lib_call(fn, a); } catch (const std::exception& e) { g.last_error = std::string("conversation: ") + e.what(); }
+}
+
+ue::UObject* conv_partner(ue::UObject* inst, ue::UObject* pawn) {  // whom the conversation is with: a speaker not us
+    try {
+        ue::UClass* k = ue::class_of(inst);
+        ue::UFunction* cur = ue::find_func(k, "GetCurrentSpeaker");
+        ue::UFunction* all = ue::find_func(k, "BP_GetAllSpeakers");
+        ue::UObject* a = cur ? ret_object(ue::call(inst, cur, json::object())) : nullptr;
+        if (a && a != pawn && a != g.puppet) return a;
+        if (all)
+            for (const json& v : ue::call(inst, all, json::object()).get("ReturnValue").items()) {
+                std::string t = v.asString(), err;
+                ue::UObject* o = t.rfind("0x", 0) == 0 ? ue::resolve(t.substr(0, t.find(' ')), &err) : nullptr;
+                if (o && o != pawn && o != g.puppet) return o;
+            }
+    } catch (const std::exception&) {}
+    return nullptr;
+}
+
+ue::UObject* load_asset(const std::string& path) {  // an asset by path, loaded if needed (blocking)
+    if (ue::UObject* o = ue::find_path(path)) return o;
+    ue::UClass* k = ue::find_class("/Script/Engine.KismetSystemLibrary");
+    if (!k) return nullptr;
+    json req = json::object();
+    req.set("Asset", path);
+    try { return ret_object(ue::call(ue::cdo(k), ue::find_func(k, "LoadAsset_Blocking"), req)); } catch (const std::exception&) { return nullptr; }
+}
+
+ue::UObject* start_conversation(ue::UObject* asset, ue::UObject* owner, int32_t node) {  // ours, at that node
+    static ue::UClass* character = ue::find_class("/Script/Arkansas.IndianaCharacter");
+    if (!owner) return nullptr;
+    json a = json::object();
+    a.set("StartNode", node).set("bAllowBarkConversationDuringCombat", false);
+    const char* fn = "StartConversationWithActor";  // an owner that is no character (a terminal): its own conversation
+    if (asset && character && ue::is_a(owner, character)) fn = "StartConversation", a.set("Conversation", ue::addr(asset)).set("Owner", ue::addr(owner));
+    else a.set("Speaker", ue::addr(owner));
+    try {
+        json r = conv_lib_call(fn, a);
+        return r.get("Result").asString() == "OnTrue" ? ret_object(r) : nullptr;
+    } catch (const std::exception& e) { g.last_error = std::string("conversation: ") + e.what(); return nullptr; }
+}
+
+bool can_start(ue::UObject* asset) {  // CanStartConversation: not in a fight, not in another conversation
+    std::string err;
+    ue::UObject* pc = ue::resolve("pc", &err);
+    if (!asset || !pc) return true;  // a terminal's: tried as it is
+    json a = json::object();
+    a.set("WorldContextObject", ue::addr(pc)).set("Conversation", ue::addr(asset)).set("bAllowBarkConversationDuringCombat", false);
+    try { return conv_lib_call("CanStartConversation", a).get("ReturnValue").asBool(true); } catch (const std::exception&) { return true; }
+}
+
+ue::UObject* text_row() {  // a response line of the game's own, alone in the viewport, on one line
     std::string err;
     ue::UObject* pc = ue::resolve("pc", &err);
     static ue::UClass* cls = nullptr;
@@ -4341,9 +4586,8 @@ ue::UObject* mirror_row() {  // a response line of the game's own, alone in the 
     if (!pc || !cls || !lib) return nullptr;
     json a = json::object();
     a.set("WorldContextObject", ue::addr(pc)).set("WidgetType", ue::addr(cls)).set("OwningPlayer", ue::addr(pc));
-    std::string r;
-    try { r = ue::call(ue::cdo(lib), ue::find_func(lib, "Create"), a).get("ReturnValue").asString(); } catch (const std::exception&) {}
-    ue::UObject* w = r.rfind("0x", 0) == 0 ? ue::resolve(r.substr(0, r.find(' ')), &err) : nullptr;
+    ue::UObject* w = nullptr;
+    try { w = ret_object(ue::call(ue::cdo(lib), ue::find_func(lib, "Create"), a)); } catch (const std::exception&) {}
     if (!w) return nullptr;
     json z = json::object();
     z.set("ZOrder", 60);
@@ -4356,130 +4600,375 @@ ue::UObject* mirror_row() {  // a response line of the game's own, alone in the 
     return w;
 }
 
-void mirror_clear() {
-    for (ue::UObject* w : mirror.rows)
-        if (w && ue::alive(w)) call_quiet(ue::addr(w), "RemoveFromParent", json::object());
-    mirror.rows.clear(), mirror.texts.clear();
-}
-
-void set_paused(bool on) {
-    static Fn f;
-    std::string err;
-    ue::UObject* pc = ue::resolve("pc", &err);
-    static ue::UObject* gs = ue::cdo(ue::find_class("/Script/Engine.GameplayStatics"));
-    if (!pc || !gs || !base_fn(f, "/Script/Engine.GameplayStatics", "SetGamePaused")) return;
-    alignas(16) uint8_t b[32] = {};
-    memcpy(b + f.off("WorldContextObject"), &pc, 8);
-    b[f.off("bPaused")] = on ? 1 : 0;
-    ue::process_event(gs, f.f, b);
-}
-
-void mirror_show(const std::vector<std::string>& c) {  // c: speaker, line, responses
-    std::vector<std::string> rows;
-    std::string head = c.size() > 0 ? c[0] : std::string(), line = c.size() > 1 ? c[1] : std::string();
-    // the line, cut at spaces into rows that fit (a tag of rich text is never cut)
-    std::string first = head.empty() ? std::string() : head + " : ";
-    if (line.find('<') != std::string::npos || line.size() + first.size() <= 90) rows.push_back(first + line);
-    else {
-        std::string cur = first;
-        size_t at = 0;
-        while (at < line.size() && rows.size() < 3) {
-            size_t sp = line.find(' ', at);
-            std::string word = line.substr(at, sp == std::string::npos ? std::string::npos : sp - at);
-            if (cur.size() + word.size() > 90 && cur.size() > first.size()) rows.push_back(cur), cur.clear();
-            cur += (cur.empty() || cur == first ? "" : " ") + word;
-            at = sp == std::string::npos ? line.size() : sp + 1;
-        }
-        if (!cur.empty() && rows.size() < 3) rows.push_back(cur);
-    }
-    for (size_t i = 2; i < c.size(); i++) rows.push_back(std::to_string(i - 1) + ". " + c[i]);
-    rows.push_back(fill(tr("({} talks; 1-9: you choose too)", "({} parle ; 1-9 : tu choisis aussi)"), peer_name()));
-    if (rows == mirror.texts) return;
-    while (mirror.rows.size() < rows.size()) {
-        ue::UObject* w = mirror_row();
-        if (!w) return;
-        mirror.rows.push_back(w);
-    }
-    while (mirror.rows.size() > rows.size()) {
-        if (ue::alive(mirror.rows.back())) call_quiet(ue::addr(mirror.rows.back()), "RemoveFromParent", json::object());
-        mirror.rows.pop_back();
-    }
-    double vp[2] = {1920, 1080};
+void viewport_size(double vp[2]) {
+    vp[0] = 1920, vp[1] = 1080;
     static Fn size;
+    static ue::UObject* lib = nullptr;
     std::string err;
     ue::UObject* pc = ue::resolve("pc", &err);
-    static ue::UObject* lib = nullptr;
     if (!lib)
         if (ue::UClass* k = ue::find_class("/Script/UMG.WidgetLayoutLibrary")) lib = ue::cdo(k);
-    if (lib && pc && base_fn(size, "/Script/UMG.WidgetLayoutLibrary", "GetViewportSize")) {
-        alignas(16) uint8_t b[64] = {};
-        memcpy(b + size.off("WorldContextObject"), &pc, 8);
-        ue::process_event(lib, size.f, b);
-        memcpy(vp, b + size.off("ReturnValue"), 16);
+    if (!lib || !pc || !base_fn(size, "/Script/UMG.WidgetLayoutLibrary", "GetViewportSize")) return;
+    alignas(16) uint8_t b[64] = {};
+    memcpy(b + size.off("WorldContextObject"), &pc, 8);
+    ue::process_event(lib, size.f, b);
+    memcpy(vp, b + size.off("ReturnValue"), 16);
+}
+
+// ----- leading: our conversation, told to the other player
+struct Lead {
+    ue::UObject* inst = nullptr;  // our conversation, led by us
+    uint32_t conv = 0, picks = 0;
+    int32_t node = -1, prev = -1, group = -1, recent[4] = {-1, -1, -1, -1};
+    std::vector<Shown> shown;     // the responses on our screen for the line we are on
+    std::string asset, owner;
+    uint64_t owner_id = 0;
+    double next_send = 0, next_look = 0;
+    int closing = 0;              // closing states still to send
+} lead;
+uint32_t lead_count = 0;
+
+void send_conv(bool open) {
+    ConvMsg m{};
+    m.open = open ? 1 : 0;
+    m.conv = lead.conv, m.node = lead.node, m.prev = lead.prev, m.group = lead.group, m.picks = lead.picks;
+    memcpy(m.recent, lead.recent, sizeof m.recent);
+    double p[3] = {}, v[3];
+    float pitch = 0;
+    if (ue::UObject* pawn = local_pawn()) read_transform(pawn, p, m.yaw, pitch, v);
+    for (int i = 0; i < 3; i++) m.pos[i] = static_cast<float>(p[i]);
+    m.owner_id = lead.owner_id;
+    size_t al = std::min<size_t>(lead.asset.size(), 255), ol = std::min<size_t>(lead.owner.size(), std::min<size_t>(255, sizeof m.text - al));
+    m.asset_len = static_cast<uint8_t>(al), m.owner_len = static_cast<uint8_t>(ol);
+    memcpy(m.text, lead.asset.data(), al);
+    memcpy(m.text + al, lead.owner.data(), ol);
+    send_typed(kConversation, &m, kConvHead + static_cast<int>(al + ol));
+    g.conv_states_sent++;
+}
+
+void lead_frame(ue::UObject* inst, ue::UObject* pawn) {
+    if (inst != lead.inst) {  // a new conversation of ours
+        if (!lead_count) lead_count = static_cast<uint32_t>(GetTickCount64() & 0xFFFFFF) << 8;  // a restarted game's count is new
+        lead = Lead{};
+        lead.inst = inst, lead.conv = ++lead_count;
+        g.conv_leads++;
     }
-    double dy = vp[1] * 0.045, y0 = vp[1] * 0.9 - dy * static_cast<double>(rows.size());
-    for (size_t i = 0; i < rows.size(); i++) {
-        ue::UObject* w = mirror.rows[i];
-        json t = json::object(), pos = json::object(), xy = json::object();
-        t.set("InText", rows[i]);
-        call_quiet(ue::addr(w) + ".MessageTextBlock", "SetText", t);
-        xy.set("X", vp[0] * 0.26).set("Y", y0 + dy * static_cast<double>(i));
-        pos.set("Position", xy).set("bRemoveDPIScale", true);
-        call_quiet(ue::addr(w), "SetPositionInViewport", pos);
+    bool changed = false, picked = false;
+    if (g.now >= lead.next_look) {  // the asset (a hub conversation goes on in another one) and whom it is with (known
+        lead.next_look = g.now + 0.25;  // once a line is spoken)
+        ue::UObject* asset = conv_asset(inst);
+        std::string a = asset ? ue::path_of(asset) : std::string();
+        bool first = lead.owner.empty();
+        if (first)
+            if (ue::UObject* who = conv_partner(inst, pawn)) lead.owner = ue::path_of(who), lead.owner_id = other_id(who), changed = true;
+        if (a != lead.asset || (first && !lead.owner.empty())) {
+            lead.asset = a, changed = true;
+            if (!lead.owner.empty())
+                core_log("conversation: we lead " + a.substr(a.rfind('/') + 1) + " with " + lead.owner.substr(lead.owner.rfind('.') + 1) + "; " + peer_name() +
+                         "'s game plays it too");
+        }
     }
-    mirror.texts = rows;
+    int32_t n = conv_node(inst);
+    changed = changed || n != lead.node;
+    if (n != lead.node) {
+        lead.group = conv_group(inst);
+        if (!lead.shown.empty() && lead.node >= 0 && n >= 0) {  // the line we answered moved on: we picked one of them
+            int32_t r = response_to(conv_asset(inst), lead.shown, n, lead.group);
+            std::memmove(lead.recent + 1, lead.recent, 3 * sizeof(int32_t));
+            lead.recent[0] = r >= 0 ? r : n, lead.picks++, g.conv_picks_sent++, picked = true;  // not found: the line it led to
+        }
+        lead.prev = lead.node, lead.node = n;
+    }
+    lead.shown.clear();
+    for (const Shown& r : shown_responses(conv_screen()))
+        if (r.parent == n) lead.shown.push_back(r);
+    if (changed || picked || g.now >= lead.next_send) send_conv(true), lead.next_send = g.now + 0.25;
+}
+
+// ----- following: the other player's conversation, played here
+struct Follow {
+    bool on = false;
+    uint32_t conv = 0, picks_done = 0;
+    ue::UObject* inst = nullptr;         // our conversation that plays the leader's
+    int32_t restart = -1;                // started again at this node once ours is gone
+    int32_t pick = -1, pick_from = -1;   // the leader's response being made here, and our node when tried
+    int pick_tries = 0, starts = 0, restarts = 0, restart_fails = 0;
+    double pick_since = 0, next_pick = 0, next_try = 0, mismatch_since = -1, next_advance = 0, gone_since = -1, asset_since = -1;
+    std::vector<int32_t> mine;           // our nodes since the last pick (the leader's node among them: we are ahead)
+    ue::UObject *screen = nullptr, *box = nullptr, *hint = nullptr;
+    uint8_t box_vis = 4;
+} follow;
+ue::UObject* followed_inst = nullptr;    // the last conversation we played for the leader (never ours to lead)
+uint32_t block_names[10];
+volatile bool conv_applying = false;     // our own pick on the follower's screen: not blocked
+std::atomic<uint64_t> conv_blocked{0};
+
+void follow_input(bool on) {  // the follower's own choices and skips are dropped (conv_swallow), the responses not hit
+    if (on && !block_names[9]) {
+        for (int i = 0; i < 9; i++) block_names[i] = ue::make_name("OnResponse" + std::to_string(i + 1) + "InputAction", false).index;
+        block_names[9] = ue::make_name("OnSkipInputAction", false).index;
+    }
+    conv_block.store(on, std::memory_order_release);
+    ue::UObject* s = on ? conv_screen() : nullptr;
+    if (follow.box && (!on || (s && s != follow.screen))) {  // the screen it was set on: as it was
+        if (ue::alive(follow.box)) set_visibility(follow.box, follow.box_vis);
+        follow.box = nullptr, follow.screen = nullptr;
+    }
+    if (!s) return;
+    if (!follow.box) {
+        std::string err;
+        follow.screen = s;
+        follow.box = ue::resolve(ue::addr(s) + ".ResponsesContainer", &err);
+        if (!follow.box) return;
+        follow.box_vis = widget_visibility(follow.box);
+        if (follow.box_vis == 3) follow.box_vis = 4;
+    }
+    if (ue::alive(follow.box) && widget_visibility(follow.box) != 3) set_visibility(follow.box, 3);  // HitTestInvisible
+}
+
+void follow_hint(bool on) {  // one line at the top: who chooses
+    if (!on || (follow.hint && !ue::alive(follow.hint))) {
+        if (follow.hint && ue::alive(follow.hint)) call_quiet(ue::addr(follow.hint), "RemoveFromParent", json::object());
+        follow.hint = nullptr;
+        if (!on) return;
+    }
+    if (follow.hint) return;
+    follow.hint = text_row();
+    if (!follow.hint) return;
+    double vp[2];
+    viewport_size(vp);
+    json t = json::object(), pos = json::object(), xy = json::object();
+    t.set("InText", fill(tr("{} leads this conversation: you see their choices.", "{} mène cette conversation : tu vois ses choix."), peer_name()));
+    call_quiet(ue::addr(follow.hint) + ".MessageTextBlock", "SetText", t);
+    xy.set("X", vp[0] * 0.30).set("Y", vp[1] * 0.05);
+    pos.set("Position", xy).set("bRemoveDPIScale", true);
+    call_quiet(ue::addr(follow.hint), "SetPositionInViewport", pos);
+}
+
+void follow_stop(const char* why) {
+    if (!follow.on) return;
+    ue::UObject* inst = active_conversation();
+    if (inst && (inst == follow.inst || follow.restart >= 0)) conv_call("EndConversationInstance", inst);
+    follow_input(false);
+    follow_hint(false);
+    unpin_banks();
+    follow.on = false, follow.restart = -1, follow.pick = -1;
+    core_log(std::string("conversation: following ended (") + why + ")");
+}
+
+void join_leader(const ConvMsg& m) {  // the follower comes next to the leader: the conversation's camera is from here
+    ue::UObject* pawn = local_pawn();
+    double pos[3], vel[3];
+    float yaw = 0, pitch = 0;
+    if (!pawn || !read_transform(pawn, pos, yaw, pitch, vel) || g.puppet_map != g.my_map) return;
+    double d = std::hypot(pos[0] - m.pos[0], pos[1] - m.pos[1]);
+    if (d < 600.0) return;
+    double a = m.yaw * 3.14159265 / 180 + 1.5708;
+    json args = json::object(), to = json::object();
+    to.set("X", m.pos[0] + 150.0 * std::cos(a)).set("Y", m.pos[1] + 150.0 * std::sin(a)).set("Z", m.pos[2] + 50.0);
+    args.set("NewLocation", to).set("bSweep", false).set("bTeleport", true);
+    call_quiet(ue::addr(pawn), "K2_SetActorLocation", args);
+    core_log("conversation: " + std::to_string(static_cast<int>(d / 100)) + " m from " + peer_name() + ": moved next to them");
+}
+
+bool follow_targets(const ConvMsg& m, ue::UObject*& asset, ue::UObject*& owner) {  // the leader's conversation, in our world
+    std::string asset_path(m.text, m.asset_len), owner_path(m.text + m.asset_len, m.owner_len);
+    owner = m.owner_id ? other_actor(m.owner_id) : nullptr;
+    if (!owner && !owner_path.empty()) owner = ue::find_path(owner_path);
+    asset = asset_path.empty() ? nullptr : load_asset(asset_path);
+    return owner != nullptr;
+}
+
+void follow_jump(ue::UObject* inst, int32_t node, const char* why) {  // ours starts again at the leader's node
+    follow.restart = node, follow.restart_fails = 0, follow.mismatch_since = -1;
+    g.conv_jumps++;
+    conv_call("EndConversationInstance", inst);
+    core_log(std::string("conversation: started again at the leader's node ") + std::to_string(node) + " (" + why + ")");
+}
+
+void follow_frame(ue::UObject* inst) {
+    const ConvMsg& m = g.peer_conv;
+    bool open = m.open && g.now - g.peer_conv_at < 3.0 && g.opt_conv_follow;
+    if (!open) {
+        follow_stop(m.open ? "no word from the leader" : "the leader's conversation ended");
+        return;
+    }
+    if (follow.on && m.conv != follow.conv) follow_stop("the leader started another one");
+    if (!follow.on) {
+        if (inst || g.now < follow.next_try || g.puppet_map != g.my_map) return;  // our own conversation is ours to lead
+        if (!m.owner_len && !m.owner_id) return;  // whom it is with: told once a line is spoken
+        ue::UObject *asset = nullptr, *owner = nullptr;
+        bool here = follow_targets(m, asset, owner);
+        ue::UObject* mine = nullptr;
+        if (here && can_start(asset)) {
+            join_leader(m);
+            mine = start_conversation(asset, owner, m.node);
+        }
+        if (!mine) {
+            follow.next_try = g.now + 1.5;
+            if (follow.starts++ < 3)
+                core_log("conversation: " + peer_name() + "'s conversation can't be played here yet (" + (here ? "it would not start" : "whom they talk to is not here") + ")");
+            return;
+        }
+        follow = Follow{};
+        follow.on = true, follow.conv = m.conv, follow.inst = followed_inst = mine, follow.picks_done = m.picks;
+        g.conv_follows++;
+        std::string a(m.text, m.asset_len);
+        core_log("conversation: " + peer_name() + " leads one (" + a.substr(a.rfind('/') + 1) + ", node " + std::to_string(m.node) + "): played here, they choose");
+        return;
+    }
+    if (follow.restart >= 0) {  // started again once ours is gone
+        if (inst) return;
+        ue::UObject *asset = nullptr, *owner = nullptr;
+        ue::UObject* mine = follow_targets(m, asset, owner) ? start_conversation(asset, owner, follow.restart) : nullptr;
+        if (mine) follow.inst = followed_inst = mine, follow.restart = -1, follow.mine.clear();
+        else if (++follow.restart_fails > 40) follow_stop("it would not start again");
+        return;
+    }
+    if (!inst) {  // ours ended by itself while the leader's goes on: again at its node (it may end there too)
+        if (follow.gone_since < 0) follow.gone_since = g.now;
+        if (g.now - follow.gone_since > 2.0 && follow.restarts < 4) follow.restarts++, follow.gone_since = -1, follow_jump(nullptr, m.node, "ours had ended");
+        return;
+    }
+    follow.gone_since = -1;
+    follow.inst = followed_inst = inst;
+    follow_input(true);
+    follow_hint(true);
+    std::string want(m.text, m.asset_len);
+    ue::UObject* our_asset = conv_asset(inst);
+    if (our_asset && !want.empty() && ue::path_of(our_asset) != want) {  // the leader's went on in another conversation
+        if (follow.asset_since < 0) follow.asset_since = g.now;
+        if (g.now - follow.asset_since > 1.5) follow.asset_since = -1, follow.pick = -1, follow.picks_done = m.picks, follow_jump(inst, m.node, "the leader's conversation went on in another one");
+        return;
+    }
+    follow.asset_since = -1;
+    if (m.group >= 0) pin_bank(our_asset, m.group, m.node);  // our game draws the leader's line from that bank
+    int32_t ours = conv_node(inst);
+    if (follow.mine.empty() || follow.mine.back() != ours) {
+        follow.mine.push_back(ours);
+        if (follow.mine.size() > 24) follow.mine.erase(follow.mine.begin());
+    }
+    if (follow.pick < 0 && m.picks > follow.picks_done) {  // the leader's picks, in order
+        uint32_t missing = m.picks - follow.picks_done;
+        if (missing > 4) follow.picks_done = m.picks - 1, missing = 1;  // more were lost than are told: the newest
+        follow.pick = m.recent[missing - 1], follow.pick_since = g.now, follow.pick_tries = 0, follow.next_pick = g.now;
+    }
+    if (follow.pick >= 0) {
+        if (follow.pick_tries > 0 && ours != follow.pick_from) {  // taken here
+            follow.picks_done++, follow.pick = -1, follow.mine.clear(), g.conv_picks_applied++;
+        } else if (g.now >= follow.next_pick) {
+            ue::UObject* s = conv_screen();
+            int k = 0, at = 0;
+            std::vector<Shown> v = shown_responses(s);
+            for (const Shown& r : v) {  // OnResponseN: the Nth selectable one
+                if (!r.selectable) continue;
+                k++;
+                if (r.node == follow.pick) at = k;
+            }
+            bool elsewhere = !at && !v.empty() && v[0].parent == ours && follow.pick_tries == 0;  // responses of ours, not theirs
+            if (at && at <= 9 && follow.pick_tries < 4) {
+                conv_applying = true;
+                call_quiet(ue::addr(s), ("OnResponse" + std::to_string(at) + "InputAction").c_str(), json::object());
+                conv_applying = false;
+                follow.pick_tries++, follow.pick_from = ours, follow.next_pick = g.now + 0.6;
+            } else if (elsewhere || follow.pick_tries >= 4 || g.now - follow.pick_since > 2.5) {  // not to be chosen here (a check, a flaw)
+                int32_t r = follow.pick;
+                follow.picks_done++, follow.pick = -1;
+                follow_jump(inst, r, "their response can't be chosen here");
+            } else follow.next_pick = g.now + 0.2;  // not on our screen yet
+        }
+        return;
+    }
+    int32_t our_group = conv_group(inst);  // a line of the leader's bank: in step (each game draws its own)
+    if (m.node >= 0 && ours != m.node && !(our_group >= 0 && our_group == m.group)) {  // behind the leader: skip there; ahead: wait
+        bool ahead = std::find(follow.mine.begin(), follow.mine.end(), m.node) != follow.mine.end();
+        if (follow.mismatch_since < 0) follow.mismatch_since = g.now;
+        if (!ahead && ours == m.prev && g.now >= follow.next_advance) {
+            conv_call("AdvanceConversationInstance", inst);
+            follow.next_advance = g.now + 1.0, g.conv_advances++;
+        }
+        if (g.now - follow.mismatch_since > (ahead ? 8.0 : 3.0)) follow_jump(inst, m.node, ahead ? "the leader stayed behind" : "left behind");
+    } else follow.mismatch_since = -1;
 }
 
 void conversation_frame() {
-    bool mine = in_conversation();
-    if (g.now >= g.next_conv_send) {  // ours, to the other player: its screen 4 times a second, all of it once a second
-        g.next_conv_send = g.now + 0.25;
-        if (mine) {
-            std::vector<std::string> c = read_conversation();
-            std::string key;
-            for (const auto& l : c) key += l + "\n";
-            if (!c.empty() && (key != g.conv_last_sent || g.now - g.last_conv_full >= 1.0)) {
-                send_conversation(true, c);
-                g.conv_last_sent = key, g.last_conv_full = g.now, g.conv_sent_open = true;
-            }
-        } else if (g.conv_sent_open) g.conv_sent_open = false, g.conv_close_left = 5, g.conv_last_sent.clear();
-        if (!mine && g.conv_close_left > 0) send_conversation(false, {}), g.conv_close_left--;
+    // Shared only with the other player in the same session: not alone, not at the main menu (the Moon Man's), not
+    // before the friend is in the host's world (a new game's start). Leaving: our input is ours again.
+    if (!g.have_peer || g.at_menu || (!g.host && !join::joined())) {
+        follow_stop(g.have_peer ? "not in the same game" : "the other player left");
+        if (conv_block.load(std::memory_order_relaxed)) follow_input(false);
+        lead.inst = nullptr, lead.closing = 0;
+        return;
     }
-    if (mine && g.conv_pick) {  // the other player chose on its mirror: the game's own key for that response
-        int k = g.conv_pick;
-        g.conv_pick = 0;
-        if (ue::UObject* c = conv_screen()) {
-            std::string fn = "OnResponse" + std::to_string(k) + "InputAction";
-            call_quiet(ue::addr(c), fn.c_str(), json::object());
-            g.conv_picks_done++;
+    ue::UObject* inst = active_conversation();
+    if (!inst) followed_inst = nullptr;
+    follow_frame(inst);
+    bool leading = inst && !follow.on && inst != followed_inst;
+    if (leading) lead_frame(inst, local_pawn());
+    else if (lead.inst) lead.inst = nullptr, lead.closing = 5, lead.next_send = 0;
+    if (!leading && lead.closing > 0 && g.now >= lead.next_send) send_conv(false), lead.closing--, lead.next_send = g.now + 0.2;
+    if (!follow.on && conv_block.load(std::memory_order_relaxed)) follow_input(false);  // never left blocking
+}
+
+void conv_world_reset() {  // a load: the old world's conversations are gone (the screen is the game instance's: it stays)
+    conv_block.store(false, std::memory_order_release);
+    unpin_banks();
+    if (follow.box && ue::alive(follow.box)) set_visibility(follow.box, follow.box_vis);
+    follow = Follow{};
+    lead.inst = nullptr, lead.closing = 0;
+    followed_inst = nullptr;
+}
+
+// New game together, the friend's side: their own New Game made their character. Once in the world (the character
+// creator closed), connected and settled, the character is kept (a private save), then the host's game is asked for as
+// from the main menu: the hand-over puts the new character into it (character::splice).
+bool creating_character() {
+    for (const char* c : {"/Script/Arkansas.CharacterCreationMasterWidget", "/Script/Arkansas.ARCC_MasterWidget"}) {
+        static Fn vis;
+        ue::UClass* k = ue::find_class(c);
+        if (!k || !base_fn(vis, "/Script/UMG.Widget", "IsVisible")) continue;
+        for (ue::UObject* o : ue::instances(k, false, 4)) {
+            alignas(16) uint8_t b[16] = {};
+            ue::process_event(o, vis.f, b);
+            if (b[vis.off("ReturnValue")]) return true;
         }
     }
-    // A conversation pauses the other player's game while it shows it (owner: conversations pause, for both). The game
-    // itself doesn't pause for conversations and lifts a pause no menu asks for, so it is asked again each frame. The
-    // starter's game is left as in the base game: paused, its conversation never got past the first line (run 139).
-    bool want = g.peer_conv_open && !mine && g.now - g.peer_conv_at < 3.0 && !g.peer_conv.empty();
-    if (want) {
-        if (!g.mirror_shown) {
-            g.mirror_shown = true, g.mirrors_shown++;
-            watch_keys();
-            if (!game_paused()) set_paused(true), g.mirror_paused = true;
-            core_log("conversation: " + peer_name() + " talks to " + g.peer_conv[0] + ": its screen shown here, the game paused");
+    return false;
+}
+
+void new_char_frame(ue::UObject* pawn, bool settled) {
+    if (!g.new_char || g.host) return;
+    if (join::joined()) {
+        g.new_char = false, g.new_char_stage = 0;
+        core_log("new game together: you play in " + peer_name() + "'s game with your new character");
+        return;
+    }
+    if (!pawn || !settled || !g.have_peer || creating_character()) return;
+    if (g.new_char_stage == 0) {  // the host's key is known once connected: the character is kept under it
+        if (g.now < g.new_char_since) return;
+        character::save_now();  // refused during the intro's conversation and cinematics: again in 3 s
+        if (!character::status().get("saving").asBool(false)) {
+            if (g.new_char_since == 0) core_log("new game together: your game doesn't allow a save yet (the intro); your character is kept once it does");
+            g.new_char_since = g.now + 3.0;
+            return;
         }
-        mirror_show(g.peer_conv);
-        if (g.opt_conv_pause && !game_paused()) set_paused(true), g.mirror_paused = true;
-        menu_own = -1;  // every digit is a choice
-        int k = menu_key.exchange(0);
-        if (k >= 1 && k <= 9 && k <= static_cast<int>(g.peer_conv.size()) - 2) {
-            uint8_t b = static_cast<uint8_t>(k);
-            send_typed(kConvPick, &b, 1);
-            g.conv_picks_sent++;
+        g.new_char_stage = 1;
+        return;
+    }
+    if (g.new_char_stage == 1) {  // never joined without it: the host's game would come with an emptied copy of theirs
+        json cs = character::status();
+        if (cs.get("saving").asBool(false)) return;
+        if (cs.get("lastSaved").asNumber(-1) < 0) {
+            g.new_char_stage = 0, g.new_char_since = g.now + 3.0;
+            return;
         }
-    } else if (g.mirror_shown) {
-        g.mirror_shown = false;
-        mirror_clear();
-        menu_own = 0, menu_key = 0;
-        if (g.mirror_paused) set_paused(false), g.mirror_paused = false;
-        core_log("conversation: " + peer_name() + "'s conversation ended: the game runs again");
+        g.new_char_stage = 2;
+        core_log("new game together: your new character is kept; " + peer_name() + "'s game comes now");
+    }
+    if (g.now >= g.next_join_request && g.now >= g.fetch_quiet_until) {  // asked every 5 s until the hand-over starts
+        uint32_t reason = 2;
+        send_typed(kResyncRequest, &reason, 4);
+        g.next_join_request = g.now + 5.0, g.join_requests++;
     }
 }
 
@@ -4509,17 +4998,19 @@ void keep_drawn_for_saves() {
     }
 }
 
-bool in_conversation() {
-    static Fn f;
-    ue::UObject* cdo = conv_lib_cdo();
-    if (!cdo || !base_fn(f, "/Script/Arkansas.ConversationBlueprintLibrary", "GetActivePlayerConversation")) return false;
-    alignas(16) uint8_t b[16] = {};
-    ue::process_event(cdo, f.f, b);
-    void* inst = nullptr;
-    memcpy(&inst, b + f.off("ReturnValue"), 8);
-    return inst != nullptr;
-}
 }  // namespace
+
+std::atomic<bool> conv_block{false};
+bool conv_swallow(void*, void* f) {  // any thread (ProcessEvent): the follower's own response or skip input
+    uint32_t name = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(f) + 0x18);
+    for (uint32_t b : block_names)
+        if (b && b == name) {
+            if (conv_applying) return false;
+            conv_blocked.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    return false;
+}
 
 void frame(float) {
     if (!g.on) return;
@@ -4539,7 +5030,7 @@ void frame(float) {
         g.settle_until = g.now + 10.0;
         g.arrived_by_travel = false;
         g.puppet = nullptr;  // it belonged to the old world
-        mirror.rows.clear(), mirror.texts.clear(), g.mirror_shown = false, g.mirror_paused = false;  // the old world's widgets
+        conv_world_reset();
         g.party_tamed.clear(), g.party_in.clear();
         g.npcs.clear(), g.scanning.clear(), g.scan_cursor = 0;
         g.interactables.clear(), g.inter_scan.clear();  // old world's doors and containers
@@ -4662,10 +5153,9 @@ void frame(float) {
             g.next_face = g.now + 5.0;
             try { send_face(); } catch (const std::exception& e) { g.last_error = std::string("send face: ") + e.what(); }
         }
-        if (g.have_peer) {
-            try { conversation_frame(); } catch (const std::exception& e) { g.last_error = std::string("conversation: ") + e.what(); }
-        }
+        try { conversation_frame(); } catch (const std::exception& e) { g.last_error = std::string("conversation: ") + e.what(); }
         try { keep_drawn_for_saves(); } catch (const std::exception& e) { g.last_error = std::string("window: ") + e.what(); }
+        try { new_char_frame(pawn, settled); } catch (const std::exception& e) { g.last_error = std::string("new game: ") + e.what(); }
         if (g.have_peer && g.opt_party && pawn) {
             try { if (g.host) host_send_party(pawn); else client_drive_party(pawn); } catch (const std::exception& e) { g.last_error = std::string("party: ") + e.what(); }
         }
@@ -4709,7 +5199,7 @@ void frame(float) {
     }
     // Automatic join: a client at the main menu (front end up for a minute: an earlier load crashes the engine) asks
     // the host for its campaign every 5 s until a hand-over starts.
-    if (!g.host && g.at_menu && g.now - g.map_since > 30.0 && g.now - g.start_time > 60.0 && g.now >= g.next_join_request &&
+    if (!g.host && g.at_menu && !g.new_char && g.now - g.map_since > 30.0 && g.now - g.start_time > 60.0 && g.now >= g.next_join_request &&
         g.now >= g.fetch_quiet_until + 90.0) {  // never from a loading screen: the client may be travelling
         uint32_t reason = 2;
         send_typed(kResyncRequest, &reason, 4);
@@ -4806,7 +5296,7 @@ json set_options(const json& p) {
     for (auto& kv : {std::make_pair("story", &g.opt_story), std::make_pair("doors", &g.opt_doors), std::make_pair("npcs", &g.opt_npcs), std::make_pair("scan", &g.opt_scan),
                      std::make_pair("follow", &g.opt_follow), std::make_pair("gifts", &g.opt_gifts), std::make_pair("giveHold", &g.opt_give_hold), std::make_pair("combat", &g.opt_combat), std::make_pair("fakeDead", &g.opt_fake_dead),
                      std::make_pair("noPause", &g.opt_no_pause), std::make_pair("party", &g.opt_party),
-                     std::make_pair("convPause", &g.opt_conv_pause)})
+                     std::make_pair("convFollow", &g.opt_conv_follow)})
         if (p.get(kv.first).isBool()) *kv.second = p.get(kv.first).asBool(true);
     if (p.get("dropInteract").isNumber()) g.opt_drop_interact = std::clamp(p.get("dropInteract").asNumber(0), 0.0, 0.95);
     if (p.get("menu").isBool()) {  // test: the role picked in the main menu from now on (off: the set role again)
@@ -4870,14 +5360,13 @@ json status() {
     s.set("pausesLifted", static_cast<double>(g.pauses_lifted)).set("noPause", g.opt_no_pause);
     s.set("partyDriven", static_cast<double>(g.party_tamed.size())).set("partyTames", static_cast<double>(g.party_tames))
         .set("partyReleases", static_cast<double>(g.party_releases)).set("partyCalm", g.party_calm_in);
-    s.set("mirrorShown", g.mirror_shown).set("mirrors", static_cast<double>(g.mirrors_shown)).set("convStatesSent", static_cast<double>(g.conv_states_sent))
-        .set("convPicksSent", static_cast<double>(g.conv_picks_sent)).set("convPicksDone", static_cast<double>(g.conv_picks_done))
-        .set("peerConvOpen", g.peer_conv_open);
-    {
-        json rows = json::array();
-        for (const auto& t : mirror.texts) rows.push(t);
-        s.set("mirrorRows", rows);
-    }
+    s.set("hostNew", g.host_new).set("newChar", g.new_char).set("newCharStage", g.new_char_stage).set("joined", join::joined());
+    s.set("convLead", lead.inst != nullptr).set("convFollow", follow.on).set("convLeads", static_cast<double>(g.conv_leads))
+        .set("convFollows", static_cast<double>(g.conv_follows)).set("convStatesSent", static_cast<double>(g.conv_states_sent))
+        .set("convPicksSent", static_cast<double>(g.conv_picks_sent)).set("convPicksApplied", static_cast<double>(g.conv_picks_applied))
+        .set("convJumps", static_cast<double>(g.conv_jumps)).set("convAdvances", static_cast<double>(g.conv_advances))
+        .set("convBlocked", static_cast<double>(conv_blocked.load())).set("peerConvOpen", g.peer_conv.open != 0 && g.now - g.peer_conv_at < 3.0)
+        .set("convNode", static_cast<double>(conv_node(active_conversation())));
     s.set("interactsPending", static_cast<double>(g.outgoing.size())).set("interactsResent", static_cast<double>(g.interacts_resent))
         .set("interactsLost", static_cast<double>(g.interacts_lost)).set("interactAcks", static_cast<double>(g.interact_acks));
     s.set("itemsSent", static_cast<double>(g.items_sent)).set("itemsApplied", static_cast<double>(g.items_applied)).set("lastInteract", g.last_interact);

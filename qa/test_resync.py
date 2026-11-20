@@ -147,6 +147,8 @@ def main(which):
             ok = wait(lambda: state(0, gid) == end, 20)
             same = safe(lambda: call("eval", {"expr": "world"}, inst=0)["value"].split()[0]) == w0 and call("coop.status", {}, inst=0)["resyncs"] == r0
             check(ok and same, "the host's campaign has the same outcome, without a reload", f"host {safe(lambda: state(0, gid))}, world kept {same}")
+            hs = safe(lambda: call("coop.status", {}, inst=0)["story"], {})
+            check(hs.get("advanced", 0) > 0, "the host's game completed it its own way (banner, journal, XP)", f"advanced {hs.get('advanced')}, written {hs.get('forced')}")
             if end == "Succeeded":  # the quest's XP: the client's game gave it (its own is dropped), the host takes it and shares it
                 got = wait(lambda: (call("coop.status", {}, inst=0).get("xp") or 0) > (xp0[0] or 0)
                            and (call("coop.status", {}, inst=1).get("xp") or 0) > (xp0[1] or 0), 15)

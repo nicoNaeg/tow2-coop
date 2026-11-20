@@ -186,6 +186,7 @@ void hk_pe(ue::UObject* o, ue::UFunction* f, void* p) {
         std::lock_guard<std::mutex> g(g_trace_mu);
         if (g_trace.size() < 4000000) g_trace.push_back({ue::class_of(o), f});
     }
+    if (coop::conv_block.load(std::memory_order_relaxed) && coop::conv_swallow(o, f)) return;  // the other player chooses
     // Game events the co-op module mirrors (door state, container removals): a pointer compare per call.
     int n = coop::watch_count.load(std::memory_order_acquire);
     if (n) {  // by FName index (UObject::NamePrivate at 0x18): Blueprint overrides are separate UFunction objects

@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+void core_log(const std::string& line);  // main.cpp: a line in tow2coop.log
+
 namespace story {
 using json = coopbridge::json::Value;
 FindQuestFn find_quest = nullptr;
@@ -67,7 +69,7 @@ struct State {
     std::map<std::pair<int, int32_t>, size_t> quest_probe;  // (quest index, 0 = state | addendum id) -> probe
     std::map<Guid, size_t> global_probe;                    // global -> probe
     size_t cursor = 0;
-    Call get_state, addendum_triggered, is_global, start, mention, trigger_addendum, set_global;
+    Call get_state, addendum_triggered, is_global, start, mention, trigger_addendum, set_global, debug_advance;
     ue::UObject* qm = nullptr;
     // reliable channel, each way
     std::vector<Event> log;     // our changes since this session started (seq = index + 1)
@@ -80,6 +82,10 @@ struct State {
     // client: outcomes the client could not apply directly (complete/fail): checked again after a grace period
     struct Pending { Guid id; int32_t target; double at; };
     std::vector<Pending> pending;
+    // outcomes the other world reached, made here through the game's own path (advance_frame)
+    struct Advance { Guid id; int32_t target; double start, next; int tries; std::string name; };
+    std::vector<Advance> advancing;
+    uint64_t advanced = 0;
     bool reset_ack = false, resync_wanted = false;
     double now = 0;
 } g;
@@ -162,6 +168,7 @@ bool load(std::string& err) {
         !g.start.init(qs, "StartQuest") || !g.mention.init(qs, "MentionQuest") || !g.trigger_addendum.init(qs, "TriggerQuestAddendum") ||
         !g.set_global.init(gs, "SetGlobalValue"))
         return err = "quest/global script functions missing", false;
+    g.debug_advance.init(qs, "DebugAdvanceQuest");  // optional: without it, outcomes are written (advance_frame)
     return true;
 }
 
@@ -244,15 +251,12 @@ void apply(const Event& e) {
         if (e.a == 1 && (local == 0 || local == 4)) { g.start.put(b, "QuestID", id); g.start.run(b); }
         else if (e.a == 4 && local == 0) { g.mention.put(b, "QuestID", id); g.mention.run(b); }
         else if ((e.a == 2 || e.a == 3) && local != e.a) {
-            // No script completes or fails a quest in this build (QuestComplete/QuestFail do nothing in shipping):
-            // the quest's own state takes the host's outcome (what GetQuestState_BP reads). Without the lookup, the
-            // synced inputs may still let the client's quest graph get there; if not after 5 s, a save resync.
-            uint8_t* quest = find_quest && g.qm ? find_quest(g.qm, id.b) : nullptr;
-            if (quest && ue::readable(quest + kQuestStateOffset, 1)) {
-                quest[kQuestStateOffset] = static_cast<uint8_t>(e.a);
-                if (e.a == 2) g.forced++;  // no quest XP from this game for it: the other side's comes (coop.cpp)
-            }
-            g.pending.push_back({id, e.a, g.now + 5.0});
+            // QuestComplete/QuestFail do nothing in shipping; the quest's own path is walked instead (advance_frame),
+            // its state written only if that path doesn't get there.
+            bool queued = false;
+            for (const auto& a : g.advancing) queued = queued || !memcmp(a.id.b, id.b, 16);
+            if (!queued) g.advancing.push_back({id, e.a, g.now, g.now + 1.5, 0, q.name});  // 1.5 s for the synced inputs
+            g.pending.push_back({id, e.a, g.now + 40.0});
         } else { g.skipped_count++; return; }
         snprintf(what, sizeof what, "quest %s -> %d", q.name.c_str(), e.a);
     } else if (e.kind == 2) {
@@ -298,6 +302,39 @@ bool ensure_loaded() {
 
 uint64_t forced_completions() { return g.forced; }
 
+namespace {
+void write_outcome(const Guid& id, int32_t target) {  // the old way: the state written (no banner, no XP here)
+    uint8_t* quest = find_quest && g.qm ? find_quest(g.qm, id.b) : nullptr;
+    if (!quest || !ue::readable(quest + kQuestStateOffset, 1)) return;
+    quest[kQuestStateOffset] = static_cast<uint8_t>(target);
+    if (target == 2) g.forced++;  // no quest XP from this game for it: the other side's comes (coop.cpp)
+}
+
+// The other world's outcome, walked here: DebugAdvanceQuest completes the quest's current objectives the game's way
+// (the banner, the journal, the quest's XP), a step a second. The state is written instead when the quest ends the
+// other way, needs more than 15 steps or 30 s, or the script is missing.
+void advance_frame() {
+    for (size_t i = 0; i < g.advancing.size();) {
+        State::Advance& a = g.advancing[i];
+        int32_t local = quest_state(a.id);
+        bool done = local == a.target;
+        if (done && a.tries) g.advanced++, core_log("story: quest " + a.name + " completed here too, the game's way (" + std::to_string(a.tries) + " steps)");
+        if (!done && ((local == 2 || local == 3) || a.tries >= 15 || g.now - a.start > 30.0 || !g.debug_advance.fn)) {
+            write_outcome(a.id, a.target);
+            core_log("story: quest " + a.name + " set to the other world's outcome (" + std::to_string(a.target) + "; it went to " + std::to_string(local) + ")");
+            done = true;
+        } else if (!done && g.now >= a.next) {
+            alignas(16) uint8_t b[64] = {};
+            g.debug_advance.put(b, "QuestID", a.id);
+            g.debug_advance.run(b);
+            a.tries++, a.next = g.now + 1.0;
+        }
+        if (done) g.advancing.erase(g.advancing.begin() + static_cast<long>(i));
+        else i++;
+    }
+}
+}  // namespace
+
 void reset_peer() { g.peer_acked = 0, g.applied = 0; }  // a (re)joined client: replay ours (idempotent), take its anew
 
 void send_log(double now, const SendFn& send) {  // our changes the other side has not applied yet
@@ -315,8 +352,10 @@ void send_log(double now, const SendFn& send) {  // our changes the other side h
 }
 
 void host_frame(double now, const SendFn& send) {
+    g.now = now;
     if (!ensure_loaded()) return;
     g.pending.clear();  // the host has no one to resync from
+    advance_frame();
     poll_some(80);
     send_log(now, send);
 }
@@ -349,7 +388,7 @@ void on_ack(const char* body, int len) {
 
 void client_reset() {  // the client's world was reloaded from a save: ask for a full (idempotent) replay
     g.applied = 0;
-    g.pending.clear();
+    g.pending.clear(), g.advancing.clear();
     g.reset_ack = true;
     g.dropped_to = static_cast<uint32_t>(g.log.size());  // changes made before the reload are not sent any more
     for (Probe& p : g.probes) p.known = false;          // the reloaded world is the new baseline
@@ -363,6 +402,7 @@ void client_frame(double now, const SendFn& send) {
         g.reset_ack = false;
     }
     if (ensure_loaded()) {  // our own changes go to the host too (the first look at each probe is the baseline)
+        advance_frame();
         poll_some(80);
         send_log(now, send);
     }
@@ -386,6 +426,7 @@ json status() {
     s.set("events", static_cast<double>(g.log.size())).set("peerAcked", static_cast<double>(g.peer_acked)).set("applied", static_cast<double>(g.applied));
     s.set("appliedCount", static_cast<double>(g.applied_count)).set("skipped", static_cast<double>(g.skipped_count)).set("lastApplied", g.last_applied);
     s.set("pendingOutcomes", static_cast<double>(g.pending.size())).set("ownEvents", static_cast<double>(g.log.size()));
+    s.set("advancing", static_cast<double>(g.advancing.size())).set("advanced", static_cast<double>(g.advanced)).set("forced", static_cast<double>(g.forced));
     return s;
 }
 }  // namespace story

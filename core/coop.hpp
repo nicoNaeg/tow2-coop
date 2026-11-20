@@ -33,6 +33,10 @@ bool close_screens();  // game thread: true while a screen the mod opened is sti
 extern std::atomic<int> watch_count;
 extern void* watch[8];
 void observe(void* object, void* function, const void* parms);  // any thread; only copies, frame() does the work
+// Shared conversations: while the other player leads the conversation we play, our own response and skip input is
+// dropped in ProcessEvent (any thread; conv_block is the cheap test).
+extern std::atomic<bool> conv_block;
+bool conv_swallow(void* object, void* function);
 // The game's damage function (hooked in main.cpp): true = drop it, it comes from the stand-in (its shots, its swings).
 bool standin_damage(void* causer, void* instigator);
 extern bool damage_hooked;

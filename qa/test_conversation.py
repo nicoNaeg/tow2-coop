@@ -1,7 +1,7 @@
-"""Shared conversations (owner, 2026-11-19), on a running pair in gameplay: a conversation pauses the game and concerns
-both players. The host starts one with a companion: its game pauses; the client's game shows the same screen (the
-speaker, the line, the responses) and pauses too; the client presses 1 and the host's conversation takes that response;
-the host ends it: both games run again. Then the other way: the client talks, the host sees it.
+"""Shared conversations (owner, 2026-11-20), on a running pair in gameplay: the player who starts a conversation leads
+it; the other player's game plays the same conversation (same node, its camera and voices) and can't choose there;
+the leader's pick is made on the other side too; when the leader's conversation ends, the other's ends.
+Both directions: the host leads, then the client.
 Usage: python -I test_conversation.py"""
 import subprocess
 import sys
@@ -41,21 +41,39 @@ def paused(inst):
     return uc(inst, gs, "IsGamePaused", {"WorldContextObject": pc})["ReturnValue"]
 
 
+def conv(inst):  # the player's conversation instance, or None
+    r = uc(inst, lib(inst), "GetActivePlayerConversation").get("ReturnValue")
+    return None if r in (None, "None") else r.split()[0]
+
+
 def active(inst):
-    return uc(inst, lib(inst), "GetActivePlayerConversation").get("ReturnValue") not in (None, "None")
+    return conv(inst) is not None
 
 
-def responses(inst):  # the starter's screen: its response texts
+def node(inst):
+    c = conv(inst)
+    return uc(inst, c, "BP_GetCurrentNodeID")["ReturnValue"] if c else None
+
+
+def screen(inst):
     for row in call("ue.find", {"class": "/Script/Arkansas.ConversationWidget", "limit": 10}, inst=inst):
         ref = row.split()[0]
-        if "Default__" in row or not safe(lambda: uc(inst, ref, "IsVisible")["ReturnValue"], False):
-            continue
-        out = []
-        for w in call("eval", {"expr": ref + ".SelectableResponseWidgets"}, inst=inst)["value"] or []:
-            t = call("eval", {"expr": w.split()[0] + ".MessageTextBlock"}, inst=inst)["value"].split()[0]
-            out.append(str(uc(inst, t, "GetText").get("ReturnValue")))
-        return out
-    return []
+        if "Default__" not in row and safe(lambda: uc(inst, ref, "IsVisible")["ReturnValue"], False):
+            return ref
+    return None
+
+
+def responses(inst):  # the screen's selectable response texts
+    w = screen(inst)
+    out = []
+    for x in (call("eval", {"expr": w + ".SelectableResponseWidgets"}, inst=inst)["value"] or []) if w else []:
+        t = call("eval", {"expr": x.split()[0] + ".MessageTextBlock"}, inst=inst)["value"].split()[0]
+        out.append(str(uc(inst, t, "GetText").get("ReturnValue")))
+    return out
+
+
+def status(inst):
+    return call("coop.status", {}, inst=inst)
 
 
 def wait(pred, timeout):
@@ -65,6 +83,16 @@ def wait(pred, timeout):
             return True
         time.sleep(0.25)
     return safe(pred, False)
+
+
+def start_with_companion(inst):
+    for row in call("ue.find", {"class": "Character", "limit": 900}, inst=inst):
+        if row.split()[1] not in COMPANIONS:
+            continue
+        r = uc(inst, lib(inst), "StartConversationWithActor", {"Speaker": row.split()[0], "StartNode": -1, "Stage": None, "bAllowBarkConversationDuringCombat": False})
+        if r.get("Result") == "OnTrue":
+            return row.split()[1]
+    return None
 
 
 def main():
@@ -77,43 +105,56 @@ def main():
         return ok
 
     for talker, other, who in ((0, 1, "host"), (1, 0, "client")):
-        npc = next((r.split()[0] for r in call("ue.find", {"class": "Character", "limit": 900}, inst=talker) if r.split()[1] in COMPANIONS), None)
-        if not check(bool(npc), f"a companion to talk to in the {who}'s world"):
-            continue
+        if active(other):  # a conversation left from before
+            uc(other, lib(other), "EndConversationInstance", {"Instance": conv(other)})
+            wait(lambda: not active(other), 5)
         Game(pid(other)).key("W", hold_s=0.05)  # the other player is awake (the idle camera hides the screen)
-        r = uc(talker, lib(talker), "StartConversationWithActor", {"Speaker": npc, "StartNode": -1, "Stage": None, "bAllowBarkConversationDuringCombat": False})
-        check(wait(lambda: active(talker), 5), f"the {who} talks to a companion", str(r.get("Result")))
-        time.sleep(1.5)
-        mine = responses(talker)
-        tw = call("ue.find", {"path": "/Script/Engine.Default__GameplayStatics"}, inst=talker)[0].split()[0]
-        wt = lambda: uc(talker, tw, "GetTimeSeconds", {"WorldContextObject": call("eval", {"expr": "pc"}, inst=talker)["value"].split()[0]})["ReturnValue"]  # noqa: E731
-        a = wt()
+        st0 = status(other)
+        name = start_with_companion(talker)
+        if not check(bool(name) and wait(lambda: active(talker), 5), f"the {who} talks to a companion", str(name)):
+            continue
+        ok = wait(lambda: status(other).get("convFollow") and active(other), 10)
+        check(ok, "the other player's game plays the same conversation", f"follows {status(other).get('convFollows')}")
+        same = wait(lambda: node(other) == node(talker) and node(talker) is not None, 6)
+        check(same, "at the same node", f"leader {safe(lambda: node(talker))} / other {safe(lambda: node(other))}")
+        time.sleep(1.5)  # the lines play; the responses come
+        mine, theirs = responses(talker), responses(other)
+        print(f"info: the leader's choices {mine[:4]} / the other's {theirs[:4]}", flush=True)
+        # the other player can't choose: its own response input is dropped
+        before = safe(lambda: node(other))
+        w = screen(other)
+        if w:
+            uc(other, w, "OnResponse1InputAction")
         time.sleep(1.0)
-        print(f"info: the {who}'s world time during its conversation: +{wt() - a:.2f} s in 1 s (the base game's own behaviour)", flush=True)
-        st = {}
-        ok = wait(lambda: st.update(call("coop.status", {}, inst=other)) or st.get("mirrorShown"), 5)
-        rows = st.get("mirrorRows") or []
-        check(bool(ok), "the other player's game shows that conversation", " | ".join(rows)[:300])
-        same = bool(mine) and all(any(m[:40] in row for row in rows) for m in mine)
-        check(same, "with the same responses", f"starter {mine[:4]}")
-        ow = call("ue.find", {"path": "/Script/Engine.Default__GameplayStatics"}, inst=other)[0].split()[0]
-        owt = lambda: uc(other, ow, "GetTimeSeconds", {"WorldContextObject": call("eval", {"expr": "pc"}, inst=other)["value"].split()[0]})["ReturnValue"]  # noqa: E731
-        b0 = owt()
-        time.sleep(1.5)
-        # (the world time, not IsGamePaused: the game lifts the pause each frame and the mod asks it again before the world runs)
-        check(owt() - b0 < 0.2, "and is paused too", f"its world time +{owt() - b0:.2f} s in 1.5 s")
-        before = mine
-        Game(pid(other)).key("1", hold_s=0.05)  # the other player picks the first response
-        changed = wait(lambda: responses(talker) != before, 6)
-        check(changed and call("coop.status", {}, inst=talker).get("convPicksDone", 0) > 0,
-              "the other player pressed 1: the conversation took that response", f"now {responses(talker)[:3]}")
-        inst = uc(talker, lib(talker), "GetActivePlayerConversation").get("ReturnValue")
-        if inst and inst != "None":
-            uc(talker, lib(talker), "EndConversationInstance", {"Instance": inst.split()[0]})
-        check(wait(lambda: not call("coop.status", {}, inst=other).get("mirrorShown"), 5), "the conversation ended: the other's screen closed")
-        check(wait(lambda: not paused(other) and not paused(talker), 5), "and both games run again",
+        st = status(other)
+        check(st.get("convBlocked", 0) > st0.get("convBlocked", 0) and safe(lambda: node(other)) == before,
+              "the other player can't choose (their response input is dropped)", f"blocked {st.get('convBlocked')}, node {before} -> {safe(lambda: node(other))}")
+        # the leader picks: a response that goes on if there is one
+        pick = next((i for i, t in enumerate(mine) if "Leave" not in t and "Quitter" not in t), 0) + 1
+        lead_before = safe(lambda: node(talker))
+        moved = False
+        for _ in range(8):  # as a player would: pressed again while the line still plays (the game ignores it then)
+            tw = screen(talker)
+            if tw:
+                uc(talker, tw, f"OnResponse{pick}InputAction")
+            moved = wait(lambda: node(talker) != lead_before, 1.0)
+            if moved:
+                break
+        check(moved, f"the leader picks response {pick}", f"{(mine[pick - 1] if len(mine) >= pick else '?')[:60]!r}: node {lead_before} -> {safe(lambda: node(talker))}")
+        took = lambda: node(other) == node(talker) and node(talker) not in (None, lead_before)  # noqa: E731
+        followed = ok and wait(lambda: took() or (not active(talker) and not active(other) and status(other).get("convPicksApplied", 0) + status(other).get("convJumps", 0) > st0.get("convPicksApplied", 0) + st0.get("convJumps", 0)), 8)
+        st = status(other)
+        check(followed, "the other player's conversation took the leader's pick",
+              f"leader {safe(lambda: node(talker))} / other {safe(lambda: node(other))}; picks applied {st.get('convPicksApplied')}, restarts {st.get('convJumps')}")
+        if len(mine) >= pick and mine[pick - 1] in theirs:  # the same response is there to choose: chosen, not started again
+            check(st.get("convPicksApplied", 0) > st0.get("convPicksApplied", 0), "the same response was chosen on the other side",
+                  f"picks applied {st0.get('convPicksApplied')} -> {st.get('convPicksApplied')}")
+        if active(talker):
+            uc(talker, lib(talker), "EndConversationInstance", {"Instance": conv(talker)})
+        check(wait(lambda: not active(other) and not status(other).get("convFollow"), 6), "the leader's conversation ended: the other's ended too")
+        check(wait(lambda: not paused(other) and not paused(talker), 5), "and neither game is paused",
               f"paused {safe(lambda: paused(talker))} / {safe(lambda: paused(other))}")
-        time.sleep(1.0)
+        time.sleep(2.0)
     print(f"RESULT: {'PASS' if not fails else 'FAIL'} ({fails} failure(s))")
     return fails
 

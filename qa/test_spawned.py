@@ -158,8 +158,9 @@ def main(parts):
     nav = safe(lambda: call("ue.find", {"path": "/Script/NavigationSystem.Default__NavigationSystemV1"}, inst=0)[0].split()[0], None)
     host_pawn = ev(0, "pawn").split()[0]
 
-    def place(turn):  # 20 m away, on the ground: a point past a ledge drops the bear out of the test (run 131)
-        for d, t in ((2000, 0), (1700, 0), (2000, 20), (2000, -20), (2300, 0), (1700, 25), (1700, -25)):
+    def place(turn):  # 7-20 m away, on the ground: a point past a ledge drops the bear out of the test (runs 131, 143)
+        tries = [(d, t) for d in (2000, 1500, 1000, 700) for t in (0, 20, -20, 45, -45, 90, -90, 135, -135, 180)]
+        for d, t in tries:
             a = math.radians(yaw + turn + t)
             q = {"X": me["X"] + d * math.cos(a), "Y": me["Y"] + d * math.sin(a), "Z": me["Z"]}
             r = safe(lambda: call("ue.call", {"ref": nav, "fn": "K2_ProjectPointToNavigation", "args": {
@@ -167,9 +168,9 @@ def main(parts):
             g = r.get("ProjectedLocation") if r.get("ReturnValue") else None
             if g and abs(g["Z"] - me["Z"]) < 400:
                 return {"X": g["X"], "Y": g["Y"], "Z": g["Z"] + 100}
-        print(f"info: no ground found {turn} degrees from the host: the first point", flush=True)
+        print(f"info: no navigable ground 7-20 m around the host: 3 m from it (where it stands)", flush=True)
         a = math.radians(yaw + turn)
-        return {"X": me["X"] + 2000 * math.cos(a), "Y": me["Y"] + 2000 * math.sin(a), "Z": me["Z"] + 60}
+        return {"X": me["X"] + 300 * math.cos(a), "Y": me["Y"] + 300 * math.sin(a), "Z": me["Z"] + 60}
 
     try:
         if "A" in parts:
