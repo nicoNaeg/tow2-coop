@@ -15,7 +15,7 @@ look, level and XP (XP earned together is shared), and players give each other i
 map change no longer waits for a save: when one player travels, the other starts the same travel at once and both
 arrive together. Fights are shared: an enemy that spots either player starts the fight in both games, and the enemies
 spread over both players. Tested on one PC with two copies (runs 70-111); the first real session across two PCs
-(2026-11-17, beta.4) ran the earlier features. 0.3.0 to 0.5.0 were tested on one PC too (runs 112-157).
+(2026-11-17, beta.4) ran the earlier features. 0.3.0 to 0.5.0 were tested on one PC too (runs 112-163).
 Use 0.5.0 on both PCs (an older version on the other PC does not connect; the log says so). Two independent copies of
 the game share one campaign owned by the host: the client joins by receiving the host's save, each player controls their
 own character, sees the other (position, rotation, walk/idle animation, the player's look, armor and helmet changes),

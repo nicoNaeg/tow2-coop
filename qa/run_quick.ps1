@@ -3,6 +3,7 @@
 # Usage: run_quick.ps1 -Out <evidence folder> [-NoRamCheck] [-Only 'interact and loot','...'] [-Menu] (the join steps always run;
 # -NewGame: menu mode, copy 1 without saves of its own, then only the new-game-together test; -Bare: only start the copies; -Stay: leave the joined pair running after god mode, for probes; -Menu: the copies start in menu mode and the players host and join through the game's main menu instead)
 param([Parameter(Mandatory)][string]$Out, [switch]$NoRamCheck, [string[]]$Only, [switch]$Warm, [switch]$Menu, [switch]$Stay, [switch]$Bare, [switch]$NewGame)
+if (-not (Get-Process -Name steam -ErrorAction SilentlyContinue)) { throw 'Steam is not running: a copy started without it exits (code 53) and Steam then starts the real game install. Start Steam first.' }
 $ErrorActionPreference = 'Continue'
 $hub = 'C:\coop-anything'; $qa = "$hub\local\tow2-coop\qa"; $cfg = "$qa\tow2.gamepool.json"
 New-Item -ItemType Directory -Force $Out | Out-Null

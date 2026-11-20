@@ -2,6 +2,7 @@
 # that copy (runs 25-29: copies reached 13-19 GB right after start while the cache was full). Memory every 2 s.
 # Usage: warmup.ps1 -Out <evidence dir> -Instance 0 [-Seconds 180] [-KeepIni (keep a tow2coop.ini placed in the copy)]
 param([Parameter(Mandatory)][string]$Out, [int]$Instance = 0, [int]$Seconds = 180, [switch]$KeepIni)
+if (-not (Get-Process -Name steam -ErrorAction SilentlyContinue)) { throw 'Steam is not running: a copy started without it exits (code 53) and Steam then starts the real game install. Start Steam first.' }
 $extra = @(); if ($KeepIni) { $extra += '--keep-ini' }
 $hub = 'C:\coop-anything'; $qa = "$hub\local\tow2-coop\qa"; $cfg = "$qa\tow2.gamepool.json"
 New-Item -ItemType Directory -Force $Out | Out-Null

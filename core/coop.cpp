@@ -2126,7 +2126,10 @@ float raw_hour(ue::UObject* c) {
 // world with the engine's own pause, the persistent level's WorldSettings.PauserPlayerState (probe 105: the player's
 // state while the pause menu or the inventory is open). While the other player is in the game it is lifted at once:
 // the menu stays open, the world goes on, as in a multiplayer game.
+ue::UObject* active_conversation();  // shared conversations, below
+
 void keep_running() {
+    if (active_conversation()) return;  // a pause the game itself sets in a conversation (a cinematic) stays, as in 0.4.0
     std::string err;
     ue::UObject* ws = ue::resolve("world.PersistentLevel.WorldSettings", &err);
     static ue::FProperty* prop = nullptr;
@@ -3981,7 +3984,6 @@ std::vector<uint64_t> hosting_friends() {
 // The game's own New Game, from the main menu: Scripts.MainMenuNewGame (what the Moon Man's "New Game" runs) sets
 // where his conversation leads; ending it starts the New Game (the character creator: CharacterCreation_Lite, then
 // 0501_PS_Intro_P; probe 109).
-ue::UObject* active_conversation();  // shared conversations, below
 bool main_menu_new_game() {
     ue::UClass* k = ue::find_class("/Script/Arkansas.Scripts");
     ue::UFunction* f = k ? ue::find_func(k, "MainMenuNewGame") : nullptr;

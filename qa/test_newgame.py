@@ -113,7 +113,7 @@ def main(host_pid, client_pid):
     for g in games.values():
         g.viewport_w = 960
     for i in (0, 1):  # past the title screen to the Moon Man's choices
-        shown = wait_for(lambda: st(i)["menu"]["shown"] or games[i].key("SPACE") or False, 150, step=3.0)
+        shown = wait_for(lambda: st(i)["menu"]["shown"] or games[i].key("SPACE") or False, 360, step=3.0)  # the game's shader screen first after a driver cache reset
         check(bool(shown), f"copy {i}: the co-op choice is in the main menu", str(safe(lambda: st(i)["menu"]["entries"])))
     check(not safe(lambda: st(1)["character"]["source"] == "kept", False), "the client has no kept character")
     # A: the host hosts a new game
