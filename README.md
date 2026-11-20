@@ -1,7 +1,8 @@
 # tow2-coop: two-player co-op for The Outer Worlds 2 (work in progress)
 
-Status: **v0.5.0, a test build: co-op through Steam (friends, or public games; no IP or port), or direct IP.**
-0.5.0: the player who starts a conversation leads it, and the other player's game plays the same conversation (the
+Status: **v0.5.1, a test build: co-op through Steam (friends, or public games; no IP or port), or direct IP.**
+0.5.1: the leader's pick is made in the other game even when that player's character couldn't take it (no restart),
+and a conversation's payments are taken from the leader only. 0.5.0: the player who starts a conversation leads it, and the other player's game plays the same conversation (the
 same lines, camera, voices and cinematics, the same choices on screen); only the leader chooses, and their pick is
 made in both games. A new game together from the very beginning: the host hosts a New Game, the friend makes their
 character in the game's character creator and joins the host's start. A quest one player completes is completed in
@@ -15,8 +16,8 @@ look, level and XP (XP earned together is shared), and players give each other i
 map change no longer waits for a save: when one player travels, the other starts the same travel at once and both
 arrive together. Fights are shared: an enemy that spots either player starts the fight in both games, and the enemies
 spread over both players. Tested on one PC with two copies (runs 70-111); the first real session across two PCs
-(2026-11-17, beta.4) ran the earlier features. 0.3.0 to 0.5.0 were tested on one PC too (runs 112-163).
-Use 0.5.0 on both PCs (an older version on the other PC does not connect; the log says so). Two independent copies of
+(2026-11-17, beta.4) ran the earlier features. 0.3.0 to 0.5.1 were tested on one PC too (runs 112-170).
+Use 0.5.0 or 0.5.1 on both PCs (the same version for public games) (an older version on the other PC does not connect; the log says so). Two independent copies of
 the game share one campaign owned by the host: the client joins by receiving the host's save, each player controls their
 own character, sees the other (position, rotation, walk/idle animation, the player's look, armor and helmet changes),
 and the host owns NPC health and deaths, quest progress, door states and container contents; either player can lead a
@@ -210,9 +211,10 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
 - In co-op the game's menus (pause, inventory, map, a flaw offer) no longer pause it: the world goes on, as in a
   multiplayer game.
 - In a conversation the other player sees the leader's choices as their own game shows them: a choice their character
-  can't take (a skill check, a flaw) shows as unavailable there; when the leader picks it, the other game starts the
-  conversation again at that response (a short camera cut). Each game runs the conversation's effects: an item the
-  NPC gives goes to both players, a payment is taken from both.
+  can't take (a skill check, a flaw) shows as unavailable there, and is taken all the same when the leader picks it.
+  This was tested with a response the test made the other game treat as locked, not yet with a real skill check.
+- Each game runs a conversation's effects: an item the NPC gives goes to both players; a payment (money, an item handed
+  over, a bounty, a purchase) is taken from the leader only.
 - Co-op combat was tested against Ursopods (melee creatures) and an Order soldier fighting nearby; a large fight with
   many armed humans was not tried yet.
 - The friend's character is kept by a private save the friend's game makes about 5 s after it changes (items, money,

@@ -76,6 +76,15 @@ def status(inst):
     return call("coop.status", {}, inst=inst)
 
 
+def scripts(inst):
+    return call("ue.find", {"path": "/Script/Arkansas.Default__Scripts"}, inst=inst)[0].split()[0]
+
+
+def held(inst, cls_name):  # how many of that item the player holds
+    return sum((x.get("Count") or 0) for x in call("eval", {"expr": "pawn.InventoryComponent.Items"}, inst=inst)["value"] or []
+               if isinstance(x, dict) and x["Item"].split()[1] == cls_name)
+
+
 def wait(pred, timeout):
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -155,6 +164,45 @@ def main():
         check(wait(lambda: not paused(other) and not paused(talker), 5), "and neither game is paused",
               f"paused {safe(lambda: paused(talker))} / {safe(lambda: paused(other))}")
         time.sleep(2.0)
+    # A response the other player's character can't take (a skill check, a flaw): the test makes the client's game treat
+    # the leader's pick as locked; it is picked past the lock (put first in the selectable list for the call), no restart.
+    talker, other = 0, 1
+    gear = ("Armor_", "Headgear_", "Weapon_")
+    host_items = call("eval", {"expr": "pawn.InventoryComponent.Items"}, inst=talker)["value"] or []
+    pay_name = next((x["Item"].split()[1] for x in host_items if isinstance(x, dict) and not x["Item"].split()[1].startswith(gear)), None)
+    pay_ref = next((r.split()[0] for r in call("ue.find", {"name": pay_name, "limit": 20}, inst=other) if r.split()[1] == "BlueprintGeneratedClass"), None) if pay_name else None
+    if pay_ref:
+        safe(lambda: uc(other, scripts(other), "GiveItemToPlayer", {"Item": pay_ref, "Count": 2}))
+    st0 = status(other)
+    if check(bool(start_with_companion(talker)) and wait(lambda: status(other).get("convFollow") and active(other), 10), "locked: the host talks, the client follows"):
+        wait(lambda: len([e for e in status(talker).get("convShown", []) if e[1]]) >= 2 and node(other) == node(talker), 8)
+        time.sleep(1.5)
+        sel = [e[0] for e in status(talker).get("convShown", []) if e[1]]
+        pick = len(sel)  # the last one ("talk later": leaves, changes nothing), never first on the client's list
+        # a payment the conversation takes (an item, through the game's script) is the leader's, not the follower's
+        if check(bool(pay_ref), "the client was given an item to pay with", str(pay_name)):
+            c0 = held(other, pay_name)
+            safe(lambda: uc(other, scripts(other), "RemoveItemFromPlayer", {"Item": pay_ref, "Count": 1}))
+            time.sleep(0.5)
+            check(held(other, pay_name) == c0, "while it follows, a payment script takes nothing from the client", f"{c0} -> {held(other, pay_name)} {pay_name}")
+        call("coop.set", {"convLockTest": int(sel[-1])}, inst=other)
+        before = safe(lambda: node(talker))
+        for _ in range(8):
+            uc(talker, screen(talker), f"OnResponse{pick}InputAction")
+            if wait(lambda: node(talker) != before, 1.0):
+                break
+        took = wait(lambda: status(other).get("convBypassed", 0) > st0.get("convBypassed", 0), 6)
+        check(bool(took), "the client took the leader's response past its lock", f"bypassed {st0.get('convBypassed')} -> {status(other).get('convBypassed')}")
+        check(wait(lambda: (node(other) == node(talker) and node(talker) not in (None, before)) or (not active(talker) and not active(other)), 8),
+              "at the leader's next line", f"leader {safe(lambda: node(talker))} / other {safe(lambda: node(other))}")
+        wait(lambda: not active(talker) and not active(other), 10)  # the reply plays out: no restart meanwhile either
+        st = status(other)
+        check(st.get("convJumps", 0) == st0.get("convJumps", 0), "the same response, so no restart (no camera cut)",
+              f"restarts {st0.get('convJumps')} -> {st.get('convJumps')}")
+        call("coop.set", {"convLockTest": -1}, inst=other)
+        if active(talker):
+            uc(talker, lib(talker), "EndConversationInstance", {"Instance": conv(talker)})
+        wait(lambda: not active(other), 6)
     print(f"RESULT: {'PASS' if not fails else 'FAIL'} ({fails} failure(s))")
     return fails
 

@@ -75,7 +75,7 @@ struct Outgoing {  // sent until the other game acknowledges it (kInteractAck), 
     int sent;
 };
 constexpr uint32_t kMagic = 0x36433254;  // "T2C6": the last character is the protocol version, bump it on any packet change
-constexpr const char* kVersion = "0.5.0";
+constexpr const char* kVersion = "0.5.1";
 constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13, kTravel = 14, kClock = 15, kCombat = 16, kSpawns = 17, kSpawnOffers = 18, kWeaponMods = 19, kInteractAck = 20, kConversation = 21, kParty = 23;  // 22: 0.4.0's response pick
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";
@@ -291,7 +291,8 @@ struct Ctx {
     // shared conversations: the one the other player leads (open: they lead one now)
     ConvMsg peer_conv{};
     double peer_conv_at = -100;
-    uint64_t conv_states_sent = 0, conv_leads = 0, conv_follows = 0, conv_picks_sent = 0, conv_picks_applied = 0, conv_jumps = 0, conv_advances = 0;
+    int32_t conv_lock_test = -1;  // test: a response the follower treats as locked (coop.set convLockTest)
+    uint64_t conv_states_sent = 0, conv_leads = 0, conv_follows = 0, conv_picks_sent = 0, conv_picks_applied = 0, conv_jumps = 0, conv_advances = 0, conv_bypassed = 0;
     uint64_t dmg_resent = 0, join_requests = 0;
     uint32_t next_eid = 1;
     std::vector<Outgoing> outgoing;
@@ -4375,7 +4376,7 @@ ue::UObject* conv_asset(ue::UObject* inst) {
     return a && ue::alive(a) ? a : nullptr;
 }
 
-struct Shown { int32_t node, parent; bool selectable; const uint8_t* data; };
+struct Shown { int32_t node, parent; bool selectable; const uint8_t* data; uint8_t* widget; };
 std::vector<Shown> shown_responses(ue::UObject* screen) {  // the responses on a conversation screen, by node
     std::vector<Shown> out;
     if (!screen) return out;
@@ -4393,10 +4394,62 @@ std::vector<Shown> shown_responses(ue::UObject* screen) {  // the responses on a
             const uint8_t* up = *reinterpret_cast<const uint8_t* const*>(w + kRespParentOff);
             if (!n || !ue::readable(n, 0x28) || n[0x10] != 1) continue;  // EFlowChartNodeType::PlayerResponse
             int32_t parent = up && ue::readable(up, 0x10) ? *reinterpret_cast<const int32_t*>(up + 8) : -1;
-            out.push_back({*reinterpret_cast<const int32_t*>(n + 8), parent, pass == 0, n});
+            out.push_back({*reinterpret_cast<const int32_t*>(n + 8), parent, pass == 0, n, const_cast<uint8_t*>(w)});
         }
     }
     return out;
+}
+
+// The response `node` picked on our screen: the Nth selectable one is OnResponseN. One our character can't take (a skill
+// check, a flaw: in UnselectableResponseWidgets) is put first for one OnResponse1 call: first in the selectable widgets,
+// its selectable flag (+0x380, probe 108) set, and first in the screen's own list of the selectable responses' nodes
+// (+0x5C0, not reflected: what OnResponseN picks from, probe 113), checked against the widgets first; all put back when
+// the game left them as they were (a pick rebuilds the lists). 0: not on our screen, 1: picked, 2: picked past the lock.
+constexpr int kRespSelectableOff = 0x380, kScreenSelectableNodesOff = 0x5C0;
+volatile bool conv_applying = false;  // our own pick on the follower's screen: not blocked (conv_swallow)
+int pick_response(int32_t node) {
+    ue::UObject* s = conv_screen();
+    static ue::FProperty* sel_prop = nullptr;
+    if (!s) return 0;
+    if (!sel_prop) sel_prop = ue::find_prop(ue::class_of(s), "SelectableResponseWidgets");
+    int k = 0, at = 0;
+    uint8_t* locked = nullptr;
+    for (const Shown& r : shown_responses(s)) {
+        if (r.selectable) k++;
+        if (r.node != node) continue;
+        if (r.selectable && node != g.conv_lock_test) at = k;
+        else locked = r.widget;
+    }
+    auto press = [&](int n) {
+        conv_applying = true;
+        call_quiet(ue::addr(s), ("OnResponse" + std::to_string(n) + "InputAction").c_str(), json::object());
+        conv_applying = false;
+    };
+    if (at && at <= 9) return press(at), 1;
+    if (!locked || !sel_prop) return 0;
+    struct TArr { ue::UObject** data; int32_t num, max; };
+    auto* arr = reinterpret_cast<TArr*>(reinterpret_cast<uint8_t*>(s) + ue::prop_offset(sel_prop));
+    if (!arr->data || arr->num < 1) return 0;  // shortcut: no selectable response to stand in for it (all locked), the follower starts again there
+    struct NArr { const uint8_t** data; int32_t num, max; };
+    auto* nodes = reinterpret_cast<NArr*>(reinterpret_cast<uint8_t*>(s) + kScreenSelectableNodesOff);
+    if (!ue::readable(nodes, sizeof *nodes) || nodes->num != arr->num || !nodes->data || !ue::readable(nodes->data, static_cast<size_t>(nodes->num) * 8)) return 0;
+    for (int i = 0; i < arr->num; i++)  // the screen's own list, as the widgets show it (this build's layout)
+        if (!arr->data[i] || !ue::readable(reinterpret_cast<uint8_t*>(arr->data[i]) + kRespNodeOff, 8) ||
+            *reinterpret_cast<const uint8_t* const*>(reinterpret_cast<uint8_t*>(arr->data[i]) + kRespNodeOff) != nodes->data[i])
+            return 0;
+    TArr was = *arr;
+    NArr nwas = *nodes;
+    ue::UObject* first = arr->data[0];
+    const uint8_t* first_node = nodes->data[0];
+    const uint8_t* node_ptr = *reinterpret_cast<const uint8_t* const*>(locked + kRespNodeOff);
+    uint8_t flag = locked[kRespSelectableOff];
+    arr->data[0] = reinterpret_cast<ue::UObject*>(locked), locked[kRespSelectableOff] = 1, nodes->data[0] = node_ptr;
+    press(1);
+    if (arr->data == was.data && arr->num == was.num && arr->data[0] == reinterpret_cast<ue::UObject*>(locked)) arr->data[0] = first;
+    if (nodes->data == nwas.data && nodes->num == nwas.num && nodes->data[0] == node_ptr) nodes->data[0] = first_node;
+    if (ue::alive(reinterpret_cast<ue::UObject*>(locked)) && *reinterpret_cast<const uint8_t* const*>(locked + kRespNodeOff) == node_ptr)
+        locked[kRespSelectableOff] = flag;  // the same response still: its own flag back (a reused widget keeps its new one)
+    return 2;
 }
 
 // A conversation asset's graph: its links by node (ConversationBundle.DialogueLinks: FromNodeID at +8, ToNodeID at
@@ -4701,14 +4754,17 @@ struct Follow {
     uint8_t box_vis = 4;
 } follow;
 ue::UObject* followed_inst = nullptr;    // the last conversation we played for the leader (never ours to lead)
-uint32_t block_names[10];
-volatile bool conv_applying = false;     // our own pick on the follower's screen: not blocked
+uint32_t block_names[14];
 std::atomic<uint64_t> conv_blocked{0};
 
 void follow_input(bool on) {  // the follower's own choices and skips are dropped (conv_swallow), the responses not hit
     if (on && !block_names[9]) {
         for (int i = 0; i < 9; i++) block_names[i] = ue::make_name("OnResponse" + std::to_string(i + 1) + "InputAction", false).index;
         block_names[9] = ue::make_name("OnSkipInputAction", false).index;
+        // The conversation's payments (Scripts: money, items handed over, a bounty, a purchase) are the leader's: a
+        // follower's game would take them a second time from its own player. Its rewards stay (each player's own).
+        int k = 10;
+        for (const char* n : {"RemoveCurrency", "RemoveItemFromPlayer", "PayOffBounty", "BuyItemWithCurrency"}) block_names[k++] = ue::make_name(n, false).index;
     }
     conv_block.store(on, std::memory_order_release);
     ue::UObject* s = on ? conv_screen() : nullptr;
@@ -4859,21 +4915,13 @@ void follow_frame(ue::UObject* inst) {
         if (follow.pick_tries > 0 && ours != follow.pick_from) {  // taken here
             follow.picks_done++, follow.pick = -1, follow.mine.clear(), g.conv_picks_applied++;
         } else if (g.now >= follow.next_pick) {
-            ue::UObject* s = conv_screen();
-            int k = 0, at = 0;
-            std::vector<Shown> v = shown_responses(s);
-            for (const Shown& r : v) {  // OnResponseN: the Nth selectable one
-                if (!r.selectable) continue;
-                k++;
-                if (r.node == follow.pick) at = k;
-            }
-            bool elsewhere = !at && !v.empty() && v[0].parent == ours && follow.pick_tries == 0;  // responses of ours, not theirs
-            if (at && at <= 9 && follow.pick_tries < 4) {
-                conv_applying = true;
-                call_quiet(ue::addr(s), ("OnResponse" + std::to_string(at) + "InputAction").c_str(), json::object());
-                conv_applying = false;
+            std::vector<Shown> v = shown_responses(conv_screen());
+            bool elsewhere = !v.empty() && v[0].parent == ours && follow.pick_tries == 0;  // our line's responses shown
+            int how = follow.pick_tries < 4 ? pick_response(follow.pick) : 0;
+            if (how) {
+                if (how == 2) g.conv_bypassed++;
                 follow.pick_tries++, follow.pick_from = ours, follow.next_pick = g.now + 0.6;
-            } else if (elsewhere || follow.pick_tries >= 4 || g.now - follow.pick_since > 2.5) {  // not to be chosen here (a check, a flaw)
+            } else if (elsewhere || follow.pick_tries >= 4 || g.now - follow.pick_since > 2.5) {  // not shown here: started at it
                 int32_t r = follow.pick;
                 follow.picks_done++, follow.pick = -1;
                 follow_jump(inst, r, "their response can't be chosen here");
@@ -5300,6 +5348,7 @@ json set_options(const json& p) {
                      std::make_pair("noPause", &g.opt_no_pause), std::make_pair("party", &g.opt_party),
                      std::make_pair("convFollow", &g.opt_conv_follow)})
         if (p.get(kv.first).isBool()) *kv.second = p.get(kv.first).asBool(true);
+    if (p.get("convLockTest").isNumber()) g.conv_lock_test = static_cast<int32_t>(p.get("convLockTest").asInt(-1));
     if (p.get("dropInteract").isNumber()) g.opt_drop_interact = std::clamp(p.get("dropInteract").asNumber(0), 0.0, 0.95);
     if (p.get("menu").isBool()) {  // test: the role picked in the main menu from now on (off: the set role again)
         if (p.get("menu").asBool()) { g.menu_mode = true; if (g.role_chosen) choose_off(); g.host = g.start_host; }
@@ -5362,11 +5411,21 @@ json status() {
     s.set("pausesLifted", static_cast<double>(g.pauses_lifted)).set("noPause", g.opt_no_pause);
     s.set("partyDriven", static_cast<double>(g.party_tamed.size())).set("partyTames", static_cast<double>(g.party_tames))
         .set("partyReleases", static_cast<double>(g.party_releases)).set("partyCalm", g.party_calm_in);
+    {
+        json shown = json::array();
+        for (const Shown& r : shown_responses(conv_screen())) {
+            json e = json::array();
+            e.push(static_cast<double>(r.node)).push(r.selectable);
+            shown.push(e);
+        }
+        s.set("convShown", shown);
+    }
     s.set("hostNew", g.host_new).set("newChar", g.new_char).set("newCharStage", g.new_char_stage).set("joined", join::joined());
     s.set("convLead", lead.inst != nullptr).set("convFollow", follow.on).set("convLeads", static_cast<double>(g.conv_leads))
         .set("convFollows", static_cast<double>(g.conv_follows)).set("convStatesSent", static_cast<double>(g.conv_states_sent))
         .set("convPicksSent", static_cast<double>(g.conv_picks_sent)).set("convPicksApplied", static_cast<double>(g.conv_picks_applied))
         .set("convJumps", static_cast<double>(g.conv_jumps)).set("convAdvances", static_cast<double>(g.conv_advances))
+        .set("convBypassed", static_cast<double>(g.conv_bypassed))
         .set("convBlocked", static_cast<double>(conv_blocked.load())).set("peerConvOpen", g.peer_conv.open != 0 && g.now - g.peer_conv_at < 3.0)
         .set("convNode", static_cast<double>(conv_node(active_conversation())));
     s.set("interactsPending", static_cast<double>(g.outgoing.size())).set("interactsResent", static_cast<double>(g.interacts_resent))
