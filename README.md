@@ -1,7 +1,10 @@
 # tow2-coop: two-player co-op for The Outer Worlds 2 (work in progress)
 
-Status: **v0.5.1, a test build: co-op through Steam (friends, or public games; no IP or port), or direct IP.**
-0.5.1: the leader's pick is made in the other game even when that player's character couldn't take it (no restart),
+Status: **v0.5.2, a test build: co-op through Steam (friends, or public games; no IP or port), or direct IP.**
+0.5.2: a controller in the co-op menu (Y opens it, the D-pad moves, A picks, B goes back) and for giving items (X in
+front of the other player); a hive's, a hatch's or a door's wave of enemies that starts in one game starts in the other
+too (before, its enemies could stay hidden in their hive there for a minute); a quest that has to be set without the
+game's banner shows its title in the game's notification. 0.5.1: the leader's pick is made in the other game even when that player's character couldn't take it (no restart),
 and a conversation's payments are taken from the leader only. 0.5.0: the player who starts a conversation leads it, and the other player's game plays the same conversation (the
 same lines, camera, voices and cinematics, the same choices on screen); only the leader chooses, and their pick is
 made in both games. A new game together from the very beginning: the host hosts a New Game, the friend makes their
@@ -84,7 +87,10 @@ Entertainment or Xbox; it ships no game files. MIT license.
   stand-in is untargetable by the AI until a fight starts. A dead player's stand-in leaves the other game until they
   live again, and its enemies turn to the living player. Enemies the game spawns during play (a hive, a hatch, a door,
   a summon) are shared too: each game tells the other about its own; the other takes one of its own of the same kind
-  nearby (both spawned it), or spawns a copy, and from then on it is shared like the others.
+  nearby (both spawned it), or spawns a copy, and from then on it is shared like the others. A hive's or a hatch's
+  enemies are the level's own (the same in both games), waiting in their spawner until their encounter's wave starts:
+  a wave that starts in one game (its player came near, or the story) is started in the other with the game's own
+  ActivateWave, so they come out in both.
 - **Quests and story:** shared both ways. Quest starts, objective updates (addendums), the global variables quest
   objectives test, and quest outcomes (completed, failed) made in either player's game reach the other's live, without
   a reload: a conversation or an objective of the friend's counts for the host's campaign too.
@@ -202,11 +208,13 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
   together, snapped past 6 m).
 - The friend's hits are told to the host by the game's "last hitter" of the enemy: a hit of the friend's in the same tenth
   of a second as a companion's on the same enemy is not counted.
-- Spawned enemies were tested with Ursopods spawned the way a spawner does (by the test), not yet with the game's own
-  hives, hatches or doors. When both games spawn one of the same kind more than 15 m apart, each gets a copy of the
-  other's (one more enemy).
+- Spawned enemies were tested with Ursopods spawned the way a spawner does (by the test), and the game's own hives and
+  floor hatches with mantisaur waves started by the test the game's way (`Encounter.ActivateWave`), not yet with a door
+  or a wave started by the story. When both games spawn one of the same kind more than 15 m apart, each gets a copy of
+  the other's (one more enemy).
 - The co-op choice is in the main menu only (not in the pause menu: to start hosting, go back to the main menu). It is
-  picked with the mouse or its number key, not yet with a gamepad. Public games and Steam's "Join game" were tested on
+  picked with the mouse, its number key or a controller (Y, the D-pad, A, B). The controller was tested with buttons
+  the bots set through the mod (no controller plugged in), not with a real one. Public games and Steam's "Join game" were tested on
   one Steam account only (a public game made, searched for, left); a join between two accounts is still to try.
 - In co-op the game's menus (pause, inventory, map, a flaw offer) no longer pause it: the world goes on, as in a
   multiplayer game.
@@ -221,13 +229,15 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
   XP; at most one every 15 s), every 3 minutes, and before a hand-over that isn't a reload. On the host's reloads and
   after the friend's death the last kept one is used: what the friend gained in the last seconds is lost, more when the
   game could not save then (combat, a conversation), as the world goes back too.
-- Giving items: keyboard and mouse only (E opens the screen; a gamepad's interact button doesn't). The bots test the
-  giving with the game's inventory functions, not with mouse clicks in the screen.
+- Giving items: E or a controller's X (its interact button) in front of the other player opens the screen; in the
+  screen the game's own controls apply. The bots test the giving with the game's inventory functions, not with mouse
+  clicks in the screen.
 - Following a travel was tested with the game's travel into and out of an interior and with fast travel; ship travel
   was not tried yet.
 - A quest one player completes is walked to the same end in the other game with the game's own quest steps (a step a
   second: the banner, the journal and the quest's XP come as usual). When that path ends the other way or gets stuck
-  (more than 15 steps or 30 s), the quest's state is set directly, without the banner.
+  (more than 15 steps or 30 s), the quest's state is set directly: no banner then, but the game's notification shows
+  the quest's title. A quest the other game had not started is started there first, then walked.
 - In a joined game the friend can't load one of their own saves (Continue, Load and Quickload bring back the host's
   current game): to play their own campaign, go back to the main menu first. After a death the friend comes back with
   the character as last kept (up to 3 minutes earlier). If the host is in a fight, that reload waits until the host's

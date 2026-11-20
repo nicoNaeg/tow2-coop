@@ -120,7 +120,10 @@ static uint8_t* item(int i) {
 
 UObject* object_at(int i) {
     uint8_t* it = item(i);
-    return it ? *reinterpret_cast<UObject**>(it) : nullptr;
+    UObject* o = it ? *reinterpret_cast<UObject**>(it) : nullptr;
+    // A slot whose object is being made or freed holds memory that is no object yet (or any more): its class pointer
+    // was garbage (run 173: 0x1060000003f; run 172: non-canonical). A real object carries its own slot's index.
+    return o && at<int32_t>(o, off::obj_index) == i ? o : nullptr;
 }
 
 bool readable(const void* p, size_t n) {
@@ -180,7 +183,9 @@ bool is_cdo(const UObject* o) { return o && (at<uint32_t>(o, off::obj_flags) & 0
 UStruct* super_of(const UStruct* s) { return s ? at<UStruct*>(s, off::struct_super) : nullptr; }
 
 bool is_a(const UObject* o, const UClass* c) {
-    for (const UStruct* s = class_of(o); s; s = super_of(s))
+    // A garbage class pointer (an object being made or freed: see object_at) outside user space ends the walk.
+    auto ok = [](const void* p) { auto v = reinterpret_cast<uintptr_t>(p); return v >= 0x10000 && v < 0x7FFFFFFF0000ull; };
+    for (const UStruct* s = class_of(o); s && ok(s); s = super_of(s))
         if (s == c) return true;
     return false;
 }

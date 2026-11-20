@@ -18,6 +18,8 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <map>
+#include <set>
 #include <unordered_set>
 #include <string>
 #include <unordered_map>
@@ -75,8 +77,8 @@ struct Outgoing {  // sent until the other game acknowledges it (kInteractAck), 
     int sent;
 };
 constexpr uint32_t kMagic = 0x36433254;  // "T2C6": the last character is the protocol version, bump it on any packet change
-constexpr const char* kVersion = "0.5.1";
-constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13, kTravel = 14, kClock = 15, kCombat = 16, kSpawns = 17, kSpawnOffers = 18, kWeaponMods = 19, kInteractAck = 20, kConversation = 21, kParty = 23;  // 22: 0.4.0's response pick
+constexpr const char* kVersion = "0.5.2";
+constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13, kTravel = 14, kClock = 15, kCombat = 16, kSpawns = 17, kSpawnOffers = 18, kWeaponMods = 19, kInteractAck = 20, kConversation = 21, kParty = 23, kWaves = 24;  // 22: 0.4.0's response pick
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";
 
@@ -292,6 +294,15 @@ struct Ctx {
     ConvMsg peer_conv{};
     double peer_conv_at = -100;
     int32_t conv_lock_test = -1;  // test: a response the follower treats as locked (coop.set convLockTest)
+    int pad_test = -1;            // test: the controller's buttons instead of XInput's (coop.set pad)
+    uint16_t pad_now = 0, pad_prev = 0;
+    bool pad_seen = false;        // a controller (or the test's) was used: the menu shows its buttons
+    std::unordered_map<uint64_t, ue::UObject*> encounters;  // this world's encounters, by path hash
+    std::map<std::pair<uint64_t, uint8_t>, uint8_t> wave_state;   // each wave's state last seen here (0: Inactive)
+    std::map<std::pair<uint64_t, uint8_t>, double> wave_starts;   // waves that started here, when (sent for 5 s)
+    std::map<std::pair<uint64_t, uint8_t>, double> waves_done;    // the other world's starts taken here, when
+    double next_waves = 0, next_encounters = 0;
+    uint64_t waves_started = 0;
     uint64_t conv_states_sent = 0, conv_leads = 0, conv_follows = 0, conv_picks_sent = 0, conv_picks_applied = 0, conv_jumps = 0, conv_advances = 0, conv_bypassed = 0;
     uint64_t dmg_resent = 0, join_requests = 0;
     uint32_t next_eid = 1;
@@ -2256,6 +2267,7 @@ void on_load_started(const std::wstring& name, uint8_t result) {
 namespace {
 // One datagram from the other player: UDP gives its address (from), Steam its SteamID (from_id).
 void on_spawns(const char* b, int n);  // enemies the game spawns during play, below
+void on_waves(const char* b, int n);   // encounter waves, below
 void on_offers(const char* b, int n);
 
 void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t from_id) {
@@ -2408,6 +2420,7 @@ void handle_packet(const char* buf, int n, const sockaddr_in* from, uint64_t fro
         g.look_weapon_mods.assign(lines.size() > 1 ? lines.begin() + 1 : lines.end(), lines.end());
         return;
     }
+    if (h.type == kWaves) { on_waves(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }
     if (h.type == kSpawnOffers) { if (g.host) on_offers(buf + sizeof(Header), n - static_cast<int>(sizeof(Header))); return; }
     if (h.type == kClock && !g.host) {
         float hour;
@@ -3030,6 +3043,99 @@ void spawned_frame(ue::UObject* pawn) {
     g.next_spawn_send = g.now + 1.0;
     if (g.host) host_spawned(pawn);
     else client_spawned(pawn);
+}
+
+// ---------------------------------------------------------------- encounter waves (hives, hatches, doors)
+// A hive's or a hatch's enemies are placed in the level (the same names in both worlds: an encounter wave pairs each
+// with its spawner) and wait hidden there until their wave starts. Each world starts waves by its own player's
+// proximity or the story, so a wave the host's world started left the client's copies hidden in their hives while they
+// fought in the host's world (probe 116: a minute, until the client's wave started by itself). Each world tells the
+// other the waves that start there (a start, not the state: an encounter its player left goes back to Inactive in that
+// world alone, and must stay so); the other starts the same wave with the game's Encounter.ActivateWave.
+constexpr int kWaveSize = 0x340, kWaveStateOff = 0x30a;  // EncounterWaveInformation in this build (dump-types)
+
+struct WaveList { uint8_t* data; int32_t num, max; };
+WaveList* encounter_waves(ue::UObject* e) {
+    static int off = -1;
+    if (off < 0) {
+        ue::UClass* k = ue::find_class("/Script/Arkansas.Encounter");
+        ue::FProperty* pr = k ? ue::find_prop(k, "EncounterWaves") : nullptr;
+        if (!pr) return nullptr;
+        off = ue::prop_offset(pr);
+    }
+    auto* w = reinterpret_cast<WaveList*>(reinterpret_cast<uint8_t*>(e) + off);
+    return w->data && w->num > 0 && w->num < 64 ? w : nullptr;
+}
+
+void waves_frame() {
+    if (!g.have_peer || g.now < g.next_waves || g.now < g.settle_until) return;
+    g.next_waves = g.now + 1.0;
+    if (g.now >= g.next_encounters) {  // the list: every 5 s (levels stream in and out)
+        g.next_encounters = g.now + 5.0;
+        g.encounters.clear();
+        if (ue::UClass* k = ue::find_class("/Script/Arkansas.Encounter"))
+            for (ue::UObject* o : ue::instances(k, false, 1024)) g.encounters[fnv64("enc:" + ue::path_of(o))] = o;
+    }
+    for (auto& kv : g.encounters) {  // a wave Inactive before, not now: started here (a wave seen first is not a start)
+        if (!ue::alive(kv.second)) continue;
+        WaveList* w = encounter_waves(kv.second);
+        for (int i = 0; w && i < w->num; i++) {
+            uint8_t now = w->data[i * kWaveSize + kWaveStateOff];
+            auto key = std::make_pair(kv.first, static_cast<uint8_t>(i));
+            auto was = g.wave_state.find(key);
+            auto taken = g.waves_done.find(key);  // started for the other world's start: not sent back
+            bool echo = taken != g.waves_done.end() && g.now - taken->second < 10.0;
+            if (was != g.wave_state.end() && was->second == 0 && now != 0 && !echo) g.wave_starts[key] = g.now;
+            g.wave_state[key] = now;
+        }
+    }
+    char body[1400];
+    memcpy(body, &g.my_map, 4);
+    int n = 5, count = 0;
+    for (auto it = g.wave_starts.begin(); it != g.wave_starts.end();) {  // each start sent for 5 s (a lost packet)
+        if (g.now - it->second > 5.0) { it = g.wave_starts.erase(it); continue; }
+        if (n + 9 <= static_cast<int>(sizeof body) && count < 255) {
+            memcpy(body + n, &it->first.first, 8);
+            body[n + 8] = static_cast<char>(it->first.second);
+            n += 9, count++;
+        }
+        ++it;
+    }
+    if (!count) return;
+    body[4] = static_cast<char>(count);
+    send_typed(kWaves, body, n);
+}
+
+void on_waves(const char* b, int n) {  // the other world's started waves (trust boundary): bounds-checked
+    uint32_t map;
+    if (n < 5) { g.bad++; return; }
+    memcpy(&map, b, 4);
+    int count = static_cast<uint8_t>(b[4]);
+    if (n != 5 + count * 9) { g.bad++; return; }
+    if (map != g.my_map || g.now < g.settle_until) return;
+    static Fn act;
+    if (!base_fn(act, "/Script/Arkansas.Encounter", "ActivateWave")) return;
+    for (int i = 0; i < count; i++) {
+        uint64_t id;
+        memcpy(&id, b + 5 + i * 9, 8);
+        uint8_t wave = static_cast<uint8_t>(b[5 + i * 9 + 8]);
+        auto key = std::make_pair(id, wave);
+        auto done = g.waves_done.find(key);
+        if (done != g.waves_done.end() && g.now - done->second < 10.0) continue;  // this start, sent again
+        auto it = g.encounters.find(id);
+        if (it == g.encounters.end() || !ue::alive(it->second)) continue;  // not loaded here
+        WaveList* w = encounter_waves(it->second);
+        if (!w || wave >= w->num) continue;
+        g.waves_done[key] = g.now;  // (our own start of it, caused by this, is not sent back)
+        if (w->data[wave * kWaveSize + kWaveStateOff] != 0) continue;  // started here too
+        alignas(16) uint8_t a[16] = {};
+        int32_t idx = wave;
+        memcpy(a + act.off("WaveIndex"), &idx, 4);
+        ue::process_event(it->second, act.f, a);
+        g.waves_started++;
+        core_log("encounter: wave " + std::to_string(wave) + " of " + ue::path_of(it->second).substr(ue::path_of(it->second).rfind('.') + 1) +
+                 " started here too (the other world started it)");
+    }
 }
 
 json spawn_test(const json& p) {  // test bridge, game thread: an NPC of a class spawned here, as the game would
@@ -3794,9 +3900,44 @@ struct MenuState {
     std::vector<steamnet::Lobby> publics;  // level 2: public games (Steam lobbies of this version)
     double search_from = 0, next_refresh = 0;
     int lang = -1;                   // 0 English, 1 French (the game's language)
+    int sel = 0;                     // levels 1-2: the entry the controller is on
 } menu;
 
 double menu_last[2] = {};  // the last click, in viewport pixels (test bridge)
+
+// A controller (XInput, as the game reads it: XINPUT1_4.dll): read once a frame; tests set its buttons (coop.set pad).
+// Connected slots are read each frame, the others looked for every 2 s (a missing pad's read is slow).
+constexpr uint16_t kPadUp = 0x1, kPadDown = 0x2, kPadA = 0x1000, kPadB = 0x2000, kPadX = 0x4000, kPadY = 0x8000;
+void pad_poll() {
+    struct PadState { DWORD packet; uint16_t buttons; uint8_t lt, rt; int16_t lx, ly, rx, ry; };
+    using GetStateFn = DWORD(WINAPI*)(DWORD, PadState*);
+    static GetStateFn get = nullptr;
+    static bool tried = false;
+    static unsigned connected = 0;
+    static double next_scan = 0;
+    g.pad_prev = g.pad_now;
+    if (g.pad_test >= 0) {
+        g.pad_now = static_cast<uint16_t>(g.pad_test), g.pad_seen = true;
+        return;
+    }
+    if (!tried) {
+        tried = true;
+        HMODULE m = GetModuleHandleW(L"XINPUT1_4.dll");
+        if (!m) m = LoadLibraryW(L"XINPUT1_4.dll");
+        if (m) get = reinterpret_cast<GetStateFn>(reinterpret_cast<void*>(GetProcAddress(m, "XInputGetState")));
+    }
+    g.pad_now = 0;
+    if (!get) return;
+    bool scan = g.now >= next_scan;
+    if (scan) next_scan = g.now + 2.0;
+    for (DWORD i = 0; i < 4; i++) {
+        if (!scan && !(connected & (1u << i))) continue;
+        PadState st{};
+        if (get(i, &st) == ERROR_SUCCESS) connected |= 1u << i, g.pad_now |= st.buttons, g.pad_seen = true;
+        else connected &= ~(1u << i);
+    }
+}
+bool pad_pressed(uint16_t button) { return (g.pad_now & button) && !(g.pad_prev & button); }
 
 enum MenuAction { kOpen = 1, kHost, kStopHosting, kJoinList, kStopJoining, kBack, kSearch, kJoinDirect, kHostPublic, kHostNew, kJoinFriend = 100, kJoinPublic = 200 };
 
@@ -3844,6 +3985,14 @@ void set_visibility(ue::UObject* w, uint8_t v) {  // ESlateVisibility: 0 Visible
     if (!base_fn(set, "/Script/UMG.Widget", "SetVisibility")) return;
     alignas(16) uint8_t b[16] = {};
     b[set.off("InVisibility")] = v;
+    ue::process_event(w, set.f, b);
+}
+
+void set_enabled(ue::UObject* w, bool on) {
+    static Fn set;
+    if (!base_fn(set, "/Script/UMG.Widget", "SetIsEnabled")) return;
+    alignas(16) uint8_t b[16] = {};
+    b[set.off("bInIsEnabled")] = on ? 1 : 0;
     ue::process_event(w, set.f, b);
 }
 
@@ -3924,7 +4073,7 @@ void clear_mine() {
 void show_game(bool show) {
     if (show) {
         for (auto& h : menu.hidden)
-            if (h.first && ue::alive(h.first)) set_visibility(h.first, h.second);
+            if (h.first && ue::alive(h.first)) set_visibility(h.first, h.second), set_enabled(h.first, true);
         menu.hidden.clear();
         return;
     }
@@ -3933,7 +4082,7 @@ void show_game(bool show) {
         for (auto& h : menu.hidden) done = done || h.first == w;
         if (done) continue;
         menu.hidden.push_back({w, widget_visibility(w)});
-        set_visibility(w, 1);
+        set_visibility(w, 1), set_enabled(w, false);
     }
 }
 
@@ -4170,10 +4319,21 @@ void menu_frame() {
         for (size_t i = 0; i < menu.mine.size() && pick < 0; i++)
             if (mine_ok(menu.mine[i]) && widget_under(menu.mine[i], x, y)) pick = static_cast<int>(i);
     }
+    if (pick < 0 && g.pad_seen && !menu.actions.empty()) {  // a controller: Y opens; then the D-pad moves, A picks, B goes back
+        int n = static_cast<int>(menu.actions.size());
+        if (menu.level == 0) pick = pad_pressed(kPadY) ? 0 : -1;
+        else {
+            menu.sel = std::min(menu.sel, n - 1);
+            if (pad_pressed(kPadDown)) menu.sel = (menu.sel + 1) % n;
+            if (pad_pressed(kPadUp)) menu.sel = (menu.sel + n - 1) % n;
+            if (pad_pressed(kPadA)) pick = menu.sel;
+            else if (pad_pressed(kPadB)) pick = static_cast<int>(std::find(menu.actions.begin(), menu.actions.end(), static_cast<int>(kBack)) - menu.actions.begin());
+        }
+    }
     if (pick >= 0 && pick < static_cast<int>(menu.actions.size())) {
         int before = menu.level;
         menu_act(menu.actions[pick]);
-        if (menu.level != before) clear_mine();  // other entries now
+        if (menu.level != before) clear_mine(), menu.sel = 0;  // other entries now
     }
     if (menu.level == 2 && g.now >= menu.next_refresh) {
         menu.next_refresh = g.now + 1.0, menu.hosts = hosting_friends();
@@ -4181,7 +4341,12 @@ void menu_frame() {
     }
     show_game(menu.level == 0);
     first = menu.level == 0 ? static_cast<int>(game_responses().size()) + 1 : 1;
-    show_entries(menu_wanted(), first);
+    std::vector<std::pair<std::string, int>> want = menu_wanted();
+    if (g.pad_seen && !want.empty()) {  // the controller's way: its button on the entry, the entry it is on marked
+        if (menu.level == 0) want[0].first += " (Y)";
+        else want[std::min<size_t>(menu.sel, want.size() - 1)].first = "\xC2\xBB " + want[std::min<size_t>(menu.sel, want.size() - 1)].first;
+    }
+    show_entries(want, first);
     menu_own = menu.level == 0 ? first : -1;  // the window procedure: the digit that is ours (-1: all of them)
 }
 }  // namespace
@@ -5083,6 +5248,7 @@ void frame(float) {
         conv_world_reset();
         g.party_tamed.clear(), g.party_in.clear();
         g.npcs.clear(), g.scanning.clear(), g.scan_cursor = 0;
+        g.encounters.clear(), g.waves_done.clear(), g.wave_state.clear(), g.wave_starts.clear(), g.next_encounters = 0;
         g.interactables.clear(), g.inter_scan.clear();  // old world's doors and containers
         g.box_pos.clear(), g.box_counts.clear();
         doors.clear(), door_cursor = 0;
@@ -5105,6 +5271,7 @@ void frame(float) {
     }
     bool settled = gameplay && g.now >= g.settle_until;
     g.in_gameplay = settled;
+    pad_poll();  // the controller, once a frame (the menu and giving read its presses)
     try { menu_frame(); } catch (const std::exception& e) { g.last_error = std::string("menu: ") + e.what(); }
     try { steam_requests(); } catch (const std::exception& e) { g.last_error = std::string("steam requests: ") + e.what(); }
     if (!g.role_chosen) return;  // nothing goes out until the player picks host or join (the co-op menu)
@@ -5113,7 +5280,7 @@ void frame(float) {
     if (gameplay) follow_travel(pawn);
     send_travels();
     send_gifts();
-    bool give_pressed = give_key.exchange(false);
+    bool give_pressed = give_key.exchange(false) || pad_pressed(kPadX);  // E, or a controller's interact (X: PrimaryInteract)
     // The host's map changed: hand the campaign over as soon as it can save, not after the map settles and the client
     // reports another map (two-PC test: 15 s, then 7 s of transfer). Not while the client follows a travel by itself.
     bool followed = g.host && g.follow_until > g.now;
@@ -5213,6 +5380,7 @@ void frame(float) {
         drive_puppet();
         if (g.opt_scan) scan_step(pawn);
         if (g.opt_scan && g.opt_npcs) spawned_frame(pawn);
+        if (g.opt_scan && g.opt_npcs) waves_frame();
         if (g.host && g.opt_story) story::host_frame(g.now, send_typed);  // polls even without a peer: the log covers the whole session
         if (g.host && g.have_peer && g.now >= g.next_clock) {
             g.next_clock = g.now + 2.0;
@@ -5348,6 +5516,10 @@ json set_options(const json& p) {
                      std::make_pair("noPause", &g.opt_no_pause), std::make_pair("party", &g.opt_party),
                      std::make_pair("convFollow", &g.opt_conv_follow)})
         if (p.get(kv.first).isBool()) *kv.second = p.get(kv.first).asBool(true);
+    if (p.get("pad").isNumber()) {  // test: buttons pressed on a simulated controller; -1: the real one again
+        g.pad_test = static_cast<int>(p.get("pad").asInt(-1));
+        if (g.pad_test < 0) g.pad_seen = false;  // a connected controller sets it again
+    }
     if (p.get("convLockTest").isNumber()) g.conv_lock_test = static_cast<int32_t>(p.get("convLockTest").asInt(-1));
     if (p.get("dropInteract").isNumber()) g.opt_drop_interact = std::clamp(p.get("dropInteract").asNumber(0), 0.0, 0.95);
     if (p.get("menu").isBool()) {  // test: the role picked in the main menu from now on (off: the set role again)
@@ -5420,6 +5592,7 @@ json status() {
         }
         s.set("convShown", shown);
     }
+    s.set("pad", static_cast<double>(g.pad_now)).set("padSeen", g.pad_seen).set("menuSel", static_cast<double>(menu.sel));
     s.set("hostNew", g.host_new).set("newChar", g.new_char).set("newCharStage", g.new_char_stage).set("joined", join::joined());
     s.set("convLead", lead.inst != nullptr).set("convFollow", follow.on).set("convLeads", static_cast<double>(g.conv_leads))
         .set("convFollows", static_cast<double>(g.conv_follows)).set("convStatesSent", static_cast<double>(g.conv_states_sent))
@@ -5467,6 +5640,7 @@ json status() {
         .set("standinRespawns", static_cast<double>(g.standin_respawns));
     s.set("standinModsInstalled", static_cast<double>(g.standin_mods_installed)).set("lookWeaponMods", static_cast<double>(g.look_weapon_mods.size()));
     s.set("menuMode", g.menu_mode).set("roleChosen", g.role_chosen).set("menuPicks", static_cast<double>(g.menu_picks)).set("menu", menu_status());
+    s.set("encounters", static_cast<double>(g.encounters.size())).set("wavesStarted", static_cast<double>(g.waves_started));
     s.set("spawnedShared", static_cast<double>(g.spawned.size())).set("spawnCopies", static_cast<double>(g.spawn_copies));
     s.set("spawnMatched", static_cast<double>(g.spawn_matched)).set("spawnRemoved", static_cast<double>(g.spawn_removed));
     s.set("spawnNatives", static_cast<double>(g.natives.size())).set("spawnOffers", static_cast<double>(g.offers.size()));

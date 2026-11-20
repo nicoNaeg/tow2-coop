@@ -125,6 +125,22 @@ def main(host_pid, client_pid):
     if not back:
         print(f"info: the 'Never mind' click: rects {m.get('rects')}, last click {menu(1).get('lastClick')}")
     check(bool(back) and menu(1)["entries"][:1] and menu(1)["entries"][0] in OPEN, "'Never mind' (a click) went back", str(menu(1)["entries"]))
+    # a controller (simulated by the mod: coop.set pad): Y opens, the D-pad moves, B goes back
+    def pad(bits):
+        call("coop.set", {"pad": bits}, inst=1)
+        time.sleep(0.4)
+        call("coop.set", {"pad": 0}, inst=1)
+        time.sleep(0.4)
+    call("coop.set", {"pad": 0}, inst=1)
+    check(bool(wait_for(lambda: menu(1)["entries"][:1] and menu(1)["entries"][0].endswith("(Y)"), 4)), "with a controller the co-op choice shows its button (Y)", str(menu(1)["entries"][:1]))
+    pad(0x8000)
+    check(bool(wait_for(lambda: menu(1)["level"] == 1 and menu(1)["entries"][0].startswith("»"), 4)), "Y opened the co-op choices, the first one marked", str(menu(1)["entries"][:2]))
+    pad(0x2)
+    check(bool(wait_for(lambda: st(1)["menuSel"] == 1 and menu(1)["entries"][1].startswith("»"), 4)), "the D-pad moved the mark down", str(menu(1)["entries"][:2]))
+    pad(0x2000)
+    check(bool(wait_for(lambda: menu(1)["level"] == 0, 4)), "B went back", str(menu(1)["entries"][:1]))
+    call("coop.set", {"pad": -1}, inst=1)
+    wait_for(lambda: menu(1)["entries"][:1] and menu(1)["entries"][0] in OPEN, 4)
     games[1].key("6")
     wait_for(lambda: menu(1)["level"] == 1, 5)
     games[1].key("1")

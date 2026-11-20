@@ -22,4 +22,5 @@ using FindQuestFn = uint8_t* (*)(void* quest_manager, const void* guid);
 extern FindQuestFn find_quest;
 constexpr int kQuestStateOffset = 0x1A4;
 coopbridge::json::Value status();
+coopbridge::json::Value title_test(const coopbridge::json::Value& p);  // test: a quest's title shown as on a forced outcome
 }  // namespace story

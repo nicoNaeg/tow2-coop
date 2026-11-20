@@ -186,10 +186,14 @@ def main(parts):
                 # Only the client's own hits are reported to the host (a companion's: the host's game has its own; the
                 # fight test checks that none are reported while the client stays out). Its blade, swung at its copy.
                 time.sleep(1.5)  # in both registries
-                h0 = health(0, mine)
-                swings(1, rec["actor"])
-                down = wait_for(lambda: health(0, mine) < h0 - 5, 4)
-                check(bool(down), "the client's swings at its copy reached the host's", f"host {h0:.0f} -> {health(0, mine):.0f}")
+                h0, c0 = health(0, mine), health(1, rec["actor"])
+                down, tries = False, 0
+                while not down and tries < 3:  # a swing can miss (the Ursopod moves): swung again, as a player would
+                    swings(1, rec["actor"])
+                    down, tries = wait_for(lambda: health(0, mine) < h0 - 5, 4), tries + 1
+                c1 = safe(lambda: health(1, rec["actor"]), -1)  # its copy here: hit but not told (a mod bug) or missed (the test)
+                check(bool(down), "the client's swings at its copy reached the host's",
+                      f"host {h0:.0f} -> {health(0, mine):.0f}, its copy in the client's world {c0:.0f} -> {c1:.0f}, {tries} round(s)")
                 uc(0, mine + ".HealthComponent", "Suicide", {"bPreventRevival": True})
                 died = wait_for(lambda: health(1, rec["actor"]) <= 0, 6)
                 check(bool(died), "killed in the host's world, it died in the client's world", f"health {safe(lambda: health(1, rec['actor']))}")
@@ -224,6 +228,8 @@ def main(parts):
                 died = wait_for(lambda: health(1, mine) <= 0, 6)
                 check(bool(died), "killed in the host's world, the client's died too", f"health {safe(lambda: health(1, mine))}")
         if "D" in parts:
+            for inst, ref in MADE:  # B's two stay alive, and its point can be < 25 m from D's (runs 171-172)
+                safe(lambda: uc(inst, ref + ".HealthComponent", "Suicide", {"bPreventRevival": True}))
             p = place(180)
             before = set(shared(1))
             mine = spawn(0, cls, p, yaw)
@@ -231,7 +237,9 @@ def main(parts):
             check(bool(rec) and rec["copy"], "a copy in the client's world")
             uc(0, mine, "K2_DestroyActor")
             gone = wait_for(lambda: rec and rec["id"] not in shared(1) and not near_of_class(1, short, p), 10) if rec else None
-            check(bool(gone), "the host's one removed: the client's copy went too")
+            check(bool(gone), "the host's one removed: the client's copy went too",
+                  f"still listed {rec['id'] in shared(1) if rec else '?'}, living there {len(near_of_class(1, short, p))}: "
+                  f"{[safe(lambda r=r: (r.split()[-1][-30:], round(health(1, r.split()[0])))) for r in near_of_class(1, short, p)]}")
     finally:
         for inst, ref in MADE:  # nothing left fighting the players
             safe(lambda: uc(inst, ref + ".HealthComponent", "Suicide", {"bPreventRevival": True}))

@@ -163,6 +163,18 @@ def main(pids):
         check(wait(lambda: not st(giver)["transferOpen"], 4), f"{who}: Escape closed the transfer screen")
         check(wait(lambda: not call("ue.find", {"name": box.split()[0], "limit": 1}, inst=giver) or not st(giver)["giveBox"], 3), f"{who}: the hidden chest is gone")
         time.sleep(1)
+    # A controller's interact button (X; simulated by the mod) in front of the stand-in opens the transfer too
+    face_standin(1)
+    call("coop.set", {"pad": 0}, inst=1)
+    time.sleep(0.3)
+    call("coop.set", {"pad": 0x4000}, inst=1)
+    opened = wait(lambda: st(1)["transferOpen"], 3)
+    call("coop.set", {"pad": -1}, inst=1)
+    check(opened, "client: a controller's X in front of the stand-in opens the transfer screen", st(1).get("lastGift"))
+    if opened:
+        games[1].key("ESCAPE")
+        wait(lambda: not st(1)["transferOpen"], 4)
+    time.sleep(1)
     # A weapon and an armor with a mod each, host to client: the client's copies carry the same mods.
     for kind, item_name, mod_name in (("Weapon", "Weapon_PI_Standard_Unique_ZanesPistol_C", "WeaponMod_Barrel_Silencer_PI_Standard_C"),
                                       ("ArmorItem", "Armor_ED_Zane_C", "ArmorMod_Armoring_DefensivePlates_C")):

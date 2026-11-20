@@ -146,6 +146,40 @@ LONG CALLBACK fault_guard(EXCEPTION_POINTERS* e) {
     e->ContextRecord->Rip = reinterpret_cast<DWORD64>(&throw_av);
     return EXCEPTION_CONTINUE_EXECUTION;
 }
+// Test copies: an access violation the core's guard doesn't take is written down before the game's crash handler runs
+// (its UEMinidump came out empty: runs 161, 164): where (module + offset), what address, and the code addresses found
+// on the stack (a rough call stack), at most 6 a run. A first-chance note: the game may still handle it.
+uintptr_t g_game_hi;
+std::string code_at(uintptr_t a) {
+    char b[96];
+    if (a >= reinterpret_cast<uintptr_t>(g_base) && a < g_game_hi) snprintf(b, sizeof b, "game+0x%llx", static_cast<unsigned long long>(a - reinterpret_cast<uintptr_t>(g_base)));
+    else if (a >= g_self_lo && a < g_self_hi) snprintf(b, sizeof b, "core+0x%llx", static_cast<unsigned long long>(a - g_self_lo));
+    else {
+        HMODULE m = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(a), &m) && m) {
+            GetModuleFileNameA(m, name, MAX_PATH);
+            const char* slash = strrchr(name, 92);  // a backslash
+            snprintf(b, sizeof b, "%s+0x%llx", slash ? slash + 1 : name, static_cast<unsigned long long>(a - reinterpret_cast<uintptr_t>(m)));
+        } else snprintf(b, sizeof b, "0x%llx", static_cast<unsigned long long>(a));
+    }
+    return b;
+}
+LONG CALLBACK fault_note(EXCEPTION_POINTERS* e) {
+    static std::atomic<int> notes{0};
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || notes.fetch_add(1) >= 6) return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t addr = e->ExceptionRecord->NumberParameters >= 2 ? e->ExceptionRecord->ExceptionInformation[1] : 0;
+    std::string line = "fault: access violation at " + code_at(e->ContextRecord->Rip) + ", address " + code_at(addr) + "; stack:";
+    const auto* sp = reinterpret_cast<const uintptr_t*>(e->ContextRecord->Rsp);
+    for (int i = 0, found = 0; i < 160 && found < 12; i++) {
+        uintptr_t v = sp[i];
+        bool code = (v >= reinterpret_cast<uintptr_t>(g_base) && v < g_game_hi) || (v >= g_self_lo && v < g_self_hi);
+        if (code) line += " " + code_at(v), found++;
+    }
+    logmsg("%s", line.c_str());
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 struct GuardScope {
     GuardScope() { ++t_guard; }
     ~GuardScope() { --t_guard; }
@@ -546,7 +580,8 @@ DWORD WINAPI init_thread(LPVOID) {
     std::string coop_why;
     reg("coop.status", [](const Value&) { return coop::status(); });
     reg("coop.fights", [](const Value&) { return coop::fights(); });
-    reg("coop.spawned", [](const Value& p) { return coop::spawned(p); });  // test: spawn an NPC here, or list the shared ones  // test: whom the NPCs fight here, and the deciding word
+    reg("coop.spawned", [](const Value& p) { return coop::spawned(p); });
+    reg("story.title", [](const Value& p) { return story::title_test(p); });  // test: a quest's title, shown as on a forced outcome  // test: spawn an NPC here, or list the shared ones  // test: whom the NPCs fight here, and the deciding word
     reg("coop.set", [](const Value& p) { return coop::set_options(p); });
     reg("coop.steamProbe", [](const Value&) { return coop::steam_probe(); }, false);  // waits: off the game thread
     reg("coop.lobbyProbe", [](const Value&) { return coop::lobby_probe(); }, false);  // waits: off the game thread
@@ -605,7 +640,10 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID) {
     g_self_hi = g_self_lo + reinterpret_cast<IMAGE_NT_HEADERS64*>(me + reinterpret_cast<IMAGE_DOS_HEADER*>(me)->e_lfanew)->OptionalHeader.SizeOfImage;
     AddVectoredExceptionHandler(1, fault_guard);
     g_base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    g_game_hi = reinterpret_cast<uintptr_t>(g_base) +
+                reinterpret_cast<IMAGE_NT_HEADERS64*>(g_base + reinterpret_cast<IMAGE_DOS_HEADER*>(g_base)->e_lfanew)->OptionalHeader.SizeOfImage;
     std::string dir = env("TOW2_SANDBOX_DIR");
+    if (!dir.empty()) AddVectoredExceptionHandler(0, fault_note);  // test copies only
     if (dir.empty()) {
         char me[MAX_PATH];
         GetModuleFileNameA(self, me, MAX_PATH);

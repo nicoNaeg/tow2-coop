@@ -20,6 +20,7 @@ struct Guid { uint8_t b[16]; bool operator<(const Guid& o) const { return memcmp
 struct Quest {
     Guid id;
     std::string name;
+    uint8_t title[16] = {};  // its title as a LocString: table id -1, string 0 (the quest node), the quest's string table
     std::vector<int32_t> addendums;
 };
 struct Probe {
@@ -69,7 +70,7 @@ struct State {
     std::map<std::pair<int, int32_t>, size_t> quest_probe;  // (quest index, 0 = state | addendum id) -> probe
     std::map<Guid, size_t> global_probe;                    // global -> probe
     size_t cursor = 0;
-    Call get_state, addendum_triggered, is_global, start, mention, trigger_addendum, set_global, debug_advance;
+    Call get_state, addendum_triggered, is_global, start, mention, trigger_addendum, set_global, debug_advance, notify;
     ue::UObject* qm = nullptr;
     // reliable channel, each way
     std::vector<Event> log;     // our changes since this session started (seq = index + 1)
@@ -112,7 +113,9 @@ bool load(std::string& err) {
     if (!qb) return err = "QuestBundles layout", false;
     int esz = ue::prop_size(inner), n = 0;
     const uint8_t* data = arr_data(reinterpret_cast<const uint8_t*>(set), bundles, n);
-    ue::FProperty *p_name = ue::find_prop(qb, "Name"), *p_id = ue::find_prop(qb, "ID");
+    ue::FProperty *p_name = ue::find_prop(qb, "Name"), *p_id = ue::find_prop(qb, "ID"), *p_table = ue::find_prop(qb, "StringTableName");
+    ue::FProperty* p_qnode = ue::find_prop(qb, "QuestNode");
+    ue::FProperty* p_qnode_id = p_qnode ? ue::find_prop(ue::struct_of(p_qnode), "NodeID") : nullptr;
     if (!p_name || !p_id || n <= 0 || n > 5000) return err = "QuestBundle fields", false;
     static const char* kObjectiveArrays[] = {"GenericObjectiveNodes", "GlobalVariableObjectiveNodes", "TalkObjectiveNodes", "KillObjectiveNodes",
                                              "AcquireItemObjectiveNodes", "ObjectiveBankNodes", "BranchCompleteObjectiveNodes"};
@@ -122,6 +125,12 @@ bool load(std::string& err) {
         Quest q;
         memcpy(q.id.b, b + ue::prop_offset(p_id), 16);
         q.name = fstr(b + ue::prop_offset(p_name));
+        if (p_table && p_qnode_id) {  // probe 118: GetLocStringText of {-1, 0, "quests/01_jp/0101_pq_intro"} = "A Cause Worth Killing For"
+            int32_t table = -1;
+            memcpy(q.title, &table, 4);
+            memcpy(q.title + 4, b + ue::prop_offset(p_qnode) + ue::prop_offset(p_qnode_id), 4);
+            memcpy(q.title + 8, b + ue::prop_offset(p_table), 8);
+        }
         for (const char* an : kObjectiveArrays) {
             ue::FProperty* ap = ue::find_prop(qb, an);
             ue::FProperty* ain = ue::array_inner(ap);
@@ -169,6 +178,7 @@ bool load(std::string& err) {
         !g.set_global.init(gs, "SetGlobalValue"))
         return err = "quest/global script functions missing", false;
     g.debug_advance.init(qs, "DebugAdvanceQuest");  // optional: without it, outcomes are written (advance_frame)
+    if (ue::UClass* nh = ue::find_class("/Script/Arkansas.NotificationHelpers")) g.notify.init(ue::cdo(nh), "ShowGenericNotification");  // optional
     return true;
 }
 
@@ -303,11 +313,25 @@ bool ensure_loaded() {
 uint64_t forced_completions() { return g.forced; }
 
 namespace {
+// No banner came: the game's own notification shows the quest's title (shortcut: the title only, no "completed" line;
+// a string of the game's for that is still to find).
+bool show_title(const Guid& id) {
+    auto at = g.quest_by_id.find(id);
+    if (!g.notify.fn || at == g.quest_by_id.end() || !g.notify.off.count("String") || !g.notify.off.count("OverrideIcon")) return false;
+    alignas(16) uint8_t b[64] = {};
+    memcpy(b + g.notify.off.at("String"), g.quests[at->second].title, 16);
+    b[g.notify.off.at("OverrideIcon")] = 2;  // GenericIcon
+    g.notify.run(b);
+    return true;
+}
+
 void write_outcome(const Guid& id, int32_t target) {  // the old way: the state written (no banner, no XP here)
     uint8_t* quest = find_quest && g.qm ? find_quest(g.qm, id.b) : nullptr;
     if (!quest || !ue::readable(quest + kQuestStateOffset, 1)) return;
     quest[kQuestStateOffset] = static_cast<uint8_t>(target);
     if (target == 2) g.forced++;  // no quest XP from this game for it: the other side's comes (coop.cpp)
+    if (target == 2 || target == 3) show_title(id);
+
 }
 
 // The other world's outcome, walked here: DebugAdvanceQuest completes the quest's current objectives the game's way
@@ -325,8 +349,10 @@ void advance_frame() {
             done = true;
         } else if (!done && g.now >= a.next) {
             alignas(16) uint8_t b[64] = {};
-            g.debug_advance.put(b, "QuestID", a.id);
-            g.debug_advance.run(b);
+            // a quest not started here (a reload took it back: run 159) is started first, then walked
+            Call& step = local == 0 || local == 4 ? g.start : g.debug_advance;
+            step.put(b, "QuestID", a.id);
+            step.run(b);
             a.tries++, a.next = g.now + 1.0;
         }
         if (done) g.advancing.erase(g.advancing.begin() + static_cast<long>(i));
@@ -417,6 +443,20 @@ bool take_resync_request() {
     bool r = g.resync_wanted;
     g.resync_wanted = false;
     return r;
+}
+
+json title_test(const json& p) {  // test bridge, game thread
+    if (!ensure_loaded()) throw std::runtime_error("quests not loaded");
+    std::string name = p.get("quest").asString();
+    for (const Quest& q : g.quests) {
+        if (q.name != name) continue;
+        json r = json::object();
+        int32_t sid;
+        memcpy(&sid, q.title + 4, 4);
+        r.set("shown", show_title(q.id)).set("stringId", static_cast<double>(sid));
+        return r;
+    }
+    throw std::runtime_error("no quest " + name);
 }
 
 json status() {

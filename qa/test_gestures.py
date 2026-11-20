@@ -187,6 +187,7 @@ def main(parts):
         try:
             uc(1, hc, "SetGod", {"bEnabled": False})
             uc(1, hc, "SetPseudoGod", {"bEnabled": True})
+            call("ue.set", {"path": hc + ".bImmuneToFallDamage", "value": True}, inst=1)  # moved in front of the stand-in: no fall
             p = loc(1, puppet1)
             yaw = ev(1, puppet1 + ".K2_GetActorRotation()")["Yaw"]  # in front of it: its aim turns only so far from its body
             near = {"X": p["X"] + 500 * math.cos(math.radians(yaw)), "Y": p["Y"] + 500 * math.sin(math.radians(yaw)), "Z": p["Z"] + 10}

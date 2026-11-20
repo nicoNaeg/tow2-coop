@@ -156,6 +156,13 @@ def main(which):
                 check(bool(got), "the quest's XP reached both players",
                       f"host {xp0[0]} -> {s0.get('xp')} (credited {s0.get('questXpCredited')}), client {xp0[1]} -> {s1.get('xp')} "
                       f"(its own dropped {s1.get('xpBlocked')}); {s0.get('lastXp')}")
+        # the rare fallback (an outcome written: no banner of the game's) shows the quest's title in the game's notification
+        before = len([r for r in call("ue.find", {"name": "GenericNotificationEntry", "limit": 50}, inst=0) if "Default__" not in r])
+        t = safe(lambda: call("story.title", {"quest": "0101_PQ_Intro"}, inst=0), {})
+        time.sleep(0.5)
+        entries = [r for r in call("ue.find", {"name": "GenericNotificationEntry", "limit": 50}, inst=0) if "Default__" not in r]
+        check(t.get("shown") is True and t.get("stringId") == 0, "a written outcome shows the quest's title in the game's notification",
+              f"{t}, notification entries {before} -> {len(entries)}")
     if "B" in which:
         # B1: the client starts the same travel as the host (no hand-over). B2 (following off on the client): the
         # fallback, the host hands its campaign over once in the new map.

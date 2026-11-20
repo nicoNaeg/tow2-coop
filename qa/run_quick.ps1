@@ -61,10 +61,17 @@ Step 'companions follow the host' { python -I test_party.py }
 Step 'minimized host saves' { python -I test_minimized.py }
 Step 'public game (one account)' { python -I test_lobby.py }
 Step 'co-op combat' { python -I test_combat.py ABCDE $p[0] }  # first (a calm start), before the reloads: they bring the NPCs back
+python -I god.py | Out-Null  # the steps before may leave a player down or vulnerable (runs 168-169)
 Step 'weapon and gestures' { python -I test_gestures.py ABCDEFGHIJ }
+python -I god.py | Out-Null  # the steps before may leave a player down or vulnerable (runs 168-169)
 Step 'spawned enemies' { python -I test_spawned.py ABCD }
+python -I god.py | Out-Null
+Step 'hive waves' { python -I test_waves.py }
+python -I god.py | Out-Null  # the steps before may leave a player down or vulnerable (runs 168-169)
 Step 'death and reload' { python -I test_death.py ABCD $p[0] }
+python -I god.py | Out-Null  # the steps before may leave a player down or vulnerable (runs 168-169)
 Step 'world sync' { python -I test_world.py $p[0] }
+python -I god.py | Out-Null  # the steps before may leave a player down or vulnerable (runs 168-169)
 Step 'resync map travel' { python -I test_resync.py B2C }  # host leads (followed), host leads (fallback), client leads
 foreach ($i in 0, 1) { Get-ChildItem "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes" -ErrorAction SilentlyContinue | ForEach-Object { "crash report in copy ${i}: $($_.Name)" | Tee-Object -FilePath $log -Append } }
 Step 'no caught faults' {
@@ -77,6 +84,7 @@ Step 'no caught faults' {
     $bad | Select-Object -First 8
     "RESULT: $(if ($bad.Count) { 'FAIL' } else { 'PASS' }) ($($bad.Count) failure(s))"
 }
+foreach ($f in $coreLogs) { if (Test-Path $f) { Select-String -Path $f -Pattern 'fault: access violation' | Select-Object -Last 6 | ForEach-Object { "fault note: $($_.Line)" | Tee-Object -FilePath $log -Append } } }  # first-chance, test copies only
 & "$qa\close_copies.ps1" | Out-Host
 Set-Location $hub; python -I tools/gamepool/gamepool.py --config $cfg down 2>&1 | Select-Object -Last 1 | Out-Host
 New-Item -ItemType File -Force "$Out\memguard.stop" | Out-Null
