@@ -1,7 +1,11 @@
 # tow2-coop: two-player co-op for The Outer Worlds 2 (work in progress)
 
-Status: **v0.5.2, a test build: co-op through Steam (friends, or public games; no IP or port), or direct IP.**
-0.5.2: a controller in the co-op menu (Y opens it, the D-pad moves, A picks, B goes back) and for giving items (X in
+Status: **v0.5.3, a test build: co-op through Steam (friends, or public games; no IP or port), or direct IP.**
+0.5.3: a choice the other player's character can't take for real (a skill check) is taken past its lock when the leader
+picks it (0.5.1 did it only for a lock the test simulated; a real one restarted the conversation, a camera cut); a
+quest set without its banner shows "Quest Completed" (or "Quest Failed") and its title, in the game's language.
+Tested further: a door's wave of enemies, a fight against a squad of armed soldiers, ship travel, a new game together
+up to the first planet. 0.5.2: a controller in the co-op menu (Y opens it, the D-pad moves, A picks, B goes back) and for giving items (X in
 front of the other player); a hive's, a hatch's or a door's wave of enemies that starts in one game starts in the other
 too (before, its enemies could stay hidden in their hive there for a minute); a quest that has to be set without the
 game's banner shows its title in the game's notification. 0.5.1: the leader's pick is made in the other game even when that player's character couldn't take it (no restart),
@@ -209,8 +213,9 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
 - The friend's hits are told to the host by the game's "last hitter" of the enemy: a hit of the friend's in the same tenth
   of a second as a companion's on the same enemy is not counted.
 - Spawned enemies were tested with Ursopods spawned the way a spawner does (by the test), and the game's own hives and
-  floor hatches with mantisaur waves started by the test the game's way (`Encounter.ActivateWave`), not yet with a door
-  or a wave started by the story. When both games spawn one of the same kind more than 15 m apart, each gets a copy of
+  floor hatches with mantisaur waves and a door (`Spawner_Human_Door_OnceEver`), started by the test the game's way
+  (`Encounter.ActivateWave`). A wave started by the story or by the wave before it was not met in the test map (the
+  mod passes on a wave's start whatever caused it). When both games spawn one of the same kind more than 15 m apart, each gets a copy of
   the other's (one more enemy).
 - The co-op choice is in the main menu only (not in the pause menu: to start hosting, go back to the main menu). It is
   picked with the mouse, its number key or a controller (Y, the D-pad, A, B). The controller was tested with buttons
@@ -219,12 +224,17 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
 - In co-op the game's menus (pause, inventory, map, a flaw offer) no longer pause it: the world goes on, as in a
   multiplayer game.
 - In a conversation the other player sees the leader's choices as their own game shows them: a choice their character
-  can't take (a skill check, a flaw) shows as unavailable there, and is taken all the same when the leader picks it.
-  This was tested with a response the test made the other game treat as locked, not yet with a real skill check.
+  can't take (a skill check, a flaw) shows as unavailable there, and is taken all the same when the leader picks it,
+  without a restart. Tested with a real skill check (the light worker in the Order's headquarters, the host's skills
+  high, the friend's at 0). Following a conversation, the friend's game counts the leader's choices as the friend's:
+  it can offer the friend a flaw for them (for example Compulsive Liar after several lies). The leader's pick is told
+  by the line it leads to: when two of the leader's responses lead to the same line, the friend's game may take the
+  other one (the same line, no camera cut; that response's own effects, such as a skill check's XP, may differ).
 - Each game runs a conversation's effects: an item the NPC gives goes to both players; a payment (money, an item handed
   over, a bounty, a purchase) is taken from the leader only.
-- Co-op combat was tested against Ursopods (melee creatures) and an Order soldier fighting nearby; a large fight with
-  many armed humans was not tried yet.
+- Co-op combat was tested against Ursopods (melee creatures), an Order soldier fighting nearby, and a squad of up to
+  9 Protectorate soldiers (rifles, revolvers, a drone) the host attacked: up to 8 fought at once in both games, each
+  soldier's two copies stayed within 6 m.
 - The friend's character is kept by a private save the friend's game makes about 5 s after it changes (items, money,
   XP; at most one every 15 s), every 3 minutes, and before a hand-over that isn't a reload. On the host's reloads and
   after the friend's death the last kept one is used: what the friend gained in the last seconds is lost, more when the
@@ -232,12 +242,13 @@ can be deleted from the game's Load menu. Steam "Verify integrity of game files"
 - Giving items: E or a controller's X (its interact button) in front of the other player opens the screen; in the
   screen the game's own controls apply. The bots test the giving with the game's inventory functions, not with mouse
   clicks in the screen.
-- Following a travel was tested with the game's travel into and out of an interior and with fast travel; ship travel
-  was not tried yet.
+- Following a travel was tested with the game's travel into and out of an interior, with fast travel, and with ship
+  travel (boarding the player ship, flying it to another planet's landing: the ship is then at the same place in both
+  games), started by the bots through the game's travel functions rather than the ship's console.
 - A quest one player completes is walked to the same end in the other game with the game's own quest steps (a step a
   second: the banner, the journal and the quest's XP come as usual). When that path ends the other way or gets stuck
-  (more than 15 steps or 30 s), the quest's state is set directly: no banner then, but the game's notification shows
-  the quest's title. A quest the other game had not started is started there first, then walked.
+  (more than 15 steps or 30 s), the quest's state is set directly: no banner then, but the game's notifications show
+  "Quest Completed" (or "Quest Failed") and the quest's title. A quest the other game had not started is started there first, then walked.
 - In a joined game the friend can't load one of their own saves (Continue, Load and Quickload bring back the host's
   current game): to play their own campaign, go back to the main menu first. After a death the friend comes back with
   the character as last kept (up to 3 minutes earlier). If the host is in a fight, that reload waits until the host's

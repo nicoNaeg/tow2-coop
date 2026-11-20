@@ -578,7 +578,7 @@ DWORD WINAPI init_thread(LPVOID) {
     });
     reg("coop.xp", [](const Value& p) { return coop::xp_test(static_cast<int>(p.get("xp").asInt(10)), static_cast<int>(p.get("reason").asInt(0))); });  // test
     std::string coop_why;
-    reg("coop.status", [](const Value&) { return coop::status(); });
+    reg("coop.status", [](const Value&) { Value s = coop::status(); s.set("frameErrors", static_cast<double>(g_coop_errors)); return s; });  // + the aborted frames (tests)
     reg("coop.fights", [](const Value&) { return coop::fights(); });
     reg("coop.spawned", [](const Value& p) { return coop::spawned(p); });
     reg("story.title", [](const Value& p) { return story::title_test(p); });  // test: a quest's title, shown as on a forced outcome  // test: spawn an NPC here, or list the shared ones  // test: whom the NPCs fight here, and the deciding word

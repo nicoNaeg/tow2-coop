@@ -161,6 +161,7 @@ def main(parts):
     def place(turn):  # 14-23 m away in the part's own direction (parts stay > 15 m apart: the mod pairs spawns by place),
         # on the ground: a point past a ledge drops the bear out of the test (runs 131, 143)
         tries = [(d, t) for d in (2000, 1700, 2300, 1400) for t in (0, 20, -20, 35, -35)]
+        tries += [(d, t) for d in (900, 600) for t in (0, 20, -20)]  # nearer the host, on its own ground (runs 171, 174, 175: a swing at a bear put anywhere missed)
         for d, t in tries:
             a = math.radians(yaw + turn + t)
             q = {"X": me["X"] + d * math.cos(a), "Y": me["Y"] + d * math.sin(a), "Z": me["Z"]}

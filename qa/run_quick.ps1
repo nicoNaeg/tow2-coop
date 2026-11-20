@@ -67,12 +67,16 @@ python -I god.py | Out-Null  # the steps before may leave a player down or vulne
 Step 'spawned enemies' { python -I test_spawned.py ABCD }
 python -I god.py | Out-Null
 Step 'hive waves' { python -I test_waves.py }
+python -I god.py | Out-Null
+Step 'big fight' { python -I test_bigfight.py }  # once a pair: the squad stays dead
 python -I god.py | Out-Null  # the steps before may leave a player down or vulnerable (runs 168-169)
 Step 'death and reload' { python -I test_death.py ABCD $p[0] }
 python -I god.py | Out-Null  # the steps before may leave a player down or vulnerable (runs 168-169)
 Step 'world sync' { python -I test_world.py $p[0] }
 python -I god.py | Out-Null  # the steps before may leave a player down or vulnerable (runs 168-169)
 Step 'resync map travel' { python -I test_resync.py B2C }  # host leads (followed), host leads (fallback), client leads
+Step 'real skill check' { python -I test_skillcheck.py }  # in the Order's headquarters (it travels there)
+Step 'ship travel' { python -I test_ship.py }  # last: it leaves the test map
 foreach ($i in 0, 1) { Get-ChildItem "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes" -ErrorAction SilentlyContinue | ForEach-Object { "crash report in copy ${i}: $($_.Name)" | Tee-Object -FilePath $log -Append } }
 Step 'no caught faults' {
     $bad = @(foreach ($f in $coreLogs) {

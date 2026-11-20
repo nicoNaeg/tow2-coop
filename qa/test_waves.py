@@ -2,7 +2,8 @@
 one world is started in the other. The test starts a wave in one world only (the game's Encounter.ActivateWave, as a
 player's approach or the story would) and checks the other world's wave starts and its enemies come out of their
 hives there too (probe 116: they stayed hidden for a minute); then a death in the host's world is one in the client's.
-Both directions: a wave the host's world starts, then one the client's starts.
+Both directions: a wave the host's world starts, then one the client's starts; then a wave whose enemy comes out of
+a door (Spawner_Human_Door_OnceEver), started by the host's world.
 Usage: python -I test_waves.py"""
 import math
 import sys
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tow2 import call  # noqa: E402
 
 SPOT = {"X": -81600.0, "Y": 41000.0, "Z": 1300.0}  # 0601_CL_P, the mantisaur nest (hives and floor hatches)
+DOOR = {"X": -41667.0, "Y": 10449.0, "Z": 2995.0}  # 0601_CL_P, 25 m from an encounter whose wave 1 comes out of a door
 
 
 def safe(fn, default=None):
@@ -134,6 +136,26 @@ def main():
             for name2, k2 in used:
                 for x in waves(i, refs[name2])[k2][1]:
                     safe(lambda x=x: call("ue.call", {"ref": x + ".HealthComponent", "fn": "Suicide"}, inst=i))
+        # a door: its wave started by the host's world, its enemy comes out of the door in both
+        tp(0, DOOR)
+        time.sleep(0.5)
+        tp(1, {"X": DOOR["X"] - 200, "Y": DOOR["Y"], "Z": DOOR["Z"]})
+        time.sleep(5)
+        h, c = encounters(0), encounters(1)
+        door = None
+        for name in sorted(set(h) & set(c)):
+            for k, (a, b) in enumerate(zip(safe(lambda: waves(0, h[name]), []), safe(lambda: waves(1, c[name]), []))):
+                sp = safe(lambda: [str(p.get("Spawner")) for p in call("eval", {"expr": h[name] + ".EncounterWaves"}, inst=0)["value"][k]["AICharacters"]], [])
+                if a[0] == b[0] == "Inactive" and any("Door" in x for x in sp) and safe(lambda: not out(1, b[1][0]) and health(1, b[1][0]) > 0, False):
+                    door = (name, k)
+        if check(bool(door), "a door's wave waits in both worlds", str(door)):
+            name, k = door
+            call("ue.call", {"ref": h[name], "fn": "ActivateWave", "args": {"WaveIndex": k}}, inst=0)
+            theirs = waves(1, c[name])[k]
+            check(wait(lambda: waves(1, c[name])[k][0] != "Inactive", 6) and wait(lambda: out(1, theirs[1][0]), 8),
+                  "the host's world started it: its enemy came out of the door in the client's world too", str(waves(1, c[name])[k][0]))
+            for x in waves(0, h[name])[k][1]:
+                safe(lambda x=x: call("ue.call", {"ref": x + ".HealthComponent", "fn": "Suicide"}, inst=0))
     finally:
         for i in (0, 1):
             safe(lambda i=i: tp(i, start[i]))

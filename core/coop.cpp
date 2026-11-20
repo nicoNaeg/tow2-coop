@@ -77,7 +77,7 @@ struct Outgoing {  // sent until the other game acknowledges it (kInteractAck), 
     int sent;
 };
 constexpr uint32_t kMagic = 0x36433254;  // "T2C6": the last character is the protocol version, bump it on any packet change
-constexpr const char* kVersion = "0.5.2";
+constexpr const char* kVersion = "0.5.3";
 constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13, kTravel = 14, kClock = 15, kCombat = 16, kSpawns = 17, kSpawnOffers = 18, kWeaponMods = 19, kInteractAck = 20, kConversation = 21, kParty = 23, kWaves = 24;  // 22: 0.4.0's response pick
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";
@@ -4597,8 +4597,11 @@ int pick_response(int32_t node) {
     if (!arr->data || arr->num < 1) return 0;  // shortcut: no selectable response to stand in for it (all locked), the follower starts again there
     struct NArr { const uint8_t** data; int32_t num, max; };
     auto* nodes = reinterpret_cast<NArr*>(reinterpret_cast<uint8_t*>(s) + kScreenSelectableNodesOff);
-    if (!ue::readable(nodes, sizeof *nodes) || nodes->num != arr->num || !nodes->data || !ue::readable(nodes->data, static_cast<size_t>(nodes->num) * 8)) return 0;
-    for (int i = 0; i < arr->num; i++)  // the screen's own list, as the widgets show it (this build's layout)
+    if (!ue::readable(nodes, sizeof *nodes) || !nodes->data || nodes->num < arr->num || !ue::readable(nodes->data, static_cast<size_t>(nodes->num) * 8)) return 0;
+    // All selectable (a lock the test simulates): the node list is the selectable widgets' own, in order; a real lock
+    // (a skill check: probe 124) keeps every shown response there, locked ones too, in the conversation's order.
+    bool full_list = nodes->num != arr->num;
+    for (int i = 0; i < arr->num && !full_list; i++)  // the screen's own list, as the widgets show it (this build's layout)
         if (!arr->data[i] || !ue::readable(reinterpret_cast<uint8_t*>(arr->data[i]) + kRespNodeOff, 8) ||
             *reinterpret_cast<const uint8_t* const*>(reinterpret_cast<uint8_t*>(arr->data[i]) + kRespNodeOff) != nodes->data[i])
             return 0;
@@ -4608,10 +4611,11 @@ int pick_response(int32_t node) {
     const uint8_t* first_node = nodes->data[0];
     const uint8_t* node_ptr = *reinterpret_cast<const uint8_t* const*>(locked + kRespNodeOff);
     uint8_t flag = locked[kRespSelectableOff];
-    arr->data[0] = reinterpret_cast<ue::UObject*>(locked), locked[kRespSelectableOff] = 1, nodes->data[0] = node_ptr;
-    press(1);
+    arr->data[0] = reinterpret_cast<ue::UObject*>(locked), locked[kRespSelectableOff] = 1;
+    if (!full_list) nodes->data[0] = node_ptr;
+    press(1);  // (the game doesn't check its requirements again: the flag is enough, probe 124)
     if (arr->data == was.data && arr->num == was.num && arr->data[0] == reinterpret_cast<ue::UObject*>(locked)) arr->data[0] = first;
-    if (nodes->data == nwas.data && nodes->num == nwas.num && nodes->data[0] == node_ptr) nodes->data[0] = first_node;
+    if (!full_list && nodes->data == nwas.data && nodes->num == nwas.num && nodes->data[0] == node_ptr) nodes->data[0] = first_node;
     if (ue::alive(reinterpret_cast<ue::UObject*>(locked)) && *reinterpret_cast<const uint8_t* const*>(locked + kRespNodeOff) == node_ptr)
         locked[kRespSelectableOff] = flag;  // the same response still: its own flag back (a reused widget keeps its new one)
     return 2;

@@ -147,6 +147,15 @@ def main(host_pid, client_pid):
     check(safe(lambda: st(1)["character"]["source"] == "kept", False), "with its own new character", str(safe(lambda: st(1)["character"]["source"])))
     seen = wait_for(lambda: st(0).get("puppet", "none") != "none" and st(1).get("puppet", "none") != "none", 60, 2.0)
     check(bool(seen), "both see each other", f"{safe(lambda: st(0).get('puppet'))} / {safe(lambda: st(1).get('puppet'))}")
+    # Out of the intro together: the player ship, then the first planet's landing, by the game's travel (the intro's own
+    # scripted end is not played by the bots: 40 DebugAdvanceQuest steps of 0101_PQ_Intro left it in the intro, probe 126)
+    import subprocess
+    r = subprocess.run([sys.executable, "-I", "test_ship.py", "SHIP_0102_Landing_Pad"], cwd=str(Path(__file__).resolve().parent), capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        if line.startswith(("PASS", "FAIL", "info")):
+            print("  " + line, flush=True)
+    check(r.returncode == 0 and "0101_JP" in world(0) and world(1) == world(0), "both left the intro together for the first planet", world(1)[-30:])
+    check(safe(lambda: st(1)["character"]["source"] == "kept", False), "the client still plays its own new character there", str(safe(lambda: st(1)["character"]["source"])))
     print(f"RESULT: {'PASS' if not FAILS else 'FAIL'} ({FAILS} failure(s))")
     return 1 if FAILS else 0
 

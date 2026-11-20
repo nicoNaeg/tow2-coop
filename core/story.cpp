@@ -313,15 +313,22 @@ bool ensure_loaded() {
 uint64_t forced_completions() { return g.forced; }
 
 namespace {
-// No banner came: the game's own notification shows the quest's title (shortcut: the title only, no "completed" line;
-// a string of the game's for that is still to find).
-bool show_title(const Guid& id) {
+// No banner came: the game's own notifications say so, in the game's language: "Quest Completed" (or "Quest Failed"),
+// then the quest's title. The two lines are the UI string table's (table 1) 54 and 55 (probe 121, by GetLocStringText).
+bool show_title(const Guid& id, int32_t target) {
     auto at = g.quest_by_id.find(id);
     if (!g.notify.fn || at == g.quest_by_id.end() || !g.notify.off.count("String") || !g.notify.off.count("OverrideIcon")) return false;
-    alignas(16) uint8_t b[64] = {};
-    memcpy(b + g.notify.off.at("String"), g.quests[at->second].title, 16);
-    b[g.notify.off.at("OverrideIcon")] = 2;  // GenericIcon
-    g.notify.run(b);
+    auto show = [](const uint8_t loc[16], uint8_t icon) {
+        alignas(16) uint8_t b[64] = {};
+        memcpy(b + g.notify.off.at("String"), loc, 16);
+        b[g.notify.off.at("OverrideIcon")] = icon;
+        g.notify.run(b);
+    };
+    uint8_t status[16] = {};  // {table 1, string 54 or 55, no table name}
+    int32_t table = 1, line = target == 3 ? 55 : 54;
+    memcpy(status, &table, 4), memcpy(status + 4, &line, 4);
+    show(status, 2);                          // GenericIcon
+    show(g.quests[at->second].title, 3);      // None: the title under it
     return true;
 }
 
@@ -330,7 +337,7 @@ void write_outcome(const Guid& id, int32_t target) {  // the old way: the state 
     if (!quest || !ue::readable(quest + kQuestStateOffset, 1)) return;
     quest[kQuestStateOffset] = static_cast<uint8_t>(target);
     if (target == 2) g.forced++;  // no quest XP from this game for it: the other side's comes (coop.cpp)
-    if (target == 2 || target == 3) show_title(id);
+    if (target == 2 || target == 3) show_title(id, target);
 
 }
 
@@ -453,7 +460,7 @@ json title_test(const json& p) {  // test bridge, game thread
         json r = json::object();
         int32_t sid;
         memcpy(&sid, q.title + 4, 4);
-        r.set("shown", show_title(q.id)).set("stringId", static_cast<double>(sid));
+        r.set("shown", show_title(q.id, static_cast<int32_t>(p.get("outcome").asNumber(2)))).set("stringId", static_cast<double>(sid));
         return r;
     }
     throw std::runtime_error("no quest " + name);
