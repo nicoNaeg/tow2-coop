@@ -81,7 +81,7 @@ struct Outgoing {  // sent until the other game acknowledges it (kInteractAck), 
     int sent;
 };
 constexpr uint32_t kMagic = 0x37433254;  // "T2C7": the last character is the protocol version, bump it on any packet change
-constexpr const char* kVersion = "0.5.4";
+constexpr const char* kVersion = "0.6.0";
 constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13, kTravel = 14, kClock = 15, kCombat = 16, kSpawns = 17, kSpawnOffers = 18, kWeaponMods = 19, kInteractAck = 20, kConversation = 21, kParty = 23, kWaves = 24;  // 22: 0.4.0's response pick
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";

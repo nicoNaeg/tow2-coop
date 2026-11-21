@@ -1,7 +1,7 @@
 # tow2-coop: two-player co-op for The Outer Worlds 2 (work in progress)
 
-Status: **v0.5.4, a test build: co-op through Steam (friends, or public games; no IP or port), or direct IP.**
-0.5.4: a quest item either player gets (a key, a pass, a sample) goes to both, and after joining the friend holds the
+Status: **v0.6.0, a test build: co-op through Steam (friends, or public games; no IP or port), or direct IP.**
+0.6.0: a quest item either player gets (a key, a pass, a sample) goes to both, and after joining the friend holds the
 host's; a loose item one player picks up from the ground is gone in the other game too, and the host's save keeps it
 gone; a switch or a radio one player uses takes the same state in the other game. 0.5.3: a choice the other player's character can't take for real (a skill check) is taken past its lock when the leader
 picks it (0.5.1 did it only for a lock the test simulated; a real one restarted the conversation, a camera cut); a
@@ -26,7 +26,7 @@ map change no longer waits for a save: when one player travels, the other starts
 arrive together. Fights are shared: an enemy that spots either player starts the fight in both games, and the enemies
 spread over both players. Tested on one PC with two copies (runs 70-111); the first real session across two PCs
 (2026-11-17, beta.4) ran the earlier features. 0.3.0 to 0.5.1 were tested on one PC too (runs 112-170).
-Use 0.5.4 on both PCs (another version on the other PC does not connect; the log says so). Two independent copies of
+Use 0.6.0 on both PCs (another version on the other PC does not connect; the log says so). Two independent copies of
 the game share one campaign owned by the host: the client joins by receiving the host's save, each player controls their
 own character, sees the other (position, rotation, walk/idle animation, the player's look, armor and helmet changes),
 and the host owns NPC health and deaths, quest progress, door states and container contents; either player can lead a
