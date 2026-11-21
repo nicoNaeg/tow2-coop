@@ -99,7 +99,8 @@ def main():
             wait(lambda: node(0) != before, 4)
         if not check(lock is not None, "a response open to the host and locked for the client (a real skill check)", f"{shown(0)} / {shown(1)}"):
             return 1
-        s0 = status(1)
+        s0, h0 = status(1), status(0)
+        raw = h0.get("convShown")  # [node, open, the line it answers]
         k = [n for n, s in shown(0) if s].index(lock) + 1
         text = responses(0)[k - 1]
         before = node(0)
@@ -107,14 +108,17 @@ def main():
             uc(0, screen(0), f"OnResponse{k}InputAction")
             if wait(lambda: node(0) != before, 1.0):
                 break
+        after = node(0)
         took = wait(lambda: status(1).get("convBypassed", 0) > s0.get("convBypassed", 0)
                     or status(1).get("convPicksApplied", 0) > s0.get("convPicksApplied", 0), 6)
         time.sleep(2)
-        s1 = status(1)
+        s1, h1 = status(1), status(0)
         # the leader's pick is told by the line it led to: when another open response leads to the same line, the client
         # may take that one (the same line, no camera cut; run 177), else it takes the locked one past its lock
         check(took, f"the client took a response to the host's next line ({text[:50]!r})",
-              f"past the lock {s0.get('convBypassed')} -> {s1.get('convBypassed')}, an open one {s0.get('convPicksApplied')} -> {s1.get('convPicksApplied')}")
+              f"past the lock {s0.get('convBypassed')} -> {s1.get('convBypassed')}, an open one {s0.get('convPicksApplied')} -> {s1.get('convPicksApplied')}"
+              f" (picks the host told {h0.get('convPicksSent')} -> {h1.get('convPicksSent')}, the client's own steps {s0.get('convAdvances')} -> {s1.get('convAdvances')};"
+              f" the host's line {before} -> {after}, shown {raw}, the host's own input dropped {h0.get('convBlocked')} -> {h1.get('convBlocked')})")
         check(s1.get("convJumps", 0) == s0.get("convJumps", 0), "the same response, no restart (no camera cut)",
               f"restarts {s0.get('convJumps')} -> {s1.get('convJumps')}")
         check(wait(lambda: node(1) == node(0) or (not active(0) and not active(1)), 8), "both at the host's next line",

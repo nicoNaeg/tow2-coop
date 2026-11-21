@@ -53,15 +53,18 @@ def squad():
 
 
 def strike(inst, target, n=4):
-    """The player swings its blade at the target from 1.6 m (as test_spawned.swings)."""
-    b, me = loc(inst, target), loc(inst, "pawn")
-    a = math.atan2(me["Y"] - b["Y"], me["X"] - b["X"])
-    spot = {"X": b["X"] + 160 * math.cos(a), "Y": b["Y"] + 160 * math.sin(a), "Z": b["Z"] + 20}
-    teleport(inst, spot, b)
+    """The player swings its blade at the target from 1.6 m (as test_spawned.swings), placed again before each swing:
+    a light soldier steps back after a hit (probe 128: the first swing hit, the next ones missed 8-9 m away)."""
+    def place():
+        b, me = loc(inst, target), loc(inst, "pawn")
+        a = math.atan2(me["Y"] - b["Y"], me["X"] - b["X"])
+        teleport(inst, {"X": b["X"] + 160 * math.cos(a), "Y": b["Y"] + 160 * math.sin(a), "Z": b["Z"] + 20}, b)
+    place()
     uc(inst, "pawn.EquipmentComponent", "EquipWeaponFromSlot", {"SlotIndex": 0, "bInstantEquip": True, "bStartingCombat": False})
     time.sleep(0.5)
     w = call("eval", {"expr": "pawn.GetCurrentWeapon()"}, inst=inst)["value"].split()[0]
     for _ in range(n):
+        safe(place)
         uc(inst, w, "BeginPrimaryTrigger")
         time.sleep(0.12)
         uc(inst, w, "EndPrimaryTrigger", {"bForceEnd": False})
@@ -91,10 +94,12 @@ def main():
         names = {n for n, _, _ in sq}
         fought_h = fought_c = 0
         hit = [False, False]
+        on_client = 0  # soldiers the host's world sets on the client: those hit the client in the client's world
         apart = []
         for _ in range(20):  # 40 s
             time.sleep(2)
             fh = {k: v for k, v in fights(0).items() if k in names}
+            on_client = max(on_client, sum(1 for v in fh.values() if v.get("word") == 2))
             fought_h = max(fought_h, sum(1 for v in fh.values() if v.get("word") in (1, 2)))
             fc = {k: v for k, v in fights(1).items() if k in names}
             fought_c = max(fought_c, sum(1 for v in fc.values() if v.get("here") in (1, 2) or v.get("word") in (1, 2)))
@@ -107,24 +112,30 @@ def main():
                         apart.append(d)
         check(fought_h >= 3, "the squad fights the players in the host's world", f"up to {fought_h} at once")
         check(fought_c >= 3, "and in the client's world", f"up to {fought_c} at once")
-        check(hit[0] and hit[1], "both players took hits in their own world", f"host {hit[0]}, client {hit[1]}")
+        # the AI picks whom to fight: a squad the host attacked may all stay on the host (runs 179-180: 6 of 6)
+        check(hit[0] and (hit[1] or not on_client), "each player took the hits of the soldiers fighting them",
+              f"host {hit[0]}, client {hit[1]} (soldiers on the client: up to {on_client})")
         within = sum(1 for d in apart if d < 6)
         check(apart and within >= 0.9 * len(apart), "each fighting soldier's two copies stay within 6 m",
               f"{within}/{len(apart)} samples, max {max(apart) if apart else 0:.1f} m")
         alive = [(n, a, b) for n, a, b in sq if safe(lambda a=a: health(0, a), 0) > 0]
-        if alive:
-            n, a, b = alive[0]
-            h0 = health(0, a)
-            got = False
-            for _ in range(3):  # a swing can miss (the soldier moves): again, as a player would
+        got, tried = False, []
+        for n, a, b in alive[:3]:  # a swing can miss (the soldier moves or dodges): again, then another soldier
+            h0, c0 = health(0, a), safe(lambda b=b: health(1, b), 0)
+            for _ in range(2):
                 strike(1, b)
                 t0 = time.time()
-                while time.time() - t0 < 4 and not got:
-                    got = safe(lambda: health(0, a), h0) < h0 - 5
+                while time.time() - t0 < 3 and not got:
+                    got = safe(lambda a=a: health(0, a), h0) < h0 - 5
                     time.sleep(0.25)
                 if got:
                     break
-            check(got, "the client's own hits on a soldier reached the host's copy", f"{n[:30]}: {h0:.0f} -> {safe(lambda: health(0, a)):.0f}")
+            # its copy in the client's world: hit there but not on the host = a hit not passed on; neither = missed
+            tried.append(f"{n[:24]}: host {h0:.0f} -> {safe(lambda a=a: health(0, a), 0):.0f}, client's {c0:.0f} -> {safe(lambda b=b: health(1, b), 0):.0f}")
+            if got:
+                break
+        if alive:
+            check(got, "the client's own hits on a soldier reached the host's copy", "; ".join(tried))
         for n, a, b in sq:
             safe(lambda a=a: uc(0, a + ".HealthComponent", "Suicide", {"bPreventRevival": True}))
         t0 = time.time()

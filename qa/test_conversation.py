@@ -56,11 +56,16 @@ def node(inst):
 
 
 def screen(inst):
+    """The conversation screen on show: an earlier conversation's screen can stay, hidden but maybe still flagged visible
+    (probe 131: two ConversationWidget_BP_C after the conversation test), so the one in the viewport comes first."""
+    vis = []
     for row in call("ue.find", {"class": "/Script/Arkansas.ConversationWidget", "limit": 10}, inst=inst):
         ref = row.split()[0]
         if "Default__" not in row and safe(lambda: uc(inst, ref, "IsVisible")["ReturnValue"], False):
-            return ref
-    return None
+            if safe(lambda: uc(inst, ref, "IsInViewport")["ReturnValue"], False):
+                return ref
+            vis.append(ref)
+    return vis[0] if vis else None
 
 
 def responses(inst):  # the screen's selectable response texts

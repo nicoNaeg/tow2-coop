@@ -5591,7 +5591,7 @@ json status() {
         json shown = json::array();
         for (const Shown& r : shown_responses(conv_screen())) {
             json e = json::array();
-            e.push(static_cast<double>(r.node)).push(r.selectable);
+            e.push(static_cast<double>(r.node)).push(r.selectable).push(static_cast<double>(r.parent));
             shown.push(e);
         }
         s.set("convShown", shown);

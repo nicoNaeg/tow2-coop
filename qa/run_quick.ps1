@@ -77,7 +77,7 @@ python -I god.py | Out-Null  # the steps before may leave a player down or vulne
 Step 'resync map travel' { python -I test_resync.py B2C }  # host leads (followed), host leads (fallback), client leads
 Step 'real skill check' { python -I test_skillcheck.py }  # in the Order's headquarters (it travels there)
 Step 'ship travel' { python -I test_ship.py }  # last: it leaves the test map
-foreach ($i in 0, 1) { Get-ChildItem "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes" -ErrorAction SilentlyContinue | ForEach-Object { "crash report in copy ${i}: $($_.Name)" | Tee-Object -FilePath $log -Append } }
+foreach ($i in 0, 1) { Get-ChildItem "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes" -ErrorAction SilentlyContinue | ForEach-Object { "crash report in copy ${i}: $($_.Name)" | Tee-Object -FilePath $log -Append; Copy-Item $_.FullName $Out -Recurse -Force } }  # the next start clears the folder (run 178's dump lost)
 Step 'no caught faults' {
     $bad = @(foreach ($f in $coreLogs) {
         if (-not (Test-Path $f)) { continue }
