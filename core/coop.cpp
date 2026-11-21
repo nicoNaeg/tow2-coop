@@ -38,6 +38,7 @@ std::atomic<uint32_t> ev_frame{1};
 std::atomic<uint8_t> my_shots{0}, my_swings{0}, my_swing_kind{0}, my_reloads{0};
 std::atomic<bool> my_aiming{false};
 uint32_t trigger_event_name = 0;
+uint32_t actor_destroyed_name = 0;  // SaveGameManager.OnActorDestroyed: the save notes an actor gone (a loose item taken)
 uint32_t ev_seen[128];
 uint32_t ev_log[32];            // test bridge: the last weapon events heard (frame << 8 | event), before de-duplication
 std::atomic<uint32_t> ev_log_n{0};
@@ -58,11 +59,14 @@ struct Observed {
 };
 std::mutex obs_mu;
 std::vector<Observed> observed;
+std::vector<uint64_t> picked_up;  // path ids of level-placed loose items taken here (obs_mu)
 volatile bool applying_remote = false;  // set while we apply a remote change: its events must not echo back
 #pragma pack(push, 1)
 struct InteractMsg {
     uint32_t eid;   // sender-unique event id (dedupe of the 3 copies)
-    uint8_t kind;   // 1 door state, 2 item taken, 3 item stored, 4 XP earned, 5 item given, 6 gift received (id: its eid)
+    uint8_t kind;   // 1 door state, 2 item taken, 3 item stored, 4 XP earned, 5 item given, 6 gift received (id: its eid),
+                    // 7 quest XP, 8 a loose item picked up, 9 a quest item's count (path), 10 quest items asked for,
+                    // 11 an interaction state (a switch, a radio)
     uint64_t id;    // fnv64 of the actor path (level-placed actors have the same path in both worlds); XP: EXPGainReason;
                     // gift: item level | rarity << 32
     int32_t a;      // door: EOCLState; items: count; XP: amount before the receiver's own multipliers
@@ -76,8 +80,8 @@ struct Outgoing {  // sent until the other game acknowledges it (kInteractAck), 
     double next, until;
     int sent;
 };
-constexpr uint32_t kMagic = 0x36433254;  // "T2C6": the last character is the protocol version, bump it on any packet change
-constexpr const char* kVersion = "0.5.3";
+constexpr uint32_t kMagic = 0x37433254;  // "T2C7": the last character is the protocol version, bump it on any packet change
+constexpr const char* kVersion = "0.5.4";
 constexpr uint16_t kState = 1, kHello = 2, kBye = 3, kEnemies = 4, kDamage = 5, kResync = 8, kResyncRequest = 9, kInteract = 10, kDamageAck = 11, kLook = 12, kAppearance = 13, kTravel = 14, kClock = 15, kCombat = 16, kSpawns = 17, kSpawnOffers = 18, kWeaponMods = 19, kInteractAck = 20, kConversation = 21, kParty = 23, kWaves = 24;  // 22: 0.4.0's response pick
 constexpr const char* kPuppetClass = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Male.Townie_DockWorker_Male_C";
 constexpr const char* kPuppetClassFemale = "/Game/Blueprints/NPC/Townies/Base_Townie_Variants/Townie_DockWorker_Female.Townie_DockWorker_Female_C";
@@ -350,6 +354,21 @@ struct Ctx {
     uint64_t gifts_sent = 0, gifts_received = 0, gifts_returned = 0;
     std::string last_gift;
     bool opt_gifts = true;  // test switch: false = take no gift and answer none (the giver gets it back)
+    ue::UClass* pickup_class = nullptr;            // loose items in the world (/Script/Arkansas.Pickup)
+    ue::UClass* icomp_class = nullptr;             // InteractableComponent: a switch's or a radio's interaction state
+    std::unordered_map<uint64_t, ue::UObject*> states, states_scan;  // those components by path id (a scan pass)
+    std::vector<uint64_t> state_ids;               // polled in turn
+    size_t state_cursor = 0;
+    std::unordered_map<uint64_t, int32_t> state_last, state_remote;  // last polled here; the other world's last word
+    std::unordered_map<uint64_t, int32_t> state_check;  // a use replayed here: the state it must end in (next poll)
+    uint64_t states_sent = 0, states_applied = 0;
+    std::unordered_set<uint64_t> pickups_gone;     // level-placed loose items taken in either world: none here
+    uint64_t pickups_sent = 0, pickups_applied = 0;
+    std::map<ue::UClass*, int32_t> qitems;          // our player's quest items as last seen, for gains
+    ue::UObject* qitems_pawn = nullptr;
+    double next_qitems = 0;
+    uint64_t qitems_sent = 0, qitems_given = 0;
+    std::vector<std::string> qitems_dropped;      // quest items our game took away by itself (a quest step), newest last
     bool opt_give_hold = false;  // test switch: the chest is not emptied (a test puts a modded item in it first)
     double reload_handed_at = -1e9;   // host: when it sent the save its game is loading (no hand-over once loaded)
     bool died = false, campaign_wanted = false;  // client: dead now; the host's current game is asked for
@@ -517,6 +536,19 @@ void npc_kill(Npc& n) {
     ue::process_event(n.health, die.f, b);
 }
 
+// A loose item the other player picked up: destroyed here too, as the game does once it is taken (its save notes the
+// actor destroyed, probe 132: CompleteInteract, the item added, SaveGameManager.OnActorDestroyed).
+void remove_pickup(ue::UObject* o) {
+    static Fn d;
+    if (!base_fn(d, "/Script/Engine.Actor", "K2_DestroyActor")) return;
+    alignas(16) uint8_t b[16] = {};
+    bool was = applying_remote;
+    applying_remote = true;  // not told back
+    ue::process_event(o, d.f, b);
+    applying_remote = was;
+    g.pickups_applied++;
+}
+
 bool is_companion(ue::UObject* o);  // co-op combat, below
 
 // One slice of the object array per frame; a full pass replaces the registry.
@@ -525,6 +557,8 @@ void scan_step(ue::UObject* pawn) {
     if (!g.door_class) g.door_class = ue::find_class("/Script/Arkansas.Door");
     if (!g.container_class) g.container_class = ue::find_class("/Script/Arkansas.Container");
     if (!g.corpse_class) g.corpse_class = ue::find_class("/Script/Arkansas.Corpse");
+    if (!g.pickup_class) g.pickup_class = ue::find_class("/Script/Arkansas.Pickup");
+    if (!g.icomp_class) g.icomp_class = ue::find_class("/Script/Arkansas.InteractableComponent");
     if (!g.character_class) return;
     int total = ue::num_objects(), end = std::min(total, g.scan_cursor + 20000);
     for (int i = g.scan_cursor; i < end; i++) {
@@ -533,6 +567,24 @@ void scan_step(ue::UObject* pawn) {
         if ((g.door_class && ue::is_a(o, g.door_class)) || (g.container_class && ue::is_a(o, g.container_class)) ||
             (g.corpse_class && ue::is_a(o, g.corpse_class))) {
             if (ue::alive(o)) g.inter_scan[fnv64(ue::path_of(o))] = o;
+            continue;
+        }
+        if (g.pickup_class && ue::is_a(o, g.pickup_class)) {  // a loose item: level-placed ones have the same path in both
+            std::string path = ue::alive(o) ? ue::path_of(o) : std::string();
+            if (path.find("_UAID_") == std::string::npos) continue;  // dropped or spawned during play: this world's own
+            uint64_t id = fnv64(path);
+            if (g.pickups_gone.count(id)) remove_pickup(o);  // taken in the other world (maybe before it streamed in here)
+            else g.inter_scan[id] = o;
+            continue;
+        }
+        if (g.icomp_class && ue::is_a(o, g.icomp_class)) {  // a level-placed switch or radio (probe 139): its state
+            ue::UObject* owner = ue::outer_of(o);
+            if (!owner || !ue::alive(o) || !ue::alive(owner) || ue::is_a(owner, g.character_class) ||
+                (g.door_class && ue::is_a(owner, g.door_class)) || (g.container_class && ue::is_a(owner, g.container_class)) ||
+                (g.corpse_class && ue::is_a(owner, g.corpse_class)) || (g.pickup_class && ue::is_a(owner, g.pickup_class)))
+                continue;  // NPCs talk; doors, containers and loose items have their own sharing
+            std::string path = ue::path_of(o);
+            if (path.find("_UAID_") != std::string::npos) g.states_scan[fnv64(path)] = o;
             continue;
         }
         if (!ue::is_a(o, g.character_class) || !ue::alive(o)) continue;
@@ -572,6 +624,8 @@ void scan_step(ue::UObject* pawn) {
         // An NPC that did not come back went away (streamed out, destroyed): its pin went with its controller.
         g.npcs.swap(g.scanning);
         g.scanning.clear();
+        g.states.swap(g.states_scan), g.states_scan.clear(), g.state_ids.clear(), g.state_cursor = 0;
+        for (auto& kv : g.states) g.state_ids.push_back(kv.first);
         g.party.swap(g.party_scan);
         g.party_scan.clear();
         g.natives.swap(g.natives_scan);
@@ -1170,11 +1224,12 @@ void setup_watches() {
     uint32_t c = ue::make_name("ItemRemoved", false).index;          // IndianaCharacter.ItemRemoved: a dead NPC looted
     uint32_t d = ue::make_name("OnItemCountChangedInInventory", false).index;  // part of the player's stack left (run 70)
     uint32_t t = ue::make_name("TriggerEventBP", false).index;  // a weapon's visuals hear its events: fire, swing, reload
+    uint32_t x = ue::make_name("OnActorDestroyed", false).index;  // SaveGameManager: a loose item taken (probe 132)
     if (!b || !c || !d) return;
     int k = 0;
-    for (uint32_t x : {b, c, d, t})
-        if (x) watch[k++] = reinterpret_cast<void*>(static_cast<uintptr_t>(x));
-    trigger_event_name = t;
+    for (uint32_t w : {b, c, d, t, x})
+        if (w) watch[k++] = reinterpret_cast<void*>(static_cast<uintptr_t>(w));
+    trigger_event_name = t, actor_destroyed_name = x;
     watch_count.store(k, std::memory_order_release);
     g.watches_set = true;
 }
@@ -1203,9 +1258,16 @@ void queue_interact(uint8_t kind, uint64_t id, int32_t a, const std::string& pat
 // Game thread: turn observed events into messages.
 void process_observed() {
     std::vector<Observed> evs;
+    std::vector<uint64_t> picked;
     {
         std::lock_guard<std::mutex> lk(obs_mu);
-        evs.swap(observed);
+        evs.swap(observed), picked.swap(picked_up);
+    }
+    for (uint64_t id : picked) {  // loose items our player took: gone in the other world too (not in our own list: a
+        if (!g.have_peer || (!g.host && !join::joined())) break;  // reload brings them back here)
+        queue_interact(8, id, 0, "");
+        g.pickups_sent++;
+        g.last_interact = "sent a loose item picked up";
     }
     g.my_removals.erase(std::remove_if(g.my_removals.begin(), g.my_removals.end(), [](const std::pair<ue::UClass*, double>& r) { return g.now - r.second > 1.0; }),
                         g.my_removals.end());
@@ -1457,6 +1519,60 @@ void poll_doors() {
     }
 }
 
+// ---------------------------------------------------------------- switches and radios
+// An interactable's interaction state (a switch on or off, a radio playing: probe 139, the game's own use changed it in
+// that world only) is shared like a door's: polled in turn, a change sent, set in the other world the game's way
+// (SetInteractionState, its own handlers run). One the other world changed before it streamed in here is set on sight.
+int32_t interact_state(ue::UObject* comp) {
+    static Fn f;
+    if (!f.init(comp, "GetInteractState")) return -1;
+    alignas(16) uint8_t b[16] = {};
+    ue::process_event(comp, f.f, b);
+    int32_t v;
+    memcpy(&v, b + f.off("ReturnValue"), 4);
+    return v;
+}
+
+// bForceExecute: the state is set, then the interaction runs from it (a two-state switch: on to the other state).
+void set_interact_state(ue::UObject* comp, int32_t st, bool run) {
+    static Fn f;
+    if (!f.init(comp, "SetInteractionState")) return;
+    alignas(16) uint8_t b[16] = {};
+    memcpy(b + f.off("StateIn"), &st, 4);
+    b[f.off("bForceExecute")] = run ? 1 : 0;
+    bool was = applying_remote;
+    applying_remote = true;
+    ue::process_event(comp, f.f, b);
+    applying_remote = was;
+    g.states_applied++;
+}
+
+void poll_states() {
+    for (int k = 0; k < 16 && !g.state_ids.empty(); k++) {
+        uint64_t id = g.state_ids[g.state_cursor];
+        g.state_cursor = (g.state_cursor + 1) % g.state_ids.size();
+        auto it = g.states.find(id);
+        if (it == g.states.end() || !ue::alive(it->second)) continue;
+        int32_t st = interact_state(it->second);
+        if (st < 0) continue;  // no interaction states (a ladder: -1)
+        auto last = g.state_last.find(id);
+        auto remote = g.state_remote.find(id);
+        auto check = g.state_check.find(id);
+        if (check != g.state_check.end()) {  // a replayed use that ended elsewhere: the other world's state, plainly
+            if (st != check->second) set_interact_state(it->second, st = check->second, false);
+            g.state_check.erase(check);
+        } else if (last == g.state_last.end()) {  // first seen here: the other world's word, if it had one
+            if (remote != g.state_remote.end() && remote->second != st) set_interact_state(it->second, st = remote->second, false);
+        } else if (st != last->second && (remote == g.state_remote.end() || remote->second != st)) {
+            queue_interact(11, id, st | last->second << 8, "");  // to | from << 8
+            g.state_remote[id] = st;  // both worlds' word now
+            g.states_sent++;
+            g.last_interact = "sent " + ue::name_of(ue::outer_of(it->second)) + " -> state " + std::to_string(st);
+        }
+        g.state_last[id] = st;
+    }
+}
+
 void note_remote_door(ue::UObject* actor, int state) {
     for (auto& d : doors)
         if (d.actor == actor) d.remote = state;
@@ -1492,9 +1608,32 @@ bool take_xp(const char* body, int len) {
     return true;
 }
 
+void take_quest_item(const InteractMsg& m);  // quest items to both, below
+void send_quest_items();
+
 void apply_interact(const InteractMsg& m) {
     if (!first_time(m.eid)) return;
+    if (m.kind == 9) return take_quest_item(m);
+    if (m.kind == 10) { if (g.host) send_quest_items(); return; }  // the client's new world: our quest items, the missing given
     ue::UObject* actor = interactable(m.id);
+    if (m.kind == 11) {  // a switch or a radio the other player used: the same state here, now or when it streams in
+        int32_t to = m.a & 0xFF, from = m.a >> 8;
+        if (m.a < 0 || to > 64 || from > 64) return;  // trust boundary: interaction state indexes
+        g.state_remote[m.id] = to;
+        auto it = g.states.find(m.id);
+        if (it == g.states.end() || !ue::alive(it->second)) return;  // set when it streams in
+        int32_t cur = interact_state(it->second);
+        if (cur == to) return;
+        if (cur == from) set_interact_state(it->second, from, true), g.state_check[m.id] = to;  // the same use: its handlers
+        else set_interact_state(it->second, to, false);
+        g.state_last[m.id] = to;
+        return;
+    }
+    if (m.kind == 8) {  // a loose item the other player picked up: gone here now, or when it streams in
+        g.pickups_gone.insert(m.id);
+        if (actor && g.pickup_class && ue::is_a(actor, g.pickup_class)) remove_pickup(actor);
+        return;
+    }
     if (!actor && m.kind == 2) {  // a looted dead NPC: the NPC registry knows it by the same path id
         auto it = g.npcs.find(m.id);
         if (it != g.npcs.end() && npc_live(it->second)) actor = it->second.actor;
@@ -1875,7 +2014,7 @@ bool install_mod(ue::UObject* item, ue::UClass* mod) {  // the game's own instal
 
 // Into the local player's inventory, with the game's own notification; a new single item gets the level, rarity and
 // mods of the given one.
-void give_to_player(ue::UClass* k, int32_t n, int32_t level, int32_t rarity, const std::vector<ue::UClass*>& mods = {}) {
+void give_to_player(ue::UClass* k, int32_t n, int32_t level, int32_t rarity, const std::vector<ue::UClass*>& mods = {}, bool notify = true) {
     ue::UObject* pawn = local_pawn();
     std::string err;
     ue::UObject* inv = pawn ? ue::resolve(ue::addr(pawn) + ".InventoryComponent", &err) : nullptr;
@@ -1884,7 +2023,7 @@ void give_to_player(ue::UClass* k, int32_t n, int32_t level, int32_t rarity, con
     std::vector<ue::UObject*> before;
     for (const auto& s : stacks_of(pawn)) if (ue::class_of(s.first) == k) before.push_back(s.first);
     json a = json::object();
-    a.set("ItemType", ue::addr(k)).set("Count", n).set("bShowNotification", true).set("bPlayItemPickupAudio", true);
+    a.set("ItemType", ue::addr(k)).set("Count", n).set("bShowNotification", notify).set("bPlayItemPickupAudio", notify);
     ue::call(inv, f, a);
     static const int lv = item_prop("ItemLevel"), ra = item_prop("ItemRarity");
     for (const auto& s : stacks_of(pawn)) {
@@ -1894,6 +2033,75 @@ void give_to_player(ue::UClass* k, int32_t n, int32_t level, int32_t rarity, con
         for (ue::UClass* m : mods)
             if (!install_mod(s.first, m)) core_log("give: could not put the mod " + ue::name_of(m) + " on " + ue::name_of(s.first));
     }
+}
+
+// ---------------------------------------------------------------- quest items to both
+// A quest item either player gets (from the ground, a container, a gift) is given to the other player too: a quest's
+// later step may ask either of them for it. The other game is told the new count and gives what its player lacks, so
+// an item both games got (an NPC's gift in a shared conversation: each game runs it) is not given twice. After a load
+// or a travel the client asks for the host's (a joined player's own character comes without the campaign's keys).
+std::map<ue::UClass*, int32_t> quest_items_of(ue::UObject* pawn) {
+    static ue::UClass* qk = nullptr;
+    if (!qk) qk = ue::find_class("/Script/Arkansas.QuestItem");
+    std::map<ue::UClass*, int32_t> out;
+    if (!qk || !pawn) return out;
+    for (const auto& st : stacks_of(pawn))
+        if (ue::is_a(st.first, qk)) out[ue::class_of(st.first)] += st.second;
+    return out;
+}
+
+void send_quest_items() {  // all of ours (asked for by the client): given quietly where missing
+    for (const auto& kv : quest_items_of(local_pawn())) queue_interact(9, 1, kv.second, ue::path_of(kv.first)), g.qitems_sent++;
+}
+
+void take_quest_item(const InteractMsg& m) {
+    // From the other player (trust boundary): a /Game/ quest item class, a sane count.
+    std::string cls(m.path, m.len);
+    static ue::UClass* qk = nullptr;
+    if (!qk) qk = ue::find_class("/Script/Arkansas.QuestItem");
+    ue::UClass* k = cls.rfind("/Game/", 0) == 0 && m.a > 0 && m.a <= 1000 ? load_class(cls) : nullptr;
+    if (!k || !qk || !ue::cdo(k) || !ue::is_a(ue::cdo(k), qk)) { core_log("quest items: ignored one that is no quest item: " + cls); return; }
+    ue::UObject* pawn = local_pawn();
+    auto have = quest_items_of(pawn);
+    int32_t mine = have.count(k) ? have[k] : 0;
+    if (mine >= m.a) return;
+    try {
+        give_to_player(k, m.a - mine, 0, -1, {}, m.id == 0);  // a new one: the game's notification; the host's set: quietly
+    } catch (const std::exception& e) {
+        core_log(std::string("quest items: could not give ") + ue::name_of(k) + ": " + e.what());
+        return;
+    }
+    g.qitems[k] = m.a;  // not told back as a gain of ours
+    g.qitems_given++;
+    if (m.id == 0) core_log("quest items: " + ue::name_of(k) + " from the other player's game");
+}
+
+void quest_items_frame(ue::UObject* pawn) {
+    if (!g.have_peer || (!g.host && !join::joined()) || g.now < g.next_qitems) return;
+    if (!g.host && character::stripping()) return;  // a first join empties our inventory: the host's set after it (run 189)
+    g.next_qitems = g.now + 1.0;
+    auto now = quest_items_of(pawn);
+    if (pawn != g.qitems_pawn) {  // a new world or a load: gains count from here; the client asks for the host's set
+        g.qitems_pawn = pawn, g.qitems = now;
+        if (!g.host) queue_interact(10, 0, 0, "");
+        return;
+    }
+    for (const auto& kv : g.qitems) {  // gone here, not given away: the game's own quest step (probe 145: the client's story
+        auto it = now.find(kv.first);       // catch-up dropped two of the host's leftovers), kept as it is
+        if (it != now.end() && it->second >= kv.second) continue;
+        std::string n = ue::name_of(kv.first);
+        if (std::find(g.qitems_dropped.begin(), g.qitems_dropped.end(), n) == g.qitems_dropped.end()) g.qitems_dropped.push_back(n);
+        if (g.qitems_dropped.size() > 32) g.qitems_dropped.erase(g.qitems_dropped.begin());
+        core_log("quest items: " + n + " left this player's inventory (" + std::to_string(kv.second) + " -> " + std::to_string(it == now.end() ? 0 : it->second) + ")");
+    }
+    for (const auto& kv : now) {
+        auto it = g.qitems.find(kv.first);
+        if (kv.second <= (it == g.qitems.end() ? 0 : it->second)) continue;
+        queue_interact(9, 0, kv.second, ue::path_of(kv.first));
+        g.qitems_sent++;
+        core_log("quest items: " + ue::name_of(kv.first) + " goes to the other player too");
+    }
+    g.qitems = std::move(now);
 }
 
 constexpr const char* kGiveBoxClass = "/Game/Blueprints/World/Interactable/Container/BP_Container_Chest_Small.BP_Container_Chest_Small_C";
@@ -5254,10 +5462,11 @@ void frame(float) {
         g.npcs.clear(), g.scanning.clear(), g.scan_cursor = 0;
         g.encounters.clear(), g.waves_done.clear(), g.wave_state.clear(), g.wave_starts.clear(), g.next_encounters = 0;
         g.interactables.clear(), g.inter_scan.clear();  // old world's doors and containers
+        g.states.clear(), g.states_scan.clear(), g.state_ids.clear(), g.state_cursor = 0, g.state_last.clear(), g.state_check.clear();
         g.box_pos.clear(), g.box_counts.clear();
         doors.clear(), door_cursor = 0;
         g.at_menu = world && ue::path_of(world).find("MainMenu") != std::string::npos;
-        if (g.at_menu) join::set_joined(false), join::hold(false), g.died = false, g.campaign_wanted = false;  // back at the menu: the player's own games save again
+        if (g.at_menu) join::set_joined(false), join::hold(false), g.died = false, g.campaign_wanted = false, g.pickups_gone.clear(), g.state_remote.clear();  // back at the menu: the player's own games save again
         bool same_save = g.now - g.reload_handed_at < 60.0 && join::status().get("state").asString() != "failed";
         if (g.host && !same_save) g.push_pending = true, g.push_ready_at = 0;  // the client follows the host's new map (or reload)
         else if (g.host) core_log("reload: the other player loads the same save, no hand-over");
@@ -5362,7 +5571,8 @@ void frame(float) {
         setup_watches();
         process_observed();
         watch_boxes(pawn);
-        if (g.opt_doors) poll_doors();
+        try { quest_items_frame(pawn); } catch (const std::exception& e) { g.last_error = std::string("quest items: ") + e.what(); }
+        if (g.opt_doors) poll_doors(), poll_states();
         apply_xp_inbox();
         if (g.host) match_quest_xp();
         send_outgoing();
@@ -5506,6 +5716,17 @@ void observe(void* o, void* f, const void* p) {
         }
         return;
     }
+    if (actor_destroyed_name && *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(f) + 0x18) == actor_destroyed_name) {
+        // Told here, while the actor still exists (it may be freed before the next frame): a level-placed loose item?
+        int off = param_offset(static_cast<ue::UFunction*>(f), "Actor");  // OnActorDestroyed(Actor)
+        ue::UObject* a = off >= 0 && off + 8 <= 64 ? *reinterpret_cast<ue::UObject* const*>(static_cast<const uint8_t*>(p) + off) : nullptr;
+        if (!a || !g.pickup_class || !ue::readable(a, 0x30) || !ue::is_a(a, g.pickup_class)) return;
+        std::string path = ue::path_of(a);
+        if (path.find("_UAID_") == std::string::npos) return;
+        std::lock_guard<std::mutex> lk(obs_mu);
+        if (picked_up.size() < 4096) picked_up.push_back(fnv64(path));
+        return;
+    }
     Observed e{};
     e.obj = o, e.fn = f;
     uint16_t size = *reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(f) + 0xB6);  // UFunction::ParmsSize
@@ -5584,6 +5805,11 @@ json status() {
     s.set("story", story::status());
     if (!g.host) s.set("character", character::status());
     s.set("doorsSent", static_cast<double>(g.doors_sent)).set("doorsApplied", static_cast<double>(g.doors_applied));
+    s.set("pickupsSent", static_cast<double>(g.pickups_sent)).set("pickupsApplied", static_cast<double>(g.pickups_applied))
+        .set("pickupsGone", static_cast<double>(g.pickups_gone.size())).set("questItemsSent", static_cast<double>(g.qitems_sent))
+        .set("questItemsGiven", static_cast<double>(g.qitems_given)).set("statesSent", static_cast<double>(g.states_sent))
+        .set("questItemsDropped", [] { json a = json::array(); for (const auto& n : g.qitems_dropped) a.push(n); return a; }())
+        .set("statesApplied", static_cast<double>(g.states_applied)).set("statesWatched", static_cast<double>(g.states.size()));
     s.set("pausesLifted", static_cast<double>(g.pauses_lifted)).set("noPause", g.opt_no_pause);
     s.set("partyDriven", static_cast<double>(g.party_tamed.size())).set("partyTames", static_cast<double>(g.party_tames))
         .set("partyReleases", static_cast<double>(g.party_releases)).set("partyCalm", g.party_calm_in);

@@ -62,6 +62,7 @@ def main():
     try:
         for i, v in ((0, 20), (1, 0)):
             ci = info(i)
+            uc(i, ci, "DisableFlawOffers")  # an offer pending blocks the responses (run 193: Foot-in-Mouth after skipped lines)
             for s in SKILLS:
                 uc(i, ci, "SetPlayerSkillDebug", {"Skill": s, "SkillValue": v})
         check(skill(0, "Engineering") >= 20 and skill(1, "Engineering") == 0, "the host's skills high, the client's 0",
@@ -104,11 +105,23 @@ def main():
         k = [n for n, s in shown(0) if s].index(lock) + 1
         text = responses(0)[k - 1]
         before = node(0)
-        for _ in range(6):
+        t_press = time.time()
+        for _ in range(20):
             uc(0, screen(0), f"OnResponse{k}InputAction")
             if wait(lambda: node(0) != before, 1.0):
                 break
         after = node(0)
+        print(f"info: the host's pick took {time.time() - t_press:.1f} s")
+        if after == before:  # the host's own pick did not take: what its screen shows (runs 179-192)
+            try:
+                from gamewin import Game
+                ev = Path(__file__).resolve().parents[2] / "the-outer-worlds-2" / "evidence"
+                for i in (0, 1):
+                    Game(pid(i)).shot(str(ev / f"skillcheck-stuck-copy{i}.png"))
+                print(f"info: the host's line stayed {before}: screens in {ev}; widgets "
+                      f"{[r.split()[-1][-30:] for r in call('ue.find', {'class': '/Script/Arkansas.ConversationWidget', 'limit': 10}, inst=0)]}")
+            except Exception as e:  # noqa: BLE001
+                print(f"info: no screenshot: {e}")
         took = wait(lambda: status(1).get("convBypassed", 0) > s0.get("convBypassed", 0)
                     or status(1).get("convPicksApplied", 0) > s0.get("convPicksApplied", 0), 6)
         time.sleep(2)

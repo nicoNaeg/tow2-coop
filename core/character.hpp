@@ -20,5 +20,6 @@ void save_now();                         // game thread: start a private save no
 bool dead();                             // game thread: the local player is dying or dead
 void use_kept_next();                    // game thread: the next hand-over takes the last kept character, no new save
 coopbridge::json::Value status();        // any thread
+bool stripping();                        // game thread: a first join's emptying is still to come
 bool has_own();                         // game thread: a character of the player's own exists (kept, or an own save)
 }  // namespace character

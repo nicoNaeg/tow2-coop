@@ -54,6 +54,7 @@ Step 'interact and loot' { python -I test_interact.py }
 Step 'party XP' { python -I test_xp.py }
 Step 'story both ways' { python -I test_resync.py AS }
 Step 'give items' { python -I test_give.py $p[0] $p[1] }
+Step 'quest and loose items' { python -I test_items.py }
 Step 'own character' { python -I test_character.py }
 Step 'menus do not pause' { python -I test_nopause.py }
 Step 'shared conversations' { python -I test_conversation.py }
@@ -76,6 +77,7 @@ Step 'world sync' { python -I test_world.py $p[0] }
 python -I god.py | Out-Null  # the steps before may leave a player down or vulnerable (runs 168-169)
 Step 'resync map travel' { python -I test_resync.py B2C }  # host leads (followed), host leads (fallback), client leads
 Step 'real skill check' { python -I test_skillcheck.py }  # in the Order's headquarters (it travels there)
+Step 'switches' { python -I test_switches.py }  # in the Order's headquarters too
 Step 'ship travel' { python -I test_ship.py }  # last: it leaves the test map
 foreach ($i in 0, 1) { Get-ChildItem "$hub\local\gamepool\instances\tow2\$i\sandbox\LocalAppData\Arkansas\Saved\Crashes" -ErrorAction SilentlyContinue | ForEach-Object { "crash report in copy ${i}: $($_.Name)" | Tee-Object -FilePath $log -Append; Copy-Item $_.FullName $Out -Recurse -Force } }  # the next start clears the folder (run 178's dump lost)
 Step 'no caught faults' {

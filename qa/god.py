@@ -1,6 +1,7 @@
 """Test helper: the bot players stand still among hostile NPCs during the combat tests, and a dead or downed host cannot
 save, so a later hand-over fails (runs 44-47). Turns god mode on for both players' current pawns (a reload resets it), no fall damage, a downed player revived, a client
-lost under the ground put back next to the host.
+lost under the ground put back next to the host, the game's flaw offers off (one pending blocks the player's conversation
+responses: run 193, Foot-in-Mouth Syndrome after the tests skipped many lines).
 Usage: python -I god.py"""
 import sys
 from pathlib import Path
@@ -17,6 +18,9 @@ for inst in (0, 1):
             print(f"info: copy {inst}'s player was {life}: revived")
         call("ue.call", {"ref": "pawn.HealthComponent", "fn": "SetGod", "args": {"bEnabled": True}}, inst=inst)
         call("ue.set", {"path": "pawn.HealthComponent.bImmuneToFallDamage", "value": True}, inst=inst)
+        info = [x for x in call("ue.find", {"class": "/Script/Arkansas.PlayerInfoComponent", "limit": 5}, inst=inst) if "Default__" not in x]
+        if info:
+            call("ue.call", {"ref": info[0].split()[0], "fn": "DisableFlawOffers"}, inst=inst)
         hp = call("ue.call", {"ref": "pawn.HealthComponent", "fn": "GetHealth"}, inst=inst)["ReturnValue"]
         print(f"PASS copy {inst}: god mode on, health {hp:.0f}")
     except Exception as e:

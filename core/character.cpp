@@ -270,6 +270,8 @@ void changed() {  // game thread: XP gained (the AddXP hook)
     if (dirty_since < 0) dirty_since = last_change;
 }
 
+bool stripping() { return strip_pending; }
+
 void frame(double now, bool joined_gameplay) {
     poll_save();
     if (!joined_gameplay) return;

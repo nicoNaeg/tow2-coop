@@ -1,7 +1,9 @@
 # tow2-coop: two-player co-op for The Outer Worlds 2 (work in progress)
 
-Status: **v0.5.3, a test build: co-op through Steam (friends, or public games; no IP or port), or direct IP.**
-0.5.3: a choice the other player's character can't take for real (a skill check) is taken past its lock when the leader
+Status: **v0.5.4, a test build: co-op through Steam (friends, or public games; no IP or port), or direct IP.**
+0.5.4: a quest item either player gets (a key, a pass, a sample) goes to both, and after joining the friend holds the
+host's; a loose item one player picks up from the ground is gone in the other game too, and the host's save keeps it
+gone; a switch or a radio one player uses takes the same state in the other game. 0.5.3: a choice the other player's character can't take for real (a skill check) is taken past its lock when the leader
 picks it (0.5.1 did it only for a lock the test simulated; a real one restarted the conversation, a camera cut); a
 quest set without its banner shows "Quest Completed" (or "Quest Failed") and its title, in the game's language.
 Tested further: a door's wave of enemies, a fight against a squad of armed soldiers, ship travel, a new game together
@@ -24,7 +26,7 @@ map change no longer waits for a save: when one player travels, the other starts
 arrive together. Fights are shared: an enemy that spots either player starts the fight in both games, and the enemies
 spread over both players. Tested on one PC with two copies (runs 70-111); the first real session across two PCs
 (2026-11-17, beta.4) ran the earlier features. 0.3.0 to 0.5.1 were tested on one PC too (runs 112-170).
-Use 0.5.0 or 0.5.1 on both PCs (the same version for public games) (an older version on the other PC does not connect; the log says so). Two independent copies of
+Use 0.5.4 on both PCs (another version on the other PC does not connect; the log says so). Two independent copies of
 the game share one campaign owned by the host: the client joins by receiving the host's save, each player controls their
 own character, sees the other (position, rotation, walk/idle animation, the player's look, armor and helmet changes),
 and the host owns NPC health and deaths, quest progress, door states and container contents; either player can lead a
@@ -112,6 +114,14 @@ Entertainment or Xbox; it ships no game files. MIT license.
 - **Doors:** shared state; either player opens, closes or locks, the other world follows.
 - **Containers and dead NPCs:** shared contents; an item taken by one player disappears from that container or body
   for the other, the taker keeps it. Two players taking the same item at the same moment may both get it.
+- **Loose items** (on the ground, a table, a shelf): one player picks it up, it is gone in the other game too (now, or
+  when that part of the map loads there); the host's save keeps it gone. Items dropped during play are each game's own.
+- **Quest items** (keys, passes, samples): either player getting one gives it to the other too, whatever the source (the
+  ground, a container, a gift, an NPC); after joining, the friend holds the host's (their own character came without
+  the campaign's). The friend's game can drop a few of them again by itself while it catches up on the story after the
+  join (in the tests, two leftovers of later quests out of 38); the host keeps them, and the mod's log names them.
+- **Switches and radios:** one player uses one, the other game's takes the same state, the game's way (its own effects
+  run there too).
 - **Disconnect:** a silent peer is dropped after 5 s (its stand-in disappears); a restarted client rejoins.
 
 ## Supported build (anything else: the mod stays off and the game runs unmodified)
